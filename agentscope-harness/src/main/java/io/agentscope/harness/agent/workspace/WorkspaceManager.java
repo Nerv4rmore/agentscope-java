@@ -39,6 +39,7 @@ import io.agentscope.harness.agent.filesystem.model.GlobResult;
 import io.agentscope.harness.agent.filesystem.model.ReadResult;
 import io.agentscope.harness.agent.filesystem.model.WriteResult;
 import io.agentscope.harness.agent.filesystem.remote.store.NamespaceFactory;
+import io.agentscope.harness.agent.filesystem.sandbox.AbstractSandboxFilesystem;
 import io.agentscope.harness.agent.subagent.task.TaskRecord;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -293,7 +294,11 @@ public class WorkspaceManager implements AutoCloseable {
     public List<Path> listKnowledgeFiles(RuntimeContext rc) {
         Set<String> relativePaths = new LinkedHashSet<>();
 
-        if (filesystem != null) {
+        if (filesystem != null && !(filesystem instanceof AbstractSandboxFilesystem)) {
+            // Sandbox backends (e.g. AgentRun) implement glob via shell `find` over MCP, whose
+            // response is markdown-wrapped and yields spurious non-path lines — and the sandbox
+            // workspace never holds knowledge files anyway. Skip the sandbox glob and rely on the
+            // local knowledge/ directory below. Mirrors the disableDefaultWorkspaceSkills stance.
             GlobResult glob = filesystem.glob(rc, "*", KNOWLEDGE_DIR);
             if (glob.isSuccess() && glob.matches() != null) {
                 for (FileInfo fi : glob.matches()) {
@@ -324,7 +329,13 @@ public class WorkspaceManager implements AutoCloseable {
 
         List<Path> result = new ArrayList<>();
         for (String rel : relativePaths) {
-            result.add(workspace.resolve(rel));
+            try {
+                result.add(workspace.resolve(rel));
+            } catch (java.nio.file.InvalidPathException e) {
+                // The sandbox MCP glob may return non-path text (e.g. informational messages)
+                // that cannot be resolved as a filesystem path; skip those silently.
+                log.warn("Skipping invalid knowledge path from sandbox glob: {}", rel);
+            }
         }
         return result;
     }
@@ -458,11 +469,14 @@ public class WorkspaceManager implements AutoCloseable {
         try {
             Map<String, TaskRecord> map;
             try {
+                // readTaskMap treats malformed (non-JSON) content as an empty store, so a
+                // corrupted file is self-healed by the write below. Only a genuine I/O error
+                // reaches this catch, in which case we abort to avoid clobbering the store
+                // with partial data.
                 map = readTaskMap(rc, rel); // already holding lock
             } catch (IOException e) {
-                // Never overwrite a malformed store with partial data from a failed parse.
                 log.error(
-                        "Failed to parse task record store {}, aborting write to avoid data loss.",
+                        "Failed to read task record store {}, aborting write to avoid data loss.",
                         rel,
                         e);
                 return;
@@ -666,8 +680,21 @@ public class WorkspaceManager implements AutoCloseable {
         if (json == null || json.isBlank()) {
             return new LinkedHashMap<>();
         }
-        Map<String, TaskRecord> map = TASK_RECORD_JSON.readValue(json, TASK_MAP_TYPE);
-        return map != null ? new LinkedHashMap<>(map) : new LinkedHashMap<>();
+        try {
+            Map<String, TaskRecord> map = TASK_RECORD_JSON.readValue(json, TASK_MAP_TYPE);
+            return map != null ? new LinkedHashMap<>(map) : new LinkedHashMap<>();
+        } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
+            // Malformed (non-JSON) content is recoverable: a sandbox filesystem read can return
+            // command-output text (e.g. a leading '#' from an MCP error banner) in place of the
+            // stored JSON. Treat it as an empty store rather than poisoning callers, so a
+            // subsequent writeTaskRecord can overwrite and self-heal the file. Genuine I/O errors
+            // (subclasses of IOException other than JsonProcessingException) still propagate.
+            log.warn(
+                    "Task record store {} is not valid JSON, treating as empty: {}",
+                    rel,
+                    e.getOriginalMessage());
+            return new LinkedHashMap<>();
+        }
     }
 
     private void persistTaskMap(RuntimeContext rc, String rel, Map<String, TaskRecord> map) {

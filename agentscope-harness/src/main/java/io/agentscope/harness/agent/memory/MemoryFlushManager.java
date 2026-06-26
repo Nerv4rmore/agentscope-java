@@ -24,6 +24,8 @@ import io.agentscope.core.message.ToolResultBlock;
 import io.agentscope.core.message.ToolUseBlock;
 import io.agentscope.core.model.Model;
 import io.agentscope.core.util.JsonUtils;
+import io.agentscope.harness.agent.filesystem.AbstractFilesystem;
+import io.agentscope.harness.agent.filesystem.sandbox.AbstractSandboxFilesystem;
 import io.agentscope.harness.agent.memory.session.SessionEntry;
 import io.agentscope.harness.agent.memory.session.SessionTree;
 import io.agentscope.harness.agent.workspace.WorkspaceConstants;
@@ -237,13 +239,18 @@ public class MemoryFlushManager {
                     new SessionTree(
                                     contextFile,
                                     workspaceManager.getWorkspace(),
-                                    workspaceManager.getFilesystem(),
+                                    resolveMirrorFilesystem(workspaceManager.getFilesystem()),
                                     workspaceManager.getIndex(),
                                     contextRelPath)
                             .setRuntimeContext(rc);
             tree.load();
             // Sync from remote before appending so that entries written by a previous replica
             // (cross-machine handoff) are included in the merged file pushed to remote.
+            // Skipped for sandbox filesystems: sandboxes are per-call, ephemeral instances —
+            // there is no durable remote history to merge, and reading them only pulls in stale
+            // or corrupted files from a previous sandbox invocation. Multi-replica deployments
+            // share conversation state via the distributed Session backend (RedisSession /
+            // MysqlSession), not via the sandbox filesystem.
             tree.syncFromRemote();
 
             List<SessionEntry> existingEntries = new ArrayList<>(tree.getAllEntries());
@@ -288,6 +295,31 @@ public class MemoryFlushManager {
         } catch (Exception e) {
             log.warn("Failed to offload to JSONL session tree: {}", e.getMessage());
         }
+    }
+
+    /**
+     * Returns the filesystem to pass to {@link SessionTree} for mirroring, or {@code null} to
+     * disable mirroring entirely.
+     *
+     * <p>Sandbox filesystems ({@link AbstractSandboxFilesystem}, e.g. {@code
+     * SandboxBackedFilesystem} created from an {@code AgentRunFilesystemSpec}) are <b>ephemeral,
+     * per-call execution environments</b> — not durable shared stores. Mirroring session JSONL to
+     * a sandbox is wasted work: the sandbox is released as soon as the agent call completes
+     * (often before the async mirror runs, causing "MCP session terminated" errors), and nothing
+     * ever reads the session history back from the sandbox (conversation state is restored from
+     * the host-disk {@code AgentState} via {@code JsonFileAgentStateStore}, or from a distributed
+     * Session backend in multi-replica deployments). Passing {@code null} makes {@link
+     * SessionTree} skip both {@code scheduleMirror} (no upload) and {@code syncFromRemote} (no
+     * download), keeping the session JSONL strictly on the host disk.
+     *
+     * <p>Non-sandbox filesystems (local / remote KV-backed stores) are returned as-is, preserving
+     * the cross-replica mirror behaviour for {@code RemoteFilesystemSpec} deployments.
+     */
+    private static AbstractFilesystem resolveMirrorFilesystem(AbstractFilesystem filesystem) {
+        if (filesystem instanceof AbstractSandboxFilesystem) {
+            return null;
+        }
+        return filesystem;
     }
 
     /**

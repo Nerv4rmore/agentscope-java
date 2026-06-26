@@ -92,6 +92,7 @@ public abstract class AbstractBaseSandbox implements Sandbox {
                     } else {
                         // Degrade to Branch D: no usable snapshot
                         log.warn("[sandbox] Branch B degraded to D: snapshot not restorable");
+                        state.setWorkspaceProjectionHash(null); // force re-projection
                         doSetupWorkspace();
                         workspaceSpecApplier.applyWorkspaceSpec(spec, false);
                     }
@@ -109,6 +110,7 @@ public abstract class AbstractBaseSandbox implements Sandbox {
                 } else {
                     // Branch D: fresh initialization from full workspace spec
                     log.debug("[sandbox] Branch D: fresh workspace initialization");
+                    state.setWorkspaceProjectionHash(null); // force re-projection on fresh create
                     doSetupWorkspace();
                     workspaceSpecApplier.applyWorkspaceSpec(spec, false);
                 }
@@ -268,20 +270,26 @@ public abstract class AbstractBaseSandbox implements Sandbox {
         WorkspaceProjectionApplier.ProjectionPayload payload =
                 WorkspaceProjectionApplier.build(spec);
         if (payload == null) {
+            log.info("[sandbox-projection] Skipped: payload is null (no projection entries)");
             return;
         }
         if (Objects.equals(payload.hash(), state.getWorkspaceProjectionHash())) {
-            log.debug("[sandbox] Workspace projection unchanged, skipping");
+            log.info("[sandbox-projection] Skipped: hash unchanged (already projected)");
             return;
         }
+        log.info(
+                "[sandbox-projection] Applying: files={}, hash={}, tarBytes={}",
+                payload.fileCount(),
+                payload.hash(),
+                payload.tarBytes().length);
         if (payload.fileCount() > 0) {
             try (InputStream archive = new ByteArrayInputStream(payload.tarBytes())) {
                 doHydrateWorkspace(archive);
             }
         }
         state.setWorkspaceProjectionHash(payload.hash());
-        log.debug(
-                "[sandbox] Workspace projection applied: files={}, hash={}",
+        log.info(
+                "[sandbox-projection] Applied: files={}, hash={}",
                 payload.fileCount(),
                 payload.hash());
     }

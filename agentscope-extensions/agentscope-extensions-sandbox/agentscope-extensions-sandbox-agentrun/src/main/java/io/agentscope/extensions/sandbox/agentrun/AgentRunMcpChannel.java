@@ -22,6 +22,7 @@ import io.agentscope.core.tool.mcp.McpClientWrapper;
 import io.agentscope.harness.agent.sandbox.SandboxErrorCode;
 import io.agentscope.harness.agent.sandbox.SandboxException;
 import io.modelcontextprotocol.spec.McpSchema;
+import io.modelcontextprotocol.spec.McpTransportSessionNotFoundException;
 import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -175,6 +176,33 @@ final class AgentRunMcpChannel implements AutoCloseable {
         }
     }
 
+    /**
+     * Returns {@code true} when an exception indicates the MCP session is no longer recognised by
+     * the server (expired, invalidated, or terminated). Covers both the direct
+     * {@link McpTransportSessionNotFoundException} and Reactor-wrapped variants whose causal
+     * chain or message mentions session termination. Used by {@link AgentRunSandbox} to decide
+     * whether to tear down and recreate the whole sandbox instance.
+     */
+    static boolean isSessionLost(Throwable e) {
+        Throwable cur = e;
+        while (cur != null) {
+            if (cur instanceof McpTransportSessionNotFoundException) {
+                return true;
+            }
+            String msg = cur.getMessage();
+            if (msg != null) {
+                String lower = msg.toLowerCase();
+                if (lower.contains("session not found")
+                        || lower.contains("does not recognize session")
+                        || lower.contains("mcp session with server terminated")) {
+                    return true;
+                }
+            }
+            cur = cur.getCause();
+        }
+        return false;
+    }
+
     private String requireApiKey() {
         String key = opt.getApiKey();
         if (key == null || key.isBlank()) {
@@ -224,32 +252,127 @@ final class AgentRunMcpChannel implements AutoCloseable {
     }
 
     /**
-     * Parses an AgentRun exec MCP response. AgentRun returns either a JSON object such as
-     * {@code {"exitCode":0,"stdout":"...","stderr":"..."}} or a plain stdout/stderr string. We
-     * accept both shapes.
+     * Parses an AgentRun exec MCP response. AgentRun may return any of:
+     * <ul>
+     *   <li>a bare JSON object {@code {"exitCode":0,"stdout":"...","stderr":"..."}};</li>
+     *   <li>a markdown-wrapped response whose TextContent looks like
+     *       {@code ### process_exec_cmd\n\n**Sandbox ID ...:**\n\n**Response:**\n{ ... }}
+     *       — the real payload is the embedded JSON, with the command output under
+     *       {@code result.stdout} / {@code result.exitCode} (or top-level
+     *       {@code stdout}/{@code exitCode});</li>
+     *   <li>a plain stdout/stderr string (no JSON at all).</li>
+     * </ul>
+     * We accept all three shapes. Critically, when the response is markdown-wrapped we must
+     * extract the embedded JSON rather than treating the whole markdown blob as stdout —
+     * otherwise every {@code glob}/{@code read}/{@code uploadFiles} call (which all rely on
+     * {@code execute()} returning clean stdout) sees the markdown wrapper as its output and
+     * corrupts downstream state files.
      */
     private static ExecResult parseExecPayload(String text) {
         if (text == null) {
             return new ExecResult(0, "", "");
         }
         String trimmed = text.strip();
-        if (trimmed.startsWith("{")) {
-            try {
-                JsonNode node = JSON.readTree(trimmed);
-                int exit =
-                        node.has("exitCode")
-                                ? node.path("exitCode").asInt(0)
-                                : node.path("exit_code").asInt(0);
-                String stdout =
-                        node.has("stdout")
-                                ? node.path("stdout").asText("")
-                                : node.path("output").asText("");
-                String stderr = node.path("stderr").asText("");
-                return new ExecResult(exit, stdout, stderr);
-            } catch (Exception ignore) {
-                // fall through to plain-text handling
-            }
+        ExecResult parsed = tryParseJson(trimmed);
+        if (parsed != null) {
+            return parsed;
         }
         return new ExecResult(0, text, "");
+    }
+
+    /**
+     * Attempts to interpret {@code text} as a (possibly markdown-wrapped) JSON exec payload.
+     * Returns {@code null} when no usable JSON payload can be located, signalling the caller
+     * to fall back to plain-text handling.
+     */
+    private static ExecResult tryParseJson(String text) {
+        // First try the whole text as JSON (bare-object shape).
+        ExecResult direct = parseJsonNode(text);
+        if (direct != null) {
+            return direct;
+        }
+        // Otherwise scan for the first balanced { ... } object — the markdown wrapper
+        // emitted by the AgentRun MCP server embeds the real payload there.
+        String json = extractFirstJsonObject(text);
+        if (json != null && !json.equals(text)) {
+            return parseJsonNode(json);
+        }
+        return null;
+    }
+
+    /** Parses {@code json} as an exec-result JSON node, supporting nested and flat shapes. */
+    private static ExecResult parseJsonNode(String json) {
+        try {
+            JsonNode node = JSON.readTree(json);
+            if (node == null || !node.isObject()) {
+                return null;
+            }
+            // Nested shape: { "result": { "exitCode":0, "stdout":"...", "stderr":"..." } }
+            JsonNode result = node.path("result");
+            JsonNode src = result.isObject() ? result : node;
+            if (!src.has("exitCode")
+                    && !src.has("exit_code")
+                    && !src.has("stdout")
+                    && !src.has("output")) {
+                // Not an exec-result object (e.g. a metadata blob); don't pretend it is.
+                return null;
+            }
+            int exit =
+                    src.has("exitCode")
+                            ? src.path("exitCode").asInt(0)
+                            : src.path("exit_code").asInt(0);
+            String stdout =
+                    src.has("stdout")
+                            ? src.path("stdout").asText("")
+                            : src.path("output").asText("");
+            String stderr = src.path("stderr").asText("");
+            return new ExecResult(exit, stdout, stderr);
+        } catch (Exception ignore) {
+            return null;
+        }
+    }
+
+    /**
+     * Locates the first balanced JSON object ({@code { ... }}) inside {@code text}, accounting
+     * for string-literal braces. Returns the raw substring, or {@code null} when no balanced
+     * object is found. Used to peel the AgentRun markdown wrapper off the embedded payload.
+     */
+    private static String extractFirstJsonObject(String text) {
+        if (text == null) {
+            return null;
+        }
+        int start = -1;
+        int depth = 0;
+        boolean inString = false;
+        boolean escape = false;
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (inString) {
+                if (escape) {
+                    escape = false;
+                } else if (c == '\\') {
+                    escape = true;
+                } else if (c == '"') {
+                    inString = false;
+                }
+                continue;
+            }
+            if (c == '"') {
+                inString = true;
+            } else if (c == '{') {
+                if (depth == 0) {
+                    start = i;
+                }
+                depth++;
+            } else if (c == '}') {
+                if (depth > 0) {
+                    depth--;
+                    if (depth == 0 && start >= 0) {
+                        return text.substring(start, i + 1);
+                    }
+                }
+            }
+        }
+        return null;
     }
 }
