@@ -93,13 +93,32 @@ final class AgentRunDataPlaneHttp {
             }
         }
 
-        String url = opt.getResolvedDataPlaneBaseUrl() + "/2025-09-10/sandboxes";
-        return AgentRunRetry.withRetries(opt.getMaxRetries(), () -> postJson(url, body));
+        String url = opt.getResolvedDataPlaneBaseUrl() + "/sandboxes";
+        return AgentRunRetry.withRetries(
+                opt.getMaxRetries(), () -> unwrapData(postJson(url, body)));
     }
 
     JsonNode getSandbox(String sandboxId) throws IOException {
-        String url = opt.getResolvedDataPlaneBaseUrl() + "/2025-09-10/sandboxes/" + sandboxId;
-        return AgentRunRetry.withRetries(opt.getMaxRetries(), () -> getJson(url));
+        String url = opt.getResolvedDataPlaneBaseUrl() + "/sandboxes/" + sandboxId;
+        return AgentRunRetry.withRetries(opt.getMaxRetries(), () -> unwrapData(getJson(url)));
+    }
+
+    /**
+     * 解包 AgentRun 数据面响应的 {@code data} 外层包装。
+     *
+     * <p>AgentRun 数据面接口标准返回形如 {@code { "code":"SUCCESS", "data": { ... } }}，
+     * 真正的沙箱对象挂在 {@code data} 下。这里把 {@code data} 取出返回；若响应没有
+     * {@code data} 包装（直接返回沙箱对象），则原样返回，兼容两种形态。
+     */
+    private static JsonNode unwrapData(JsonNode response) {
+        if (response == null) {
+            return null;
+        }
+        JsonNode data = response.get("data");
+        if (data != null && data.isObject()) {
+            return data;
+        }
+        return response;
     }
 
     /**
@@ -107,7 +126,7 @@ final class AgentRunDataPlaneHttp {
      * responses raise.
      */
     void deleteSandbox(String sandboxId) throws IOException {
-        String url = opt.getResolvedDataPlaneBaseUrl() + "/2025-09-10/sandboxes/" + sandboxId;
+        String url = opt.getResolvedDataPlaneBaseUrl() + "/sandboxes/" + sandboxId;
         Request req = baseRequest().url(url).delete().build();
         try (Response res = http.newCall(req).execute()) {
             if (!res.isSuccessful() && res.code() != 404) {
@@ -119,8 +138,7 @@ final class AgentRunDataPlaneHttp {
     }
 
     /**
-     * Polls {@link #getSandbox(String)} until the sandbox reaches the {@code READY} state or
-     * fails.
+     * 轮询 {@link #getSandbox(String)}，直到沙箱进入 {@code READY} 状态或失败为止。
      */
     void waitUntilReady(String sandboxId, int maxWaitSeconds) throws Exception {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(maxWaitSeconds);
@@ -150,15 +168,43 @@ final class AgentRunDataPlaneHttp {
                         + sandboxId);
     }
 
+    /**
+     * 从沙箱 JSON 中解析状态字段。
+     *
+     * <p>AgentRun 数据面接口返回的响应体是包了一层的：
+     * <pre>{@code
+     * { "code": "SUCCESS", "requestId": "...", "data": { "sandboxId": "...", "status": "READY", ... } }
+     * }</pre>
+     * 因此这里依次尝试：根节点的 {@code status}/{@code state}，以及嵌套 {@code data} 节点下的
+     * {@code status}/{@code state}。兼容直接返回沙箱对象（无 {@code data} 包装）和带包装两种形态。
+     */
     private static String textStatus(JsonNode s) {
         if (s == null) {
             return null;
         }
-        JsonNode st = s.get("status");
+        // 1) 直接挂在根节点上的状态字段（沙箱对象直接作为响应体时）
+        String direct = readStatusField(s);
+        if (direct != null) {
+            return direct;
+        }
+        // 2) 包在 data 字段里的状态字段（AgentRun 数据面标准响应包装）
+        JsonNode data = s.get("data");
+        if (data != null) {
+            return readStatusField(data);
+        }
+        return null;
+    }
+
+    /** 读取一个节点上的 {@code status} 或 {@code state} 文本字段，缺失或非文本时返回 {@code null}。 */
+    private static String readStatusField(JsonNode node) {
+        if (node == null) {
+            return null;
+        }
+        JsonNode st = node.get("status");
         if (st != null && st.isTextual()) {
             return st.asText();
         }
-        JsonNode state = s.get("state");
+        JsonNode state = node.get("state");
         if (state != null && state.isTextual()) {
             return state.asText();
         }

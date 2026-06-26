@@ -58,7 +58,9 @@ import reactor.core.scheduler.Schedulers;
  * </ul>
  *
  * <p>Message <b>offload</b> is independent of the flush trigger and runs on every call so the
- * session JSONL stays complete (needed for {@code SessionSearchTool} and resumption).
+ * session JSONL stays complete (needed for {@code SessionSearchTool} and resumption). Offload and
+ * flush execute in parallel ({@code Mono.when}); offload is not blocked by the LLM-based flush,
+ * and a skipped flush (NEVER / throttled) leaves offload running alone.
  *
  * <p>The throttle window is tracked per <em>isolation key</em>, which matches the memory data
  * isolation in use:
@@ -139,56 +141,87 @@ public class MemoryFlushMiddleware implements MiddlewareBase {
                                 .then(Mono.<AgentEvent>empty()));
     }
 
+    /**
+     * Wraps the flush/offload logic in {@link Mono#defer} so that {@link
+     * RuntimeContext#resolveAgentState} and {@link AgentState#getContext} are evaluated only when
+     * this Mono is subscribed — i.e. <em>after</em> the upstream agent stream has completed
+     * (courtesy of {@code concatWith} in {@link #onAgent}).
+     *
+     * <p>Without {@code defer}, {@code concatWith(doFlush(...))} evaluates {@code doFlush(...)}
+     * eagerly at assembly time (when {@code onAgent} builds the Flux), which is <em>before</em>
+     * the agent has run. At that point {@code state.getContext()} is still empty, so {@code
+     * doFlush} returns {@code Mono.empty()} and the session history is never persisted to disk.
+     * {@code defer} defers the state lookup to subscription time, when the conversation context
+     * is fully populated.
+     */
     private Mono<Void> doFlush(Agent agent, RuntimeContext rc) {
-        if (!(agent instanceof ReActAgent reActAgent)) {
-            return Mono.empty();
-        }
-        AgentState state = RuntimeContext.resolveAgentState(rc, reActAgent);
-        if (state == null) {
-            return Mono.empty();
-        }
-        List<Msg> messages = state.getContext();
-        if (messages.isEmpty()) {
-            return Mono.empty();
-        }
+        return Mono.defer(
+                () -> {
+                    if (!(agent instanceof ReActAgent reActAgent)) {
+                        return Mono.empty();
+                    }
+                    AgentState state = RuntimeContext.resolveAgentState(rc, reActAgent);
+                    if (state == null) {
+                        return Mono.empty();
+                    }
+                    List<Msg> messages = state.getContext();
+                    if (messages.isEmpty()) {
+                        return Mono.empty();
+                    }
 
-        MemoryFlushManager flushManager =
-                new MemoryFlushManager(workspaceManager, model, flushPrompt);
+                    MemoryFlushManager flushManager =
+                            new MemoryFlushManager(workspaceManager, model, flushPrompt);
 
-        boolean shouldFlush = shouldFlushNow(rc);
-        Mono<Void> flushMono;
-        if (shouldFlush) {
-            flushMono =
-                    flushManager
-                            .flushMemories(rc, messages)
-                            .doOnSuccess(v -> log.debug("Memory flush completed"))
-                            .onErrorResume(
-                                    e -> {
-                                        log.warn("Memory flush failed: {}", e.getMessage());
-                                        return Mono.empty();
-                                    });
-        } else {
-            log.debug("Memory flush skipped (trigger={})", flushTrigger);
-            flushMono = Mono.empty();
-        }
+                    boolean shouldFlush = shouldFlushNow(rc);
+                    Mono<Void> flushMono;
+                    if (shouldFlush) {
+                        flushMono =
+                                flushManager
+                                        .flushMemories(rc, messages)
+                                        .doOnSuccess(v -> log.debug("Memory flush completed"))
+                                        .onErrorResume(
+                                                e -> {
+                                                    log.warn(
+                                                            "Memory flush failed: {}",
+                                                            e.getMessage());
+                                                    return Mono.empty();
+                                                });
+                    } else {
+                        log.debug("Memory flush skipped (trigger={})", flushTrigger);
+                        flushMono = Mono.empty();
+                    }
 
-        String agentId = agent.getName();
-        String sessionId = rc != null && rc.getSessionId() != null ? rc.getSessionId() : "default";
+                    String agentId = agent.getName();
+                    String sessionId =
+                            rc != null && rc.getSessionId() != null ? rc.getSessionId() : "default";
 
-        Mono<Void> offloadMono =
-                Mono.fromRunnable(
-                                () ->
-                                        flushManager.offloadMessages(
-                                                rc, messages, agentId, sessionId))
-                        .then()
-                        .doOnSuccess(v -> log.debug("Message offload completed"))
-                        .onErrorResume(
-                                e -> {
-                                    log.warn("Message offload failed: {}", e.getMessage());
-                                    return Mono.empty();
-                                });
+                    Mono<Void> offloadMono =
+                            Mono.fromRunnable(
+                                            () ->
+                                                    flushManager.offloadMessages(
+                                                            rc, messages, agentId, sessionId))
+                                    .then()
+                                    .doOnSuccess(v -> log.debug("Message offload completed"))
+                                    .onErrorResume(
+                                            e -> {
+                                                log.warn(
+                                                        "Message offload failed: {}",
+                                                        e.getMessage());
+                                                return Mono.empty();
+                                            });
 
-        return flushMono.then(offloadMono);
+                    // Run offload and flush in parallel rather than serially (flushMono.then
+                    // would force offload to wait for the LLM-based flushMemories, which can take
+                    // tens of seconds). offload (session JSONL persistence) is the time-critical
+                    // path; flush (LLM memory extraction) is best-effort and gated by
+                    // flushTrigger. They write disjoint files (agents/.../sessions vs memory/),
+                    // so concurrent execution is safe — flush snapshots its LLM input before
+                    // subscribing, and offload never touches the memory/ tree.
+                    // Mono.when subscribes both sources immediately; when flushTrigger skips the
+                    // flush (e.g. NEVER / throttled), flushMono is Mono.empty() and this degrades
+                    // to running offload alone.
+                    return Mono.when(offloadMono, flushMono);
+                });
     }
 
     /**

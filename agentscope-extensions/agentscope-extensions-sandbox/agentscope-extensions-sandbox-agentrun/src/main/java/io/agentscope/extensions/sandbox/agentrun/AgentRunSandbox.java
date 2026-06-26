@@ -48,7 +48,13 @@ public class AgentRunSandbox extends AbstractBaseSandbox {
     private final AgentRunSandboxState arState;
     private final AgentRunSandboxClientOptions options;
     private final AgentRunDataPlaneHttp http;
-    private final AgentRunMcpChannel mcp;
+    // Non-final: start() may replace the channel when recreating the sandbox after an MCP
+    // session-loss (the old channel's session is torn down and a fresh one established against
+    // the newly created sandbox instance).
+    private AgentRunMcpChannel mcp;
+    // Guards against infinite recreate loops: a single start() call recreates the sandbox at
+    // most once. If the recreated instance also fails, the error propagates to the caller.
+    private boolean recreated;
 
     public AgentRunSandbox(
             AgentRunSandboxState state,
@@ -69,6 +75,48 @@ public class AgentRunSandbox extends AbstractBaseSandbox {
                     "[sandbox-agentrun] WorkspaceSpec contains bind_mount entries; "
                             + "AgentRun does not apply host bind mounts — paths are not mounted.");
         }
+        try {
+            doStart();
+        } catch (Exception e) {
+            if (!AgentRunMcpChannel.isSessionLost(e) || recreated) {
+                throw e;
+            }
+            recreated = true;
+            log.warn(
+                    "[sandbox-agentrun] MCP session lost during start ({}); recreating sandbox"
+                            + " instance '{}'",
+                    e.getMessage(),
+                    arState.getSandboxId());
+            recreateSandbox();
+            doStart();
+        }
+    }
+
+    /** Tears down the old sandbox instance + MCP session and creates a fresh one. */
+    private void recreateSandbox() throws Exception {
+        String id = arState.getSandboxId();
+        // Close the stale MCP channel (its session is gone) so connect() builds a fresh one.
+        try {
+            mcp.close();
+        } catch (Exception ignore) {
+            // best-effort
+        }
+        // Delete the old sandbox instance; ensureSandbox() will recreate it with the same id.
+        if (id != null && !id.isBlank() && arState.isSandboxOwned()) {
+            try {
+                http.deleteSandbox(id);
+            } catch (Exception e) {
+                log.warn(
+                        "[sandbox-agentrun] delete old sandbox during recreate failed: {}",
+                        e.getMessage());
+            }
+        }
+        // Force a full workspace re-init on the fresh instance.
+        arState.setWorkspaceRootReady(false);
+        arState.setWorkspaceProjectionHash(null);
+    }
+
+    private void doStart() throws Exception {
         ensureSandbox();
         mcp.connect();
         super.start();
@@ -88,11 +136,11 @@ public class AgentRunSandbox extends AbstractBaseSandbox {
 
     @Override
     public void shutdown() throws Exception {
-        try {
-            mcp.close();
-        } catch (Exception ignore) {
-            // best-effort
-        }
+        // NOTE: do NOT close the MCP channel here. The channel is cached per-sandboxId by
+        // AgentRunSandboxClient and reused across acquire/release cycles so the MCP session
+        // survives — closing it here would force a re-initialize on the next resume, which the
+        // AgentRun MCP server rejects ("Session not found"). The channel is closed only when the
+        // sandbox instance is destroyed via AgentRunSandboxClient#delete.
         if (!arState.isSandboxOwned()) {
             return;
         }
@@ -152,7 +200,9 @@ public class AgentRunSandbox extends AbstractBaseSandbox {
     protected void doHydrateWorkspace(InputStream archive) throws Exception {
         String root = arState.getWorkspaceRoot();
         byte[] all = archive.readAllBytes();
+        log.info("[sandbox-projection] doHydrateWorkspace: root={}, tarBytes={}", root, all.length);
         if (all.length == 0) {
+            log.info("[sandbox-projection] doHydrateWorkspace: empty archive, skipping");
             return;
         }
         String b64 = Base64.getEncoder().encodeToString(all);
@@ -187,7 +237,23 @@ public class AgentRunSandbox extends AbstractBaseSandbox {
 
     @Override
     protected void doSetupWorkspace() throws Exception {
-        mcp.exec("mkdir -p " + shellSingleQuote(arState.getWorkspaceRoot()), null, 30);
+        String root = arState.getWorkspaceRoot();
+        log.info("[sandbox-projection] doSetupWorkspace: mkdir -p {}", root);
+        AgentRunMcpChannel.ExecResult res =
+                mcp.exec("mkdir -p " + shellSingleQuote(root), null, 30);
+        if (res.exitCode != 0) {
+            throw new SandboxException.SandboxRuntimeException(
+                    SandboxErrorCode.WORKSPACE_ARCHIVE_WRITE_ERROR,
+                    "Failed to create workspace directory "
+                            + root
+                            + " (exitCode="
+                            + res.exitCode
+                            + ", stderr="
+                            + res.stderr
+                            + ")."
+                            + " The sandbox user may lack write permission on the parent."
+                            + " Verify workspaceRoot is under a writable path (e.g. /home/user/).");
+        }
     }
 
     @Override
