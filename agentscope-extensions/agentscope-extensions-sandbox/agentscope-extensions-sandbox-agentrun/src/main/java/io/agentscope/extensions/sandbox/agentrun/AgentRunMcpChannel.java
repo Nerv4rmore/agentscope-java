@@ -227,6 +227,10 @@ final class AgentRunMcpChannel implements AutoCloseable {
      * {@link McpTransportSessionNotFoundException} and Reactor-wrapped variants whose causal
      * chain or message mentions session termination. Used by {@link AgentRunSandbox} to decide
      * whether to tear down and recreate the whole sandbox instance.
+     *
+     * <p>纯 MCP 方案下，沙箱实例被 idle-timeout 回收后，MCP exec 会返回 "Sandbox not found" /
+     * HTTP 404 / ERR_NOT_FOUND。这些也需要识别为"session 丢失"，否则沙箱回收后无法触发重建，
+     * 会导致 execute 反复失败。因此这里同时识别 sandbox 实例失效的错误特征。
      */
     static boolean isSessionLost(Throwable e) {
         Throwable cur = e;
@@ -240,6 +244,13 @@ final class AgentRunMcpChannel implements AutoCloseable {
                 if (lower.contains("session not found")
                         || lower.contains("does not recognize session")
                         || lower.contains("mcp session with server terminated")) {
+                    return true;
+                }
+                // 沙箱实例被回收 / 不存在：MCP 返回 "Sandbox not found" / 404 / err_not_found
+                if (lower.contains("sandbox not found")
+                        || lower.contains("http 404")
+                        || lower.contains("err_not_found")
+                        || lower.contains("not_found")) {
                     return true;
                 }
             }

@@ -15,7 +15,6 @@
  */
 package io.agentscope.extensions.sandbox.agentrun;
 
-import com.fasterxml.jackson.databind.JsonNode;
 import io.agentscope.core.agent.RuntimeContext;
 import io.agentscope.harness.agent.sandbox.AbstractBaseSandbox;
 import io.agentscope.harness.agent.sandbox.ExecResult;
@@ -36,6 +35,11 @@ import org.slf4j.LoggerFactory;
  * sandbox state declares {@code workspaceOnNas=true}, persistence is delegated entirely to the
  * NAS mount and {@link #doPersistWorkspace()} is a no-op; otherwise the sandbox falls back to a
  * tar-via-MCP archive identical in shape to Daytona's payload.
+ *
+ * <p><b>纯 MCP 方案：</b>沙箱实例由 MCP server 在 initialize 握手时自动创建，不再通过控制面
+ * {@code createSandbox} 显式创建。这样只有一个沙箱实例（MCP 创建的），避免"控制面建一个 +
+ * MCP 又建一个"的双沙箱问题。代价是沙箱实例不跨 JVM 重启复用（重启后 MCP 重新连接会创建新
+ * 沙箱，workspace 走 Branch D 重新投射）。
  */
 public class AgentRunSandbox extends AbstractBaseSandbox {
 
@@ -43,7 +47,6 @@ public class AgentRunSandbox extends AbstractBaseSandbox {
 
     private static final int OUTPUT_TRUNCATE_BYTES = 512 * 1024;
     private static final int TAR_TIMEOUT_SECONDS = 300;
-    private static final int START_WAIT_SECONDS = 300;
     private static final int B64_CHUNK = 4000;
 
     private final AgentRunSandboxState arState;
@@ -112,24 +115,20 @@ public class AgentRunSandbox extends AbstractBaseSandbox {
         }
     }
 
-    /** Tears down the old sandbox instance + MCP session and creates a fresh one. */
+    /**
+     * 纯 MCP 方案下的重建：关闭旧 MCP channel（其 session 绑定的沙箱已失效），让下次
+     * {@code connect()} 重新 initialize 建立新 session，由 MCP server 自动创建新沙箱实例。
+     *
+     * <p>不再调用 {@code http.deleteSandbox}：纯 MCP 方案下没有通过 createSandbox 显式创建
+     * 的沙箱实例，确定性 sandboxId 只是 channelCache 的 key，删除它无意义。沙箱实例由
+     * MCP server 创建和回收（idle timeout），重建只需断开旧 MCP session 即可。
+     */
     private void recreateSandbox() throws Exception {
-        String id = arState.getSandboxId();
         // Close the stale MCP channel (its session is gone) so connect() builds a fresh one.
         try {
             mcp.close();
         } catch (Exception ignore) {
             // best-effort
-        }
-        // Delete the old sandbox instance; ensureSandbox() will recreate it with the same id.
-        if (id != null && !id.isBlank() && arState.isSandboxOwned()) {
-            try {
-                http.deleteSandbox(id);
-            } catch (Exception e) {
-                log.warn(
-                        "[sandbox-agentrun] delete old sandbox during recreate failed: {}",
-                        e.getMessage());
-            }
         }
         // Force a full workspace re-init on the fresh instance.
         arState.setWorkspaceRootReady(false);
@@ -137,13 +136,12 @@ public class AgentRunSandbox extends AbstractBaseSandbox {
     }
 
     private void doStart() throws Exception {
-        // 诊断：doStart 三步骤依次执行，定位失败发生在 ensureSandbox / mcp.connect / super.start 哪一步
-        log.info(
-                "[sandbox-diag] doStart step1 ensureSandbox: sandboxId={}", arState.getSandboxId());
-        ensureSandbox();
-        log.info("[sandbox-diag] doStart step2 mcp.connect: sandboxId={}", arState.getSandboxId());
+        // 纯 MCP 方案：不再调用 ensureSandbox/createSandbox。MCP server 在 initialize 握手时
+        // 会自动创建沙箱实例，后续 mcp.exec 都落在该实例上。这样只有一个沙箱（MCP 创建的），
+        // 不再出现 ensureSandbox 建一个、MCP 又建一个的"双沙箱"问题。
+        log.info("[sandbox-diag] doStart step1 mcp.connect: sandboxId={}", arState.getSandboxId());
         mcp.connect();
-        log.info("[sandbox-diag] doStart step3 super.start: sandboxId={}", arState.getSandboxId());
+        log.info("[sandbox-diag] doStart step2 super.start: sandboxId={}", arState.getSandboxId());
         super.start();
         log.info("[sandbox-diag] doStart DONE: sandboxId={}", arState.getSandboxId());
     }
@@ -163,11 +161,8 @@ public class AgentRunSandbox extends AbstractBaseSandbox {
     @Override
     public void shutdown() throws Exception {
         // The sandbox instance survives across acquire/release cycles: AgentRun reclaims it via
-        // the configured idle timeout (sandboxIdleTimeoutSeconds), not on shutdown. Issuing a
-        // DELETE here every turn was wasteful and, if AgentRun ever made DELETE immediate, would
-        // cause the next ensureSandbox() to see a 404 and rebuild a fresh instance — discarding
-        // the workspace and forcing a full re-projection. Real teardown is done via
-        // destroyInstance(), called only from AgentRunSandboxClient#delete().
+        // the configured idle timeout (sandboxIdleTimeoutSeconds), not on shutdown. Real teardown
+        // is done via destroyInstance(), called only from AgentRunSandboxClient#delete().
         //
         // NOTE: do NOT close the MCP channel here either. The channel is cached per-sandboxId by
         // AgentRunSandboxClient and reused across acquire/release cycles so the MCP session
@@ -179,6 +174,11 @@ public class AgentRunSandbox extends AbstractBaseSandbox {
      * Destroys the backend sandbox instance via an HTTP delete. Called only from {@link
      * AgentRunSandboxClient#delete} for explicit teardown — {@link #shutdown()} is intentionally a
      * no-op so instances live across turns.
+     *
+     * <p>纯 MCP 方案下，真实沙箱实例由 MCP server 创建（随机 id），持久化的派生 sandboxId 只是
+     * channelCache 的 key，对应的 HTTP 沙箱可能不存在，{@code deleteSandbox} 会静默 404。
+     * 真正的清理靠 {@link AgentRunSandboxClient#delete} 里关闭 MCP channel（断开 session），
+     * 沙箱实例随后由 AgentRun idle-timeout 自然回收。
      */
     void destroyInstance() throws Exception {
         if (!arState.isSandboxOwned()) {
@@ -312,134 +312,6 @@ public class AgentRunSandbox extends AbstractBaseSandbox {
     @Override
     protected String getWorkspaceRoot() {
         return arState.getWorkspaceRoot();
-    }
-
-    private void ensureSandbox() throws Exception {
-        String id = arState.getSandboxId();
-        if (id == null || id.isBlank()) {
-            throw new SandboxException.SandboxConfigurationException(
-                    "AgentRun sandbox id is not set — call AgentRunSandboxClient#create or resume");
-        }
-        // 诊断：ensureSandbox 入口，记录要查询的 sandboxId
-        log.info("[sandbox-diag] ensureSandbox ENTER: sandboxId={}", id);
-        try {
-            JsonNode existing = http.getSandbox(id);
-            String status = http.readStatus(existing);
-            // 诊断：HTTP 查询到实例，记录返回的 status（含原始 JSON 片段，定位 HTTP 层与 MCP 层状态不一致）
-            log.info(
-                    "[sandbox-diag] ensureSandbox getSandbox OK: sandboxId={}, status={}, body={}",
-                    id,
-                    status,
-                    existing != null ? existing.toString() : "null");
-            // The instance record may still be present even after it was terminated/deleted
-            // (manual console delete, expired idle timeout, prior shutdown). A terminal instance
-            // is not reusable — treat it as "gone" and fall through to recreate with the same id,
-            // the same as a 404. Otherwise poll until READY/RUNNING and reuse it.
-            if (isTerminalStatus(status)) {
-                log.info(
-                        "[sandbox-agentrun] Existing instance '{}' is terminal ({}); recreating",
-                        id,
-                        status);
-                // Drop the dead record first so createSandbox(id) isn't rejected as a duplicate;
-                // close the stale MCP channel (its session was bound to the dead instance) so
-                // connect() builds a fresh one; force a full workspace re-init on the fresh
-                // instance.
-                deleteForRecreate(id);
-                closeMcpForRecreate();
-                arState.setWorkspaceRootReady(false);
-                arState.setWorkspaceProjectionHash(null);
-            } else {
-                // 诊断：实例非终态，waitUntilReady 后复用（不重建）
-                log.info(
-                        "[sandbox-diag] ensureSandbox REUSE: sandboxId={}, status={} →"
-                                + " waitUntilReady",
-                        id,
-                        status);
-                http.waitUntilReady(id, 30);
-                log.info("[sandbox-diag] ensureSandbox REUSE OK: sandboxId={}", id);
-                return;
-            }
-        } catch (SandboxException.SandboxRuntimeException e) {
-            // 诊断：getSandbox/waitUntilReady 抛异常，记录是否 404 / 是否终态，定位是否走重建
-            log.warn(
-                    "[sandbox-diag] ensureSandbox getSandbox ERROR: sandboxId={}, isNotFound={},"
-                            + " isTerminalStateFromError={}, msg={}",
-                    id,
-                    isNotFound(e),
-                    isTerminalStateFromError(e),
-                    e.getMessage());
-            // Most likely 404 — fall through to create
-            if (!isNotFound(e) && !isTerminalStateFromError(e)) {
-                throw e;
-            }
-            if (isTerminalStateFromError(e)) {
-                // waitUntilReady saw a terminal state — clear the dead record and stale MCP
-                // session before recreating.
-                deleteForRecreate(id);
-                closeMcpForRecreate();
-                arState.setWorkspaceProjectionHash(null);
-            }
-            arState.setWorkspaceRootReady(false);
-        }
-        // 诊断：走重建路径（用同 id 重新 createSandbox）
-        log.info("[sandbox-diag] ensureSandbox CREATE(reuse id): sandboxId={}", id);
-        http.createSandbox(id);
-        http.waitUntilReady(id, START_WAIT_SECONDS);
-        log.info("[sandbox-diag] ensureSandbox CREATE OK: sandboxId={}", id);
-    }
-
-    /**
-     * Best-effort delete of a dead/terminal sandbox record so a fresh instance can be created with
-     * the same id. Mirrors {@link #recreateSandbox()}'s cleanup; failures are logged (the record
-     * may already be gone, in which case createSandbox proceeds normally).
-     */
-    private void deleteForRecreate(String id) {
-        if (id == null || id.isBlank() || !arState.isSandboxOwned()) {
-            return;
-        }
-        try {
-            http.deleteSandbox(id);
-        } catch (Exception e) {
-            log.warn(
-                    "[sandbox-agentrun] delete dead sandbox before recreate failed: {}",
-                    e.getMessage());
-        }
-    }
-
-    /**
-     * Closes the cached MCP channel so the next {@code connect()} initializes a fresh session
-     * against the recreated instance. The channel object stays in the client's cache, but
-     * {@link AgentRunMcpChannel#connect()} re-initializes once its underlying client is null.
-     */
-    private void closeMcpForRecreate() {
-        try {
-            mcp.close();
-        } catch (Exception ignore) {
-            // best-effort
-        }
-    }
-
-    private static boolean isTerminalStatus(String status) {
-        if (status == null) {
-            return false;
-        }
-        String upper = status.toUpperCase();
-        return upper.contains("TERMINATED") || upper.contains("FAILED");
-    }
-
-    /**
-     * Detects a terminal-state failure raised by {@link AgentRunDataPlaneHttp#waitUntilReady}
-     * (message shaped "AgentRun sandbox entered terminal state TERMINATED: ..."). Used so a
-     * terminated/deleted instance is recreated rather than propagated as a hard error.
-     */
-    private static boolean isTerminalStateFromError(Exception e) {
-        String m = e.getMessage();
-        return m != null && m.contains("entered terminal state");
-    }
-
-    private static boolean isNotFound(Exception e) {
-        String m = e.getMessage();
-        return m != null && (m.contains("HTTP 404") || m.contains("NotFound"));
     }
 
     private String relativeOrAbsoluteCwd() {
