@@ -31,6 +31,9 @@ import java.util.Optional;
  */
 public final class SessionSandboxStateStore {
 
+    private static final org.slf4j.Logger log =
+            org.slf4j.LoggerFactory.getLogger(SessionSandboxStateStore.class);
+
     private static final String SANDBOX_STATE_KEY = "_sandbox_state";
 
     private final AgentStateStore stateStore;
@@ -42,34 +45,95 @@ public final class SessionSandboxStateStore {
     }
 
     public Optional<String> load(SandboxIsolationKey key) throws IOException {
+        String slotSid = slotSessionId(key);
         try {
-            String slotSid = slotSessionId(key);
             Optional<SandboxStateSlot> state =
                     stateStore.get(null, slotSid, SANDBOX_STATE_KEY, SandboxStateSlot.class);
-            if (state.isEmpty() || state.get().deleted() || state.get().json() == null) {
+            if (state.isEmpty()) {
+                // 诊断：slot 下根本没有记录（首轮正常；非首轮则说明上一轮没写进来）
+                log.info(
+                        "[sandbox-store-diag] load MISS(empty): agentId={}, slot={}, key={}",
+                        agentId,
+                        slotSid,
+                        key);
                 return Optional.empty();
             }
+            if (state.get().deleted()) {
+                // 诊断：被 tombstone 标记删除（clearState 调用 / 跨调用被清）
+                log.info(
+                        "[sandbox-store-diag] load MISS(tombstoned): agentId={}, slot={}, key={}",
+                        agentId,
+                        slotSid,
+                        key);
+                return Optional.empty();
+            }
+            if (state.get().json() == null) {
+                log.info(
+                        "[sandbox-store-diag] load MISS(null json): agentId={}, slot={}, key={}",
+                        agentId,
+                        slotSid,
+                        key);
+                return Optional.empty();
+            }
+            // 诊断：命中，记录 slot 便于和 persistState 写入侧对照
+            log.info(
+                    "[sandbox-store-diag] load HIT: agentId={}, slot={}, key={}, jsonLen={}",
+                    agentId,
+                    slotSid,
+                    key,
+                    state.get().json().length());
             return Optional.of(state.get().json());
         } catch (Exception e) {
+            // 诊断：load 抛异常（IO / 反序列化），会被 SandboxManager 当作 Priority 3 ERROR
+            log.warn(
+                    "[sandbox-store-diag] load ERROR: agentId={}, slot={}, key={}, error={}",
+                    agentId,
+                    slotSid,
+                    key,
+                    e.getMessage(),
+                    e);
             throw asIo("load", key, e);
         }
     }
 
     public void save(SandboxIsolationKey key, String json) throws IOException {
+        String slotSid = slotSessionId(key);
         try {
-            stateStore.save(
-                    null, slotSessionId(key), SANDBOX_STATE_KEY, new SandboxStateSlot(json, false));
+            stateStore.save(null, slotSid, SANDBOX_STATE_KEY, new SandboxStateSlot(json, false));
+            // 诊断：写盘完成，记录 slot + 底层 store 类型，便于核对读侧 load 是否走同一 slot
+            log.info(
+                    "[sandbox-store-diag] save OK: agentId={}, slot={}, key={}, jsonLen={},"
+                            + " storeType={}",
+                    agentId,
+                    slotSid,
+                    key,
+                    json != null ? json.length() : 0,
+                    stateStore.getClass().getSimpleName());
         } catch (Exception e) {
+            // 诊断：save 抛异常 = 下一轮 load 必然 MISS 的直接原因
+            log.warn(
+                    "[sandbox-store-diag] save ERROR: agentId={}, slot={}, key={}, error={}",
+                    agentId,
+                    slotSid,
+                    key,
+                    e.getMessage(),
+                    e);
             throw asIo("save", key, e);
         }
     }
 
     public void delete(SandboxIsolationKey key) throws IOException {
+        String slotSid = slotSessionId(key);
         try {
+            // 诊断：delete 会写 tombstone，是导致后续 load MISS 的关键来源（如正常流程不应调用）
+            log.info(
+                    "[sandbox-store-diag] delete(tombstone): agentId={}, slot={}, key={}",
+                    agentId,
+                    slotSid,
+                    key);
             // Not all AgentStateStore implementations support per-key delete; tombstone keeps
             // behavior consistent across stores.
-            stateStore.save(
-                    null, slotSessionId(key), SANDBOX_STATE_KEY, SandboxStateSlot.tombstone());
+            stateStore.save(null, slotSid, SANDBOX_STATE_KEY, SandboxStateSlot.tombstone());
         } catch (Exception e) {
             throw asIo("delete", key, e);
         }

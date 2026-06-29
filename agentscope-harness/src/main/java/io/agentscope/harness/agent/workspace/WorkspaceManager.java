@@ -40,6 +40,7 @@ import io.agentscope.harness.agent.filesystem.model.ReadResult;
 import io.agentscope.harness.agent.filesystem.model.WriteResult;
 import io.agentscope.harness.agent.filesystem.remote.store.NamespaceFactory;
 import io.agentscope.harness.agent.filesystem.sandbox.AbstractSandboxFilesystem;
+import io.agentscope.harness.agent.filesystem.sandbox.BaseSandboxFilesystem;
 import io.agentscope.harness.agent.subagent.task.TaskRecord;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -244,19 +245,52 @@ public class WorkspaceManager implements AutoCloseable {
         return workspace.resolve(String.join("/", ns)).resolve(relativePath);
     }
 
-    /** Reads AGENTS.md content, returns empty string if not found. */
+    /**
+     * Reads AGENTS.md content, returns empty string if not found.
+     *
+     * <p>Context files (AGENTS.md/MEMORY.md/KNOWLEDGE.md) are host-side configuration and memory —
+     * they never live in the sandbox workspace. For sandbox-backed filesystems the sandbox read is
+     * skipped (it would only raise "no active sandbox" or return markdown-wrapped junk over MCP)
+     * and the local-disk file is read directly, mirroring {@link #listKnowledgeFiles} and the
+     * {@code disableDefaultWorkspaceSkills} stance. Non-sandbox filesystems keep the two-layer
+     * override (filesystem first, local fallback).
+     */
     public String readAgentsMd(RuntimeContext rc) {
-        return readWithOverride(rc, AGENTS_MD);
+        return readContextMd(rc, AGENTS_MD);
     }
 
-    /** Reads KNOWLEDGE.md content from the knowledge directory. */
+    /** Reads KNOWLEDGE.md content from the knowledge directory. See {@link #readAgentsMd}. */
     public String readKnowledgeMd(RuntimeContext rc) {
-        return readWithOverride(rc, KNOWLEDGE_DIR + "/" + KNOWLEDGE_MD);
+        return readContextMd(rc, KNOWLEDGE_DIR + "/" + KNOWLEDGE_MD);
     }
 
-    /** Reads MEMORY.md content (two-layer: filesystem override, local fallback). */
+    /** Reads MEMORY.md content. See {@link #readAgentsMd}. */
     public String readMemoryMd(RuntimeContext rc) {
-        return readWithOverride(rc, MEMORY_MD);
+        return readContextMd(rc, MEMORY_MD);
+    }
+
+    /**
+     * Reads a context markdown file. Skips the sandbox filesystem layer for sandbox-backed
+     * filesystems (context files are host-only); otherwise applies the two-layer override.
+     *
+     * <p>For sandbox backends the host file is read from the plain workspace root (matching the
+     * original local-disk fallback path) — AGENTS.md/MEMORY.md/KNOWLEDGE.md are shared workspace
+     * files; per-user isolation comes from each user's own sandbox instance, not from host-side
+     * namespacing of these files.
+     */
+    private String readContextMd(RuntimeContext rc, String relativePath) {
+        // Ephemeral sandbox backends (BaseSandboxFilesystem, e.g. AgentRun's
+        // SandboxBackedFilesystem)
+        // never hold context files and are reclaimed on idle timeout — skip the sandbox read and go
+        // straight to the host file. Host-backed shell filesystems (LocalFilesystemWithShell) and
+        // other backends keep the two-layer override (filesystem first, local fallback), matching
+        // the original behaviour. Note LocalFilesystemWithShell implements
+        // AbstractSandboxFilesystem
+        // but is host-backed and persistent, so the check must be against BaseSandboxFilesystem.
+        if (filesystem == null || filesystem instanceof BaseSandboxFilesystem) {
+            return readFileQuietly(workspace.resolve(relativePath));
+        }
+        return readWithOverride(rc, relativePath);
     }
 
     /**
@@ -275,11 +309,51 @@ public class WorkspaceManager implements AutoCloseable {
         if (!resolved.startsWith(workspace)) {
             return "";
         }
+        // Context memory files are host-only for ephemeral sandbox backends (BaseSandboxFilesystem)
+        // — skip the sandbox layer so the flush dedup read matches where memory_save wrote (host),
+        // and never hits the sandbox. Mirrors readContextMd (plain workspace root).
+        if (isContextMemoryFile(normalized) && filesystem instanceof BaseSandboxFilesystem) {
+            return readFileQuietly(workspace.resolve(normalized));
+        }
         return readWithOverride(rc, normalized);
     }
 
     public Path getMemoryDir(RuntimeContext rc) {
         return resolveRuntimeDataPath(rc, MEMORY_DIR);
+    }
+
+    /**
+     * Lists daily memory files (relative paths like {@code memory/YYYY-MM-DD.md}) from the host
+     * disk, never touching the sandbox filesystem. Used by {@link
+     * io.agentscope.harness.agent.memory.MemoryConsolidator} so consolidation reads the same host
+     * files that {@code memory_save}/{@code appendUtf8WorkspaceRelative} wrote, instead of globbing
+     * an ephemeral sandbox where they don't exist. Mirrors the {@code listKnowledgeFiles} /
+     * {@code readContextMd} host-only stance for sandbox backends.
+     */
+    public List<String> listLocalMemoryFiles() {
+        Path dir = workspace.resolve(MEMORY_DIR);
+        if (!Files.isDirectory(dir)) {
+            return List.of();
+        }
+        List<String> result = new ArrayList<>();
+        try (Stream<Path> walk = Files.list(dir)) {
+            walk.filter(Files::isRegularFile)
+                    .filter(p -> p.toString().endsWith(".md"))
+                    .forEach(
+                            p -> {
+                                String rel =
+                                        workspace
+                                                .relativize(p.normalize())
+                                                .toString()
+                                                .replace('\\', '/');
+                                if (rel.startsWith(MEMORY_DIR + "/")) {
+                                    result.add(rel);
+                                }
+                            });
+        } catch (IOException e) {
+            log.warn("Failed to list local memory files: {}", e.getMessage());
+        }
+        return result;
     }
 
     public Path getSkillsDir() {
@@ -387,6 +461,16 @@ public class WorkspaceManager implements AutoCloseable {
         ReentrantLock lock = pathLocks.computeIfAbsent(normalized, k -> new ReentrantLock());
         lock.lock();
         try {
+            // Context memory files (MEMORY.md and anything under memory/) are host-only for
+            // ephemeral sandbox backends (BaseSandboxFilesystem, e.g. AgentRun): the sandbox is a
+            // per-call instance reclaimed on idle timeout, so writing long-term memory there would
+            // lose it. Route these to the host disk (plain workspace root, matching readContextMd)
+            // and never touch the sandbox. Host-backed shell filesystems
+            // (LocalFilesystemWithShell) keep the original namespaced filesystem write.
+            if (isContextMemoryFile(normalized) && filesystem instanceof BaseSandboxFilesystem) {
+                appendLocalWorkspaceFile(normalized, content);
+                return;
+            }
             if (filesystem == null) {
                 appendLocalFile(normalized, content);
                 return;
@@ -401,6 +485,48 @@ public class WorkspaceManager implements AutoCloseable {
                     rc, List.of(Map.entry(normalized, merged.getBytes(StandardCharsets.UTF_8))));
         } finally {
             lock.unlock();
+        }
+    }
+
+    /** True for MEMORY.md and files under the memory/ directory — host-only context memory. */
+    private static boolean isContextMemoryFile(String normalized) {
+        if (MEMORY_MD.equals(normalized)) {
+            return true;
+        }
+        return normalized.startsWith(MEMORY_DIR + "/");
+    }
+
+    /**
+     * Appends to a host-side workspace file (used for context memory under sandbox backends).
+     * Reads the existing host content, merges, and writes back at the plain workspace root — the
+     * local equivalent of the filesystem read→merge→write cycle, on the same path that {@link
+     * #readContextMd} reads from.
+     */
+    private void appendLocalWorkspaceFile(String normalized, String content) {
+        Path local = workspace.resolve(normalized).normalize();
+        if (!local.startsWith(workspace)) {
+            log.warn("Refusing to write outside workspace: {}", normalized);
+            return;
+        }
+        try {
+            if (local.getParent() != null) {
+                Files.createDirectories(local.getParent());
+            }
+            String existing =
+                    Files.isRegularFile(local)
+                            ? Files.readString(local, StandardCharsets.UTF_8)
+                            : "";
+            Files.writeString(
+                    local,
+                    existing + content,
+                    StandardCharsets.UTF_8,
+                    java.nio.file.StandardOpenOption.CREATE,
+                    java.nio.file.StandardOpenOption.TRUNCATE_EXISTING);
+            if (index != null) {
+                index.upsertFromLocalFile(normalized, local);
+            }
+        } catch (IOException e) {
+            log.warn("Failed to append host memory file {}: {}", local, e.getMessage());
         }
     }
 
@@ -740,7 +866,12 @@ public class WorkspaceManager implements AutoCloseable {
         return readWithOverride(rc, normalized);
     }
 
-    /** Overwrites a workspace-relative UTF-8 file. All writes go through the filesystem. */
+    /**
+     * Overwrites a workspace-relative UTF-8 file. All writes go through the filesystem, except
+     * context memory files (MEMORY.md and anything under memory/) on ephemeral sandbox backends
+     * (BaseSandboxFilesystem), which are written to the host disk so long-term memory survives
+     * sandbox reclaim — mirroring {@link #readContextMd} and {@link #appendUtf8WorkspaceRelative}.
+     */
     public void writeUtf8WorkspaceRelative(RuntimeContext rc, String relativePath, String content) {
         if (relativePath == null || content == null) {
             return;
@@ -750,6 +881,10 @@ public class WorkspaceManager implements AutoCloseable {
             return;
         }
         if (filesystem == null) {
+            writeLocalFile(normalized, content);
+            return;
+        }
+        if (isContextMemoryFile(normalized) && filesystem instanceof BaseSandboxFilesystem) {
             writeLocalFile(normalized, content);
             return;
         }

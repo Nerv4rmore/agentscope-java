@@ -37,6 +37,10 @@ import java.util.Objects;
  */
 final class AgentRunMcpChannel implements AutoCloseable {
 
+    // 诊断日志：MCP 层连接与 exec 失败排查
+    private static final org.slf4j.Logger log =
+            org.slf4j.LoggerFactory.getLogger(AgentRunMcpChannel.class);
+
     /** MCP tool name for shell-style command execution. */
     static final String TOOL_EXEC = "process_exec_cmd";
 
@@ -60,8 +64,18 @@ final class AgentRunMcpChannel implements AutoCloseable {
     /** Connects the MCP client. Idempotent — repeated calls are a no-op. */
     void connect() {
         if (client != null) {
+            // 诊断：MCP channel 已连接，复用现有 session（channelCache 按 sandboxId 复用的体现）
+            log.info(
+                    "[sandbox-diag] mcp.connect REUSE: already connected, url={}, channel={}",
+                    url,
+                    Integer.toHexString(System.identityHashCode(this)));
             return;
         }
+        // 诊断：MCP channel 首次连接，建立新 MCP session（注意：URL 是 template 级，不含 sandboxId）
+        log.info(
+                "[sandbox-diag] mcp.connect NEW: url={}, channel={}",
+                url,
+                Integer.toHexString(System.identityHashCode(this)));
         McpClientWrapper c =
                 McpClientBuilder.create("agentrun-" + opt.getTemplateName())
                         .streamableHttpTransport(url)
@@ -72,6 +86,10 @@ final class AgentRunMcpChannel implements AutoCloseable {
                         .buildSync();
         c.initialize().block();
         this.client = c;
+        log.info(
+                "[sandbox-diag] mcp.connect NEW OK: url={}, channel={}",
+                url,
+                Integer.toHexString(System.identityHashCode(this)));
     }
 
     /** Result of a shell command executed in the sandbox. */
@@ -96,15 +114,42 @@ final class AgentRunMcpChannel implements AutoCloseable {
             args.put("cwd", cwd);
         }
         args.put("timeout", Math.max(1, timeoutSeconds));
-        McpSchema.CallToolResult result =
-                client.callTool(TOOL_EXEC, args)
-                        .block(Duration.ofSeconds(Math.max(5, timeoutSeconds) + 30L));
+        McpSchema.CallToolResult result;
+        try {
+            result =
+                    client.callTool(TOOL_EXEC, args)
+                            .block(Duration.ofSeconds(Math.max(5, timeoutSeconds) + 30L));
+        } catch (Exception e) {
+            // 诊断：MCP callTool 抛异常（如 session 失效），记录命令与异常，定位 MCP 层失效
+            log.warn(
+                    "[sandbox-diag] mcp.exec CALL ERROR: channel={}, cmd={}, cwd={}, error={}",
+                    Integer.toHexString(System.identityHashCode(this)),
+                    command,
+                    cwd,
+                    e.getMessage());
+            throw new SandboxException.SandboxRuntimeException(
+                    SandboxErrorCode.EXEC_TIMEOUT,
+                    "AgentRun MCP callTool failed: " + e.getMessage());
+        }
         if (result == null) {
+            log.warn(
+                    "[sandbox-diag] mcp.exec NULL: channel={}, cmd={}, cwd={}",
+                    Integer.toHexString(System.identityHashCode(this)),
+                    command,
+                    cwd);
             throw new SandboxException.SandboxRuntimeException(
                     SandboxErrorCode.EXEC_TIMEOUT, "AgentRun MCP exec returned null");
         }
         if (Boolean.TRUE.equals(result.isError())) {
             String msg = extractText(result);
+            // 诊断：MCP 返回 error（如 "Sandbox not found" 404），记录命令与错误文本，
+            // 这是第二轮复用报错的直接来源
+            log.warn(
+                    "[sandbox-diag] mcp.exec RESULT ERROR: channel={}, cmd={}, cwd={}, error={}",
+                    Integer.toHexString(System.identityHashCode(this)),
+                    command,
+                    cwd,
+                    msg);
             throw new SandboxException.SandboxRuntimeException(
                     SandboxErrorCode.WORKSPACE_START_ERROR,
                     "AgentRun MCP " + TOOL_EXEC + " error: " + msg);

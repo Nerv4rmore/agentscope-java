@@ -71,17 +71,29 @@ public abstract class AbstractBaseSandbox implements Sandbox {
         WorkspaceSpec spec = state.getWorkspaceSpec();
         SandboxSnapshot snapshot = state.getSnapshot();
 
+        // 诊断：AbstractBaseSandbox.start 入口，记录 workspaceRootReady 与 snapshot 是否可恢复，
+        // 决定走 Branch A/B/C/D 哪一支
+        log.info(
+                "[sandbox-diag] base.start ENTER: workspaceRootReady={}, snapshot={},"
+                        + " snapshotRestorable={}, projectionHash={}",
+                state.isWorkspaceRootReady(),
+                snapshot != null,
+                snapshot != null && snapshot.isRestorable(),
+                state.getWorkspaceProjectionHash());
+
         try {
             if (state.isWorkspaceRootReady()) {
                 // Workspace was ready at last stop — check if it still exists
                 boolean stillExists = probeWorkspaceRootForPreservedResume();
                 if (stillExists) {
                     // Branch A: workspace preserved — only apply ephemeral entries
+                    log.info("[sandbox-diag] base.start Branch A: workspace preserved");
                     log.debug(
                             "[sandbox] Branch A: workspace preserved, applying ephemeral entries");
                     workspaceSpecApplier.applyWorkspaceSpec(spec, true);
                 } else {
                     // Branch B: workspace was lost — restore from snapshot + ephemeral entries
+                    log.info("[sandbox-diag] base.start Branch B: workspace lost");
                     log.debug("[sandbox] Branch B: workspace lost, restoring from snapshot");
                     if (snapshot != null && snapshot.isRestorable()) {
                         doSetupWorkspace();
@@ -91,6 +103,7 @@ public abstract class AbstractBaseSandbox implements Sandbox {
                         workspaceSpecApplier.applyWorkspaceSpec(spec, true);
                     } else {
                         // Degrade to Branch D: no usable snapshot
+                        log.info("[sandbox-diag] base.start Branch B→D: snapshot not restorable");
                         log.warn("[sandbox] Branch B degraded to D: snapshot not restorable");
                         state.setWorkspaceProjectionHash(null); // force re-projection
                         doSetupWorkspace();
@@ -101,6 +114,7 @@ public abstract class AbstractBaseSandbox implements Sandbox {
                 // Workspace was not ready at last stop
                 if (snapshot != null && snapshot.isRestorable()) {
                     // Branch C: restore from snapshot + all spec entries
+                    log.info("[sandbox-diag] base.start Branch C: restore from snapshot");
                     log.debug("[sandbox] Branch C: restoring from snapshot");
                     doSetupWorkspace();
                     try (InputStream archive = snapshot.restore()) {
@@ -109,6 +123,7 @@ public abstract class AbstractBaseSandbox implements Sandbox {
                     workspaceSpecApplier.applyWorkspaceSpec(spec, false);
                 } else {
                     // Branch D: fresh initialization from full workspace spec
+                    log.info("[sandbox-diag] base.start Branch D: fresh init");
                     log.debug("[sandbox] Branch D: fresh workspace initialization");
                     state.setWorkspaceProjectionHash(null); // force re-projection on fresh create
                     doSetupWorkspace();
@@ -118,8 +133,14 @@ public abstract class AbstractBaseSandbox implements Sandbox {
             applyWorkspaceProjectionIfChanged(spec);
             state.setWorkspaceRootReady(true);
             running.set(true);
+            log.info("[sandbox-diag] base.start DONE: workspaceRootReady=true");
         } catch (Exception e) {
             state.setWorkspaceRootReady(false);
+            // 诊断：start 失败，记录异常类型与消息，定位是哪一步抛出（probe / hydrate / mkdir / exec）
+            log.warn(
+                    "[sandbox-diag] base.start FAILED: errorType={}, msg={}",
+                    e.getClass().getSimpleName(),
+                    e.getMessage());
             throw new SandboxException.WorkspaceStartException(
                     java.nio.file.Path.of(state.getWorkspaceSpec().getRoot()), e);
         }
@@ -200,8 +221,20 @@ public abstract class AbstractBaseSandbox implements Sandbox {
         try {
             ExecResult result =
                     doExec(null, "test -d " + getWorkspaceRoot(), PROBE_TIMEOUT_SECONDS);
-            return result.ok();
+            boolean ok = result.ok();
+            // 诊断：probe 工作区目录是否存在，决定走 Branch A（复用）还是 B（丢失重建）
+            log.info(
+                    "[sandbox-diag] probeWorkspaceRoot: root={}, exitCode={}, ok={}",
+                    getWorkspaceRoot(),
+                    result.exitCode(),
+                    ok);
+            return ok;
         } catch (Exception e) {
+            // 诊断：probe 抛异常（如 MCP 404 "Sandbox not found"），被迫假定工作区丢失
+            log.warn(
+                    "[sandbox-diag] probeWorkspaceRoot ERROR: root={}, error={}",
+                    getWorkspaceRoot(),
+                    e.getMessage());
             log.warn(
                     "[sandbox] Probe for workspace root failed, assuming lost: {}", e.getMessage());
             return false;

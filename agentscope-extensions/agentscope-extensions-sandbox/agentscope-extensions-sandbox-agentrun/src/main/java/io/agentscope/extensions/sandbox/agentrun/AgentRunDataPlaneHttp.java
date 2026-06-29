@@ -104,6 +104,17 @@ final class AgentRunDataPlaneHttp {
     }
 
     /**
+     * Reads the lifecycle status text from a sandbox object returned by {@link #getSandbox}.
+     *
+     * <p>Returns {@code null} when no status can be located. Exposed so callers can decide whether
+     * an existing instance is reusable (READY/RUNNING) or terminal (TERMINATED/FAILED) and must be
+     * recreated, without relying on exception message parsing.
+     */
+    static String readStatus(JsonNode sandbox) {
+        return textStatus(sandbox);
+    }
+
+    /**
      * 解包 AgentRun 数据面响应的 {@code data} 外层包装。
      *
      * <p>AgentRun 数据面接口标准返回形如 {@code { "code":"SUCCESS", "data": { ... } }}，

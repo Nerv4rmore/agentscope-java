@@ -1065,6 +1065,9 @@ public class HarnessAgent implements Agent, AutoCloseable {
         boolean disableDefaultWorkspaceSkills = false;
         boolean disableDynamicSubagents = false;
         boolean disableToolsConfig = false;
+        // 禁用 MessageBus 默认创建：避免 InboxMiddleware 在每次推理前访问沙箱文件系统，
+        // 从而让沙箱真正按需创建（仅工具执行时才创建）。适用于不使用 async tool / subagent 通信的场景。
+        boolean disableMessageBus = false;
 
         boolean skillManageToolEnabled = false;
         SkillManageConfig skillManageConfig;
@@ -1876,6 +1879,25 @@ public class HarnessAgent implements Agent, AutoCloseable {
             return this;
         }
 
+        /**
+         * 禁用 MessageBus 默认创建。
+         *
+         * <p>默认情况下，当未显式设置 {@code messageBus} 且配置了文件系统时，builder 会自动创建
+         * {@code WorkspaceMessageBus}（以沙箱文件系统为后端），并注册 {@code InboxMiddleware}。
+         * {@code InboxMiddleware} 会在每次推理前 drain inbox，访问沙箱文件系统，从而触发沙箱创建
+         * —— 这会使沙箱"按需创建"失效（即使纯文本对话也会创建沙箱）。
+         *
+         * <p>调用此方法后：不创建默认 MessageBus、不注册 InboxMiddleware / AsyncToolMiddleware /
+         * WaitAsyncResultsTool。适用于仅使用同步工具、不需要异步工具与 subagent 通信的场景，让沙箱
+         * 真正推迟到首次调用需要沙箱的工具时才创建。
+         *
+         * @return this builder
+         */
+        public Builder disableMessageBus() {
+            this.disableMessageBus = true;
+            return this;
+        }
+
         public Builder disableSubagents() {
             this.disableSubagents = true;
             return this;
@@ -2096,12 +2118,14 @@ public class HarnessAgent implements Agent, AutoCloseable {
             // ---- MessageBus / AsyncToolRegistry: workspace defaults ----
             // If not set explicitly or via DistributedStore, fall back to workspace-backed
             // implementations that use the same AbstractFilesystem as the rest of the agent.
-            if (messageBus == null && filesystem != null) {
+            // disableMessageBus 时跳过默认创建：WorkspaceMessageBus/WorkspaceAsyncToolRegistry 以
+            // 沙箱文件系统为后端，会在推理前被 InboxMiddleware 访问，导致沙箱被提前创建。
+            if (!disableMessageBus && messageBus == null && filesystem != null) {
                 messageBus =
                         new io.agentscope.harness.agent.bus.WorkspaceMessageBus(
                                 filesystem, ".agentscope/bus");
             }
-            if (asyncToolRegistry == null && filesystem != null) {
+            if (!disableMessageBus && asyncToolRegistry == null && filesystem != null) {
                 asyncToolRegistry =
                         new io.agentscope.harness.agent.bus.WorkspaceAsyncToolRegistry(
                                 filesystem, ".agentscope/bus/async-tools");

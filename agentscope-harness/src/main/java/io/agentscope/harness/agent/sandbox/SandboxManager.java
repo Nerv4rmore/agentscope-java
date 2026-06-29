@@ -99,24 +99,42 @@ public class SandboxManager {
                 try {
                     Optional<String> stateJson = stateStore.load(scopeKey.get());
                     if (stateJson.isPresent()) {
-                        log.debug(
-                                "[sandbox] Priority 3: resuming from persisted state (scope={})",
-                                scopeKey.get());
+                        // 诊断：命中持久化 state，走 Priority 3 resume（复用旧沙箱）
+                        log.info(
+                                "[sandbox-diag] Priority 3 HIT: resuming from persisted state"
+                                        + " (scope={}, stateLen={})",
+                                scopeKey.get(),
+                                stateJson.get() != null ? stateJson.get().length() : 0);
                         SandboxState state = client.deserializeState(stateJson.get());
                         Sandbox sandbox = client.resume(state);
                         return SandboxAcquireResult.selfManaged(sandbox, lease);
                     }
+                    // 诊断：load 返回空 = 上一轮没写成功 / 写入路径与读取路径不一致 / 被清除
+                    log.info(
+                            "[sandbox-diag] Priority 3 MISS: no persisted state for scope={}"
+                                    + " → falling through to Priority 4 create",
+                            scopeKey.get());
                 } catch (Exception e) {
+                    // 诊断：load 抛异常（反序列化失败 / IO 异常等）
                     log.warn(
-                            "[sandbox] Failed to load persisted state for scope {}, falling through"
-                                    + " to fresh create: {}",
+                            "[sandbox-diag] Priority 3 ERROR: failed to load persisted state for"
+                                    + " scope={}, falling through to fresh create: {}",
                             scopeKey.get(),
                             e.getMessage(),
                             e);
                 }
+            } else {
+                // 诊断：没有 scopeKey（USER/SESSION 缺失关键字段），Priority 3 直接跳过
+                log.info(
+                        "[sandbox-diag] Priority 3 SKIP: no scope key resolved"
+                                + " (isolationScope={}, runtimeContext={})",
+                        sandboxContext.getIsolationScope(),
+                        runtimeContext);
             }
 
-            log.debug("[sandbox] Priority 4: creating new sandbox");
+            log.info(
+                    "[sandbox-diag] Priority 4: creating new sandbox (scope={})",
+                    scopeKey.isPresent() ? scopeKey.get() : "none");
             WorkspaceSpec spec =
                     sandboxContext.getWorkspaceSpec() != null
                             ? sandboxContext.getWorkspaceSpec().copy()
@@ -193,19 +211,33 @@ public class SandboxManager {
                         runtimeContext,
                         agentId);
         if (scopeKey.isEmpty()) {
-            log.debug("[sandbox] No scope key available, skipping state persistence");
+            // 诊断：写盘时解析不出 scopeKey（与读侧一致地跳过），下一轮 load 自然 MISS
+            log.info(
+                    "[sandbox-diag] persistState SKIP: no scope key resolved"
+                            + " (isolationScope={}, runtimeContext={})",
+                    sandboxContext != null ? sandboxContext.getIsolationScope() : null,
+                    runtimeContext);
             return;
         }
 
         try {
             String json = client.serializeState(state);
             stateStore.save(scopeKey.get(), json);
-            log.debug(
-                    "[sandbox] Persisted sandbox state for scope {}: sessionId={}",
+            // 诊断：写盘成功，记录 scopeKey + sessionId + state 长度，便于和读侧 load 对照
+            log.info(
+                    "[sandbox-diag] persistState OK: scope={}, sandboxId={}, sessionId={},"
+                            + " stateLen={}",
                     scopeKey.get(),
-                    state.getSessionId());
+                    state.getSessionId() != null ? state.getSessionId() : "?",
+                    state.getSessionId(),
+                    json != null ? json.length() : 0);
         } catch (Exception e) {
-            log.warn("[sandbox] Failed to persist sandbox state: {}", e.getMessage(), e);
+            // 诊断：写盘抛异常 = 下一轮 load 必然 MISS 的直接原因
+            log.warn(
+                    "[sandbox-diag] persistState ERROR: scope={}, error={}",
+                    scopeKey.get(),
+                    e.getMessage(),
+                    e);
         }
     }
 

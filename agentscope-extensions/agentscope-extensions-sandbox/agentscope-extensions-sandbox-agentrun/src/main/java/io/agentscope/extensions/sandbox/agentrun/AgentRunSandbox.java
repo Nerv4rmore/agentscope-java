@@ -15,6 +15,7 @@
  */
 package io.agentscope.extensions.sandbox.agentrun;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import io.agentscope.core.agent.RuntimeContext;
 import io.agentscope.harness.agent.sandbox.AbstractBaseSandbox;
 import io.agentscope.harness.agent.sandbox.ExecResult;
@@ -70,6 +71,16 @@ public class AgentRunSandbox extends AbstractBaseSandbox {
 
     @Override
     public void start() throws Exception {
+        // 诊断：start 入口，记录 sandboxId / sessionId / workspaceRootReady / recreated，便于追踪复用与重建
+        log.info(
+                "[sandbox-diag] start ENTER: sandboxId={}, sessionId={}, workspaceRootReady={},"
+                        + " workspaceOnNas={}, recreated={}, projectionHash={}",
+                arState.getSandboxId(),
+                arState.getSessionId(),
+                arState.isWorkspaceRootReady(),
+                arState.isWorkspaceOnNas(),
+                recreated,
+                arState.getWorkspaceProjectionHash());
         if (WorkspaceMountSupport.hasBindMounts(arState.getWorkspaceSpec())) {
             log.warn(
                     "[sandbox-agentrun] WorkspaceSpec contains bind_mount entries; "
@@ -78,6 +89,15 @@ public class AgentRunSandbox extends AbstractBaseSandbox {
         try {
             doStart();
         } catch (Exception e) {
+            // 诊断：start 失败，记录异常类型与 isSessionLost 判断结果，定位为何未触发重建
+            log.warn(
+                    "[sandbox-diag] start FAILED: sandboxId={}, errorType={}, msg={},"
+                            + " isSessionLost={}, recreated={}",
+                    arState.getSandboxId(),
+                    e.getClass().getSimpleName(),
+                    e.getMessage(),
+                    AgentRunMcpChannel.isSessionLost(e),
+                    recreated);
             if (!AgentRunMcpChannel.isSessionLost(e) || recreated) {
                 throw e;
             }
@@ -117,9 +137,15 @@ public class AgentRunSandbox extends AbstractBaseSandbox {
     }
 
     private void doStart() throws Exception {
+        // 诊断：doStart 三步骤依次执行，定位失败发生在 ensureSandbox / mcp.connect / super.start 哪一步
+        log.info(
+                "[sandbox-diag] doStart step1 ensureSandbox: sandboxId={}", arState.getSandboxId());
         ensureSandbox();
+        log.info("[sandbox-diag] doStart step2 mcp.connect: sandboxId={}", arState.getSandboxId());
         mcp.connect();
+        log.info("[sandbox-diag] doStart step3 super.start: sandboxId={}", arState.getSandboxId());
         super.start();
+        log.info("[sandbox-diag] doStart DONE: sandboxId={}", arState.getSandboxId());
     }
 
     @Override
@@ -136,11 +162,25 @@ public class AgentRunSandbox extends AbstractBaseSandbox {
 
     @Override
     public void shutdown() throws Exception {
-        // NOTE: do NOT close the MCP channel here. The channel is cached per-sandboxId by
+        // The sandbox instance survives across acquire/release cycles: AgentRun reclaims it via
+        // the configured idle timeout (sandboxIdleTimeoutSeconds), not on shutdown. Issuing a
+        // DELETE here every turn was wasteful and, if AgentRun ever made DELETE immediate, would
+        // cause the next ensureSandbox() to see a 404 and rebuild a fresh instance — discarding
+        // the workspace and forcing a full re-projection. Real teardown is done via
+        // destroyInstance(), called only from AgentRunSandboxClient#delete().
+        //
+        // NOTE: do NOT close the MCP channel here either. The channel is cached per-sandboxId by
         // AgentRunSandboxClient and reused across acquire/release cycles so the MCP session
         // survives — closing it here would force a re-initialize on the next resume, which the
-        // AgentRun MCP server rejects ("Session not found"). The channel is closed only when the
-        // sandbox instance is destroyed via AgentRunSandboxClient#delete.
+        // AgentRun MCP server rejects ("Session not found").
+    }
+
+    /**
+     * Destroys the backend sandbox instance via an HTTP delete. Called only from {@link
+     * AgentRunSandboxClient#delete} for explicit teardown — {@link #shutdown()} is intentionally a
+     * no-op so instances live across turns.
+     */
+    void destroyInstance() throws Exception {
         if (!arState.isSandboxOwned()) {
             return;
         }
@@ -280,20 +320,121 @@ public class AgentRunSandbox extends AbstractBaseSandbox {
             throw new SandboxException.SandboxConfigurationException(
                     "AgentRun sandbox id is not set — call AgentRunSandboxClient#create or resume");
         }
+        // 诊断：ensureSandbox 入口，记录要查询的 sandboxId
+        log.info("[sandbox-diag] ensureSandbox ENTER: sandboxId={}", id);
         try {
-            http.getSandbox(id);
-            // Already exists; assume it's reusable (READY/RUNNING). Poll once to be sure.
-            http.waitUntilReady(id, 30);
-            return;
+            JsonNode existing = http.getSandbox(id);
+            String status = http.readStatus(existing);
+            // 诊断：HTTP 查询到实例，记录返回的 status（含原始 JSON 片段，定位 HTTP 层与 MCP 层状态不一致）
+            log.info(
+                    "[sandbox-diag] ensureSandbox getSandbox OK: sandboxId={}, status={}, body={}",
+                    id,
+                    status,
+                    existing != null ? existing.toString() : "null");
+            // The instance record may still be present even after it was terminated/deleted
+            // (manual console delete, expired idle timeout, prior shutdown). A terminal instance
+            // is not reusable — treat it as "gone" and fall through to recreate with the same id,
+            // the same as a 404. Otherwise poll until READY/RUNNING and reuse it.
+            if (isTerminalStatus(status)) {
+                log.info(
+                        "[sandbox-agentrun] Existing instance '{}' is terminal ({}); recreating",
+                        id,
+                        status);
+                // Drop the dead record first so createSandbox(id) isn't rejected as a duplicate;
+                // close the stale MCP channel (its session was bound to the dead instance) so
+                // connect() builds a fresh one; force a full workspace re-init on the fresh
+                // instance.
+                deleteForRecreate(id);
+                closeMcpForRecreate();
+                arState.setWorkspaceRootReady(false);
+                arState.setWorkspaceProjectionHash(null);
+            } else {
+                // 诊断：实例非终态，waitUntilReady 后复用（不重建）
+                log.info(
+                        "[sandbox-diag] ensureSandbox REUSE: sandboxId={}, status={} →"
+                                + " waitUntilReady",
+                        id,
+                        status);
+                http.waitUntilReady(id, 30);
+                log.info("[sandbox-diag] ensureSandbox REUSE OK: sandboxId={}", id);
+                return;
+            }
         } catch (SandboxException.SandboxRuntimeException e) {
+            // 诊断：getSandbox/waitUntilReady 抛异常，记录是否 404 / 是否终态，定位是否走重建
+            log.warn(
+                    "[sandbox-diag] ensureSandbox getSandbox ERROR: sandboxId={}, isNotFound={},"
+                            + " isTerminalStateFromError={}, msg={}",
+                    id,
+                    isNotFound(e),
+                    isTerminalStateFromError(e),
+                    e.getMessage());
             // Most likely 404 — fall through to create
-            if (!isNotFound(e)) {
+            if (!isNotFound(e) && !isTerminalStateFromError(e)) {
                 throw e;
+            }
+            if (isTerminalStateFromError(e)) {
+                // waitUntilReady saw a terminal state — clear the dead record and stale MCP
+                // session before recreating.
+                deleteForRecreate(id);
+                closeMcpForRecreate();
+                arState.setWorkspaceProjectionHash(null);
             }
             arState.setWorkspaceRootReady(false);
         }
+        // 诊断：走重建路径（用同 id 重新 createSandbox）
+        log.info("[sandbox-diag] ensureSandbox CREATE(reuse id): sandboxId={}", id);
         http.createSandbox(id);
         http.waitUntilReady(id, START_WAIT_SECONDS);
+        log.info("[sandbox-diag] ensureSandbox CREATE OK: sandboxId={}", id);
+    }
+
+    /**
+     * Best-effort delete of a dead/terminal sandbox record so a fresh instance can be created with
+     * the same id. Mirrors {@link #recreateSandbox()}'s cleanup; failures are logged (the record
+     * may already be gone, in which case createSandbox proceeds normally).
+     */
+    private void deleteForRecreate(String id) {
+        if (id == null || id.isBlank() || !arState.isSandboxOwned()) {
+            return;
+        }
+        try {
+            http.deleteSandbox(id);
+        } catch (Exception e) {
+            log.warn(
+                    "[sandbox-agentrun] delete dead sandbox before recreate failed: {}",
+                    e.getMessage());
+        }
+    }
+
+    /**
+     * Closes the cached MCP channel so the next {@code connect()} initializes a fresh session
+     * against the recreated instance. The channel object stays in the client's cache, but
+     * {@link AgentRunMcpChannel#connect()} re-initializes once its underlying client is null.
+     */
+    private void closeMcpForRecreate() {
+        try {
+            mcp.close();
+        } catch (Exception ignore) {
+            // best-effort
+        }
+    }
+
+    private static boolean isTerminalStatus(String status) {
+        if (status == null) {
+            return false;
+        }
+        String upper = status.toUpperCase();
+        return upper.contains("TERMINATED") || upper.contains("FAILED");
+    }
+
+    /**
+     * Detects a terminal-state failure raised by {@link AgentRunDataPlaneHttp#waitUntilReady}
+     * (message shaped "AgentRun sandbox entered terminal state TERMINATED: ..."). Used so a
+     * terminated/deleted instance is recreated rather than propagated as a hard error.
+     */
+    private static boolean isTerminalStateFromError(Exception e) {
+        String m = e.getMessage();
+        return m != null && m.contains("entered terminal state");
     }
 
     private static boolean isNotFound(Exception e) {

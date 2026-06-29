@@ -50,9 +50,12 @@ import reactor.core.publisher.Mono;
  * that timestamp are skipped — reducing token usage and protecting MEMORY.md from being
  * re-rewritten with stale content.
  *
- * <p>All file I/O is performed via the {@link AbstractFilesystem} obtained from the
- * {@link WorkspaceManager}, so this class is backend-agnostic (works with Local,
- * Sandbox, and Remote filesystems without any direct {@code java.nio.file.Files} usage).
+ * <p>File I/O is performed via the {@link AbstractFilesystem} obtained from the
+ * {@link WorkspaceManager} (Local, Sandbox, and Remote backends). For ephemeral sandbox backends
+ * ({@link io.agentscope.harness.agent.filesystem.sandbox.BaseSandboxFilesystem}) memory files live
+ * on the host disk (see {@link WorkspaceManager#readContextMd}), so consolidation lists/reads them
+ * via {@link WorkspaceManager} host-backed methods and {@code java.nio.file} mtime checks rather
+ * than globbing the sandbox.
  */
 public class MemoryConsolidator {
 
@@ -209,6 +212,13 @@ public class MemoryConsolidator {
             return "";
         }
 
+        // Ephemeral sandbox backends never hold memory files (memory_save/flush write them to the
+        // host, see WorkspaceManager). List + read from the host disk directly instead of globbing
+        // the sandbox. Other backends keep the original filesystem glob.
+        if (fs instanceof io.agentscope.harness.agent.filesystem.sandbox.BaseSandboxFilesystem) {
+            return readDailyEntriesFromHost(rc, watermark);
+        }
+
         GlobResult glob = fs.glob(rc, "*.md", "memory");
         if (!glob.isSuccess() || glob.matches() == null || glob.matches().isEmpty()) {
             return "";
@@ -239,6 +249,51 @@ public class MemoryConsolidator {
             }
         }
         return sb.toString();
+    }
+
+    /**
+     * Host-disk variant of {@link #readDailyEntries} for ephemeral sandbox backends: lists the
+     * local {@code memory/} directory and reads each daily file via {@link
+     * WorkspaceManager#readManagedWorkspaceFileUtf8} (which is host-backed for sandbox backends).
+     */
+    private String readDailyEntriesFromHost(RuntimeContext rc, Instant watermark) {
+        List<String> rels = workspaceManager.listLocalMemoryFiles();
+        List<String> eligible = new ArrayList<>();
+        for (String rel : rels) {
+            String name = fileName(rel);
+            if (name.equals(STATE_FILE) || name.equals("archive") || !name.endsWith(".md")) {
+                continue;
+            }
+            if (isHostModifiedAfter(rel, watermark)) {
+                eligible.add(rel);
+            }
+        }
+        eligible.sort(Comparator.comparing(MemoryConsolidator::fileName));
+
+        StringBuilder sb = new StringBuilder();
+        for (String rel : eligible) {
+            String content = workspaceManager.readManagedWorkspaceFileUtf8(rc, rel);
+            if (content != null && !content.isBlank()) {
+                sb.append("### ").append(fileName(rel)).append("\n");
+                sb.append(content.strip()).append("\n\n");
+            }
+        }
+        return sb.toString();
+    }
+
+    /** Host-disk mtime check mirroring {@link #isModifiedAfter(FileInfo, Instant)}. */
+    private boolean isHostModifiedAfter(String workspaceRelativePath, Instant watermark) {
+        try {
+            java.nio.file.Path local =
+                    workspaceManager.getWorkspace().resolve(workspaceRelativePath).normalize();
+            if (!java.nio.file.Files.isRegularFile(local)) {
+                return true; // be safe — include on missing file
+            }
+            Instant mtime = java.nio.file.Files.getLastModifiedTime(local).toInstant();
+            return mtime.isAfter(watermark);
+        } catch (java.io.IOException e) {
+            return true; // be safe on error
+        }
     }
 
     private static boolean isModifiedAfter(FileInfo fi, Instant watermark) {

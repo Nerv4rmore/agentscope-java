@@ -90,6 +90,15 @@ public class AgentRunSandboxClient implements SandboxClient<AgentRunSandboxClien
         String sessionId = UUID.randomUUID().toString();
         String sandboxId = deriveSandboxId(sessionId);
 
+        // 诊断：create 入口（Priority 4 新建沙箱的唯一来源），记录新 sessionId / 派生 sandboxId，
+        // 配合调用栈可定位为何走到 create（load MISS / state store 不可用等）
+        log.info(
+                "[sandbox-diag] client.create: NEW sessionId={}, derived sandboxId={},"
+                        + " workspaceRoot={}",
+                sessionId,
+                sandboxId,
+                merged.getWorkspaceRoot());
+
         AgentRunSandboxState state = new AgentRunSandboxState();
         state.setSessionId(sessionId);
         state.setWorkspaceSpec(workspaceSpec);
@@ -121,20 +130,40 @@ public class AgentRunSandboxClient implements SandboxClient<AgentRunSandboxClien
             throw new IllegalArgumentException(
                     "Expected AgentRunSandboxState but got: " + state.getClass().getName());
         }
+        // 诊断：resume 入口（Priority 3 复用沙箱的唯一来源），记录复用的 sessionId / sandboxId，
+        // 便于核对 resume 出来的沙箱与第一轮 create 的是否一致
+        log.info(
+                "[sandbox-diag] client.resume: REUSE sessionId={}, sandboxId={},"
+                        + " workspaceRootReady={} (workspaceRoot old={} → new={})",
+                ar.getSessionId(),
+                ar.getSandboxId(),
+                ar.isWorkspaceRootReady(),
+                ar.getWorkspaceRoot(),
+                merge(null).getWorkspaceRoot());
         // Refresh runtime configuration from current options. The persisted state may carry
         // stale values (e.g. workspaceRoot changed from /home/agentscope/workspace to
         // /home/user/workspace, or mcpServerUrl updated). These are operator settings, not
         // per-sandbox facts, so the live options always win.
         AgentRunSandboxClientOptions merged = merge(null);
-        ar.setWorkspaceRoot(merged.getWorkspaceRoot());
+        String oldRoot = ar.getWorkspaceRoot();
+        String newRoot = merged.getWorkspaceRoot();
+        ar.setWorkspaceRoot(newRoot);
         ar.setTemplateName(merged.getTemplateName());
         ar.setAccountId(merged.getAccountId());
         ar.setRegion(merged.getRegion());
         ar.setMcpServerUrl(merged.getMcpServerUrl());
         // workspaceOnNas depends on mount config + workspaceRoot, both possibly changed.
         ar.setWorkspaceOnNas(isWorkspaceUnderMounts(merged));
-        // A workspaceRoot change invalidates the prior root-ready flag.
-        ar.setWorkspaceRootReady(false);
+        // Only invalidate the root-ready flag (and projection hash) when workspaceRoot actually
+        // changes — the persisted sandbox instance survives across acquire/release cycles
+        // (AgentRun reclaims it via idle timeout, not on shutdown), so an unchanged root means
+        // the workspace is still in place. Preserving ready=true lets start() take Branch A
+        // (ephemeral-only) and skip re-projecting files that are already present. Unconditionally
+        // resetting here was the cause of every turn re-running mkdir + workspace projection.
+        if (oldRoot == null || !oldRoot.equals(newRoot)) {
+            ar.setWorkspaceRootReady(false);
+            ar.setWorkspaceProjectionHash(null);
+        }
         return build(ar, merged);
     }
 
@@ -159,6 +188,17 @@ public class AgentRunSandboxClient implements SandboxClient<AgentRunSandboxClien
                             "[sandbox-agentrun] delete: cached channel close failed: {}",
                             e.getMessage());
                 }
+            }
+        }
+        // Destroy the remote sandbox instance. This is the only place an HTTP delete is issued —
+        // AgentRunSandbox#shutdown() is a no-op so the instance survives across acquire/release
+        // cycles (reclaimed by AgentRun idle timeout), and the explicit delete is reserved for
+        // real teardown.
+        if (sandbox instanceof AgentRunSandbox ars) {
+            try {
+                ars.destroyInstance();
+            } catch (Exception e) {
+                log.warn("[sandbox-agentrun] delete: destroyInstance failed: {}", e.getMessage());
             }
         }
         try {
