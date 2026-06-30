@@ -309,10 +309,11 @@ public class WorkspaceManager implements AutoCloseable {
         if (!resolved.startsWith(workspace)) {
             return "";
         }
-        // Context memory files are host-only for ephemeral sandbox backends (BaseSandboxFilesystem)
-        // — skip the sandbox layer so the flush dedup read matches where memory_save wrote (host),
-        // and never hits the sandbox. Mirrors readContextMd (plain workspace root).
-        if (isContextMemoryFile(normalized) && filesystem instanceof BaseSandboxFilesystem) {
+        // Context memory files and session index are host-only for ephemeral sandbox backends
+        // (BaseSandboxFilesystem) — skip the sandbox layer so the flush dedup read matches where
+        // memory_save wrote (host), and never hits the sandbox. Mirrors readContextMd (plain
+        // workspace root).
+        if (isHostOnlyFile(normalized) && filesystem instanceof BaseSandboxFilesystem) {
             return readFileQuietly(workspace.resolve(normalized));
         }
         return readWithOverride(rc, normalized);
@@ -494,6 +495,29 @@ public class WorkspaceManager implements AutoCloseable {
             return true;
         }
         return normalized.startsWith(MEMORY_DIR + "/");
+    }
+
+    /**
+     * True for the per-agent session metadata index {@code agents/<agentId>/sessions/sessions.json}.
+     *
+     * <p>Like context memory, this index is host-only for ephemeral sandbox backends: it is read
+     * and written on every conversation offload, and routing it through the sandbox would trigger
+     * lazy sandbox creation on pure-text turns (breaking on-demand sandboxing). The index lives on
+     * the host disk alongside the session JSONL files.
+     */
+    private static boolean isSessionIndexFile(String normalized) {
+        // 路径形如 agents/<agentId>/sessions/sessions.json：以 sessions/sessions.json 结尾，
+        // 且前面包含 sessions/ 目录段，避免误判同名文件。
+        String suffix = SESSIONS_DIR + "/" + SESSIONS_STORE;
+        if (!normalized.endsWith(suffix)) {
+            return false;
+        }
+        return normalized.startsWith(AGENTS_DIR + "/") && normalized.contains("/" + suffix);
+    }
+
+    /** 沙箱后端下应走 host 本地 IO 的文件：memory 文件 + 会话索引文件。 */
+    private static boolean isHostOnlyFile(String normalized) {
+        return isContextMemoryFile(normalized) || isSessionIndexFile(normalized);
     }
 
     /**
@@ -884,7 +908,7 @@ public class WorkspaceManager implements AutoCloseable {
             writeLocalFile(normalized, content);
             return;
         }
-        if (isContextMemoryFile(normalized) && filesystem instanceof BaseSandboxFilesystem) {
+        if (isHostOnlyFile(normalized) && filesystem instanceof BaseSandboxFilesystem) {
             writeLocalFile(normalized, content);
             return;
         }
@@ -984,6 +1008,11 @@ public class WorkspaceManager implements AutoCloseable {
      * NamespaceFactory}), local disk fallback.
      */
     private String readWithOverride(RuntimeContext rc, String relativePath) {
+        // 沙箱后端下，host-only 文件（memory 文件 + 会话索引）绝不走沙箱：沙箱读取会触发
+        // 懒创建，破坏按需创建沙箱；且这些文件本就只存在于 host 磁盘。直接读本地。
+        if (isHostOnlyFile(relativePath) && filesystem instanceof BaseSandboxFilesystem) {
+            return readFileQuietly(workspace.resolve(relativePath));
+        }
         String fsContent = readTextThroughFilesystem(rc, relativePath);
         if (!fsContent.isEmpty()) {
             return fsContent;
