@@ -148,16 +148,23 @@
         </dependencies>
     </dependencyManagement>
 
+    <!--
+        发布到阿里云云效私有 Maven 仓库（master-agent 项目专用）。
+        原指向 Sonatype 公共仓库，现改为私有仓库以承载本地修复版制品。
+        凭据不内嵌于 URL（密码含 '[' 字符会被 java.net.URI 拒绝），改为在
+        ~/.m2/settings.xml 中按 <server id="repo-mascd"> 配置用户名/密码，
+        server.id 与此处的 repository.id 对应。
+    -->
     <distributionManagement>
         <repository>
-            <id>sonatype-nexus-staging</id>
-            <name>Nexus Release Repository</name>
-            <url>https://oss.sonatype.org/service/local/staging/deploy/maven2/</url>
+            <id>repo-mascd</id>
+            <name>Aliyun Packages (master-agent)</name>
+            <url>https://packages.aliyun.com/6a41e00ca7a8d2b1c6bfaf8b/maven/repo-mascd</url>
         </repository>
         <snapshotRepository>
-            <id>sonatype-nexus-snapshots</id>
-            <name>Sonatype Nexus Snapshots</name>
-            <url>https://oss.sonatype.org/content/repositories/snapshots/</url>
+            <id>repo-mascd</id>
+            <name>Aliyun Packages (master-agent)</name>
+            <url>https://packages.aliyun.com/6a41e00ca7a8d2b1c6bfaf8b/maven/repo-mascd</url>
         </snapshotRepository>
     </distributionManagement>
 

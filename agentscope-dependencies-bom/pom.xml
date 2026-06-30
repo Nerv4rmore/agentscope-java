@@ -507,16 +507,21 @@
         </dependencies>
     </dependencyManagement>
 
+    <!--
+        发布到阿里云云效私有 Maven 仓库（master-agent 项目专用）。
+        原指向 Sonatype 公共仓库，此 BOM 自带独立 distributionManagement 覆盖父 pom，
+        故需在此同步改为私有仓库。凭据在 ~/.m2/settings.xml 按 server.id=repo-mascd 配置。
+    -->
     <distributionManagement>
         <repository>
-            <id>sonatype-nexus-staging</id>
-            <name>Nexus Release Repository</name>
-            <url>https://oss.sonatype.org/service/local/staging/deploy/maven2/</url>
+            <id>repo-mascd</id>
+            <name>Aliyun Packages (master-agent)</name>
+            <url>https://packages.aliyun.com/6a41e00ca7a8d2b1c6bfaf8b/maven/repo-mascd</url>
         </repository>
         <snapshotRepository>
-            <id>sonatype-nexus-snapshots</id>
-            <name>Sonatype Nexus Snapshots</name>
-            <url>https://oss.sonatype.org/content/repositories/snapshots/</url>
+            <id>repo-mascd</id>
+            <name>Aliyun Packages (master-agent)</name>
+            <url>https://packages.aliyun.com/6a41e00ca7a8d2b1c6bfaf8b/maven/repo-mascd</url>
         </snapshotRepository>
     </distributionManagement>
 
