@@ -1057,6 +1057,9 @@ public class HarnessAgent implements Agent, AutoCloseable {
         boolean disableShellTool = false;
         boolean disableMemoryTools = false;
         boolean disableMemoryHooks = false;
+        // 仅禁用 MemoryMaintenanceMiddleware，保留 MemoryFlushMiddleware 的每轮 offload。
+        // 用于沙箱懒加载场景：maintenance 会 glob 扫沙箱破坏懒加载，而 offload 走 host 本地 IO。
+        boolean disableMemoryMaintenance = false;
         boolean disableSessionPersistence = false;
         boolean disableWorkspaceContext = false;
         boolean disableAtPathExpansion = false;
@@ -1863,6 +1866,22 @@ public class HarnessAgent implements Agent, AutoCloseable {
             return this;
         }
 
+        /**
+         * 仅禁用 {@link MemoryMaintenanceMiddleware}（memory 文件归档 / consolidation / session 日志清理），
+         * 保留 {@link MemoryFlushMiddleware} 的每轮 offload（写 session JSONL）。
+         *
+         * <p>适用于沙箱懒加载场景：{@code MemoryMaintenanceMiddleware} 会在每次 agent 调用后
+         * glob 扫描 memory 目录做维护，访问沙箱文件系统触发懒创建；而 {@code MemoryFlushMiddleware}
+         * 的 offload 全程走 host 本地 IO，不碰沙箱。本开关允许只关维护、保留 offload。
+         *
+         * <p>注意：{@link #disableMemoryHooks()} 仍会同时关闭 flush 与 maintenance（向后兼容）；
+         * 若仅需关闭 maintenance，请改用本方法。
+         */
+        public Builder disableMemoryMaintenance() {
+            this.disableMemoryMaintenance = true;
+            return this;
+        }
+
         /** No-op since 2.0; session persistence is owned by ReActAgent itself. */
         public Builder disableSessionPersistence() {
             this.disableSessionPersistence = true;
@@ -2152,9 +2171,11 @@ public class HarnessAgent implements Agent, AutoCloseable {
                 inner.middleware(new AtPathExpansionMiddleware(wsManager));
             }
             Model memoryModel = memoryConfig.model() != null ? memoryConfig.model() : model;
-            if (memoryModel != null && !disableMemoryHooks) {
-                IsolationScope effectiveIsolationScope = fsIsolationScope;
+            IsolationScope effectiveIsolationScope = fsIsolationScope;
 
+            // MemoryFlushMiddleware：每轮 offload 写 session JSONL（host 本地 IO，不碰沙箱）。
+            // 受 disableMemoryHooks 控制（保留原语义：disableMemoryHooks 仍同时关 flush 与 maintenance）。
+            if (memoryModel != null && !disableMemoryHooks) {
                 String effectiveFlushPrompt =
                         memoryConfig.flushPrompt() != null
                                 ? memoryConfig.flushPrompt()
@@ -2166,7 +2187,12 @@ public class HarnessAgent implements Agent, AutoCloseable {
                                 effectiveFlushPrompt,
                                 memoryConfig.flushTrigger(),
                                 effectiveIsolationScope));
+            }
 
+            // MemoryMaintenanceMiddleware：memory 文件归档 / consolidation / session 日志清理。
+            // 会在每次 agent 调用后 glob 扫描 memory 目录，访问沙箱文件系统触发懒创建，
+            // 破坏沙箱懒加载。受 disableMemoryHooks 或 disableMemoryMaintenance 控制。
+            if (memoryModel != null && !disableMemoryHooks && !disableMemoryMaintenance) {
                 String effectiveConsolidationPrompt =
                         memoryConfig.consolidationPrompt() != null
                                 ? memoryConfig.consolidationPrompt()
