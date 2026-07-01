@@ -189,11 +189,14 @@ class ToolExecutor {
             return Mono.just(ToolResultBlock.error("Tool not found: " + toolCall.getName()));
         }
 
-        // External tool short-circuit: surface the call to the caller without running schema
-        // validation, preset injection, or scheduling. SchemaOnlyTool and any
-        // @Tool(externalTool=true) method end up here.
+        // 外部工具短路：不在本地执行，直接返回 suspended 块交由调用方处理。
+        // SchemaOnlyTool 和任何 @Tool(externalTool=true) 方法都会走到这里。
+        // 必须返回 suspended 块（而非 Mono.error），否则 error 会被
+        // executeWithInfrastructure 的通用错误处理转成 error 块，导致
+        // ReActAgent.acting() 的 isSuspended() 检测不到、Agent 不暂停、
+        // 模型陷入重试死循环。
         if (tool instanceof ToolBase tb && tb.isExternalTool()) {
-            return Mono.error(new ToolSuspendException());
+            return Mono.just(ToolResultBlock.suspended(toolCall));
         }
 
         // Check tool activation

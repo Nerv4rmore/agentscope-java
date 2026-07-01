@@ -35,6 +35,7 @@ import io.agentscope.core.event.ExceedMaxItersEvent;
 import io.agentscope.core.event.ModelCallEndEvent;
 import io.agentscope.core.event.ModelCallStartEvent;
 import io.agentscope.core.event.RequestStopEvent;
+import io.agentscope.core.event.RequireExternalExecutionEvent;
 import io.agentscope.core.event.RequireUserConfirmEvent;
 import io.agentscope.core.event.TextBlockDeltaEvent;
 import io.agentscope.core.event.TextBlockEndEvent;
@@ -2340,6 +2341,15 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
 
                                 if (successPairs.isEmpty()) {
                                     if (!pendingPairs.isEmpty()) {
+                                        // 外部工具暂停：发出 RequireExternalExecutionEvent，
+                                        // 前端收到 hitl.options 后渲染选项表单，
+                                        // 用户确认后 POST /chat/confirm 恢复会话。
+                                        publishEvent(
+                                                new RequireExternalExecutionEvent(
+                                                        replyId,
+                                                        pendingPairs.stream()
+                                                                .map(Map.Entry::getKey)
+                                                                .toList()));
                                         return Mono.just(buildSuspendedMsg(pendingPairs));
                                     }
                                     return executeIteration(iter + 1);
@@ -2359,6 +2369,17 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                                                     }
 
                                                     if (!pendingPairs.isEmpty()) {
+                                                        // 部分工具成功、部分外部工具暂停：
+                                                        // 发出 RequireExternalExecutionEvent 通知前端，
+                                                        // 然后暂停 Agent 等待用户确认。
+                                                        publishEvent(
+                                                                new RequireExternalExecutionEvent(
+                                                                        replyId,
+                                                                        pendingPairs.stream()
+                                                                                .map(
+                                                                                        Map.Entry
+                                                                                                ::getKey)
+                                                                                .toList()));
                                                         return Mono.just(
                                                                 buildSuspendedMsg(pendingPairs));
                                                     }
