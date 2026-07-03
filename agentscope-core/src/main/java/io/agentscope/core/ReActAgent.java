@@ -31,6 +31,7 @@ import io.agentscope.core.event.AgentEventEmitter;
 import io.agentscope.core.event.AgentResultEvent;
 import io.agentscope.core.event.AgentStartEvent;
 import io.agentscope.core.event.ConfirmResult;
+import io.agentscope.core.event.DeferredEventEmitter;
 import io.agentscope.core.event.ExceedMaxItersEvent;
 import io.agentscope.core.event.ModelCallEndEvent;
 import io.agentscope.core.event.ModelCallStartEvent;
@@ -2557,6 +2558,17 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                                                 Set<String> chunkedToolIds =
                                                         ConcurrentHashMap.newKeySet();
 
+                                                // 延迟事件缓冲队列：工具通过 DeferredEventEmitter
+                                                // 发射的事件暂存于此，在所有 ToolResultEndEvent 之后
+                                                // 统一 flush，使延迟事件出现在 tool.end 之后。
+                                                java.util.concurrent.ConcurrentLinkedQueue<
+                                                                AgentEvent>
+                                                        deferredEvents =
+                                                                new java.util.concurrent
+                                                                        .ConcurrentLinkedQueue<>();
+                                                DeferredEventEmitter deferredEmitter =
+                                                        deferredEvents::add;
+
                                                 toolkit.setInternalChunkCallback(
                                                         (toolUse, chunk) -> {
                                                             if (chunk.getOutput() != null
@@ -2604,7 +2616,11 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                                                                 .contextWrite(
                                                                         ctx ->
                                                                                 ctx.putAll(
-                                                                                        parentCtx))
+                                                                                                parentCtx)
+                                                                                        .put(
+                                                                                                DeferredEventEmitter
+                                                                                                        .CONTEXT_KEY,
+                                                                                                deferredEmitter))
                                                                 .subscribe(
                                                                         results -> {
                                                                             List<
@@ -2641,6 +2657,20 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                                                                                                 entry.getKey()
                                                                                                         .getName(),
                                                                                                 state));
+                                                                            }
+                                                                            // 所有 ToolResultEndEvent
+                                                                            // 发完后，
+                                                                            // flush 延迟事件缓冲队列，使工具
+                                                                            // 通过
+                                                                            // DeferredEventEmitter
+                                                                            // 发射
+                                                                            // 的事件出现在 tool.end 之后。
+                                                                            AgentEvent deferred;
+                                                                            while ((deferred =
+                                                                                            deferredEvents
+                                                                                                    .poll())
+                                                                                    != null) {
+                                                                                sink.next(deferred);
                                                                             }
                                                                             sink.complete();
                                                                         },
