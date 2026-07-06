@@ -66,6 +66,7 @@ class ToolExecutor {
     private final ExecutorService executorService;
     private BiConsumer<ToolUseBlock, ToolResultBlock> userChunkCallback;
     private BiConsumer<ToolUseBlock, ToolResultBlock> internalChunkCallback;
+    private List<ToolExecutionListener> executionListeners = new ArrayList<>();
 
     /**
      * Create a tool executor with Reactor Schedulers (recommended).
@@ -114,6 +115,25 @@ class ToolExecutor {
      */
     BiConsumer<ToolUseBlock, ToolResultBlock> getChunkCallback() {
         return this.userChunkCallback;
+    }
+
+    /**
+     * Append a {@link ToolExecutionListener} that will be notified after each tool finishes
+     * executing (success, error, or suspended). Used by Toolkit.copy() to preserve listeners
+     * across deep copies.
+     */
+    void addExecutionListener(ToolExecutionListener listener) {
+        if (listener != null) {
+            this.executionListeners.add(listener);
+        }
+    }
+
+    /**
+     * Returns a snapshot of the registered execution listeners. Used by Toolkit.copy() so the
+     * copied toolkit keeps the same listeners.
+     */
+    List<ToolExecutionListener> getExecutionListeners() {
+        return new ArrayList<>(this.executionListeners);
     }
 
     /**
@@ -290,7 +310,39 @@ class ToolExecutor {
                         Mono.just(
                                 ToolResultBlock.error(
                                         "Tool execution failed: Tool completed without returning a"
-                                                + " result")));
+                                                + " result")))
+                .doOnNext(result -> notifyListeners(executionParam, result));
+    }
+
+    /**
+     * Notifies all registered {@link ToolExecutionListener}s that a tool has finished executing.
+     * Each listener is invoked in isolation; any exception is caught and logged so a faulty
+     * listener can never break the tool/agent pipeline. No-op when no listeners are registered.
+     */
+    private void notifyListeners(ToolCallParam param, ToolResultBlock result) {
+        if (executionListeners.isEmpty() || result == null) {
+            return;
+        }
+        ToolUseBlock toolUse = param.getToolUseBlock();
+        ToolCallContext ctx =
+                new ToolCallContext(
+                        toolUse.getName(),
+                        toolUse.getId(),
+                        param.getInput(),
+                        toolUse,
+                        param.getRuntimeContext());
+        for (ToolExecutionListener listener : executionListeners) {
+            try {
+                listener.onToolExecuted(ctx, result);
+            } catch (Exception e) {
+                logger.warn(
+                        "ToolExecutionListener '{}' failed for tool '{}': {}",
+                        listener.getClass().getSimpleName(),
+                        ctx.getToolName(),
+                        e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName(),
+                        e);
+            }
+        }
     }
 
     // ==================== Batch Tool Execution ====================

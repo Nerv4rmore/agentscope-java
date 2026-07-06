@@ -464,6 +464,21 @@ public class Toolkit {
     }
 
     /**
+     * Registers a {@link ToolExecutionListener} that will be invoked after each tool finishes
+     * executing (success, error, or suspended). Multiple listeners are notified in registration
+     * order.
+     *
+     * <p>Listeners are preserved across {@link #copy()} so a toolkit deep-copied by ReActAgent
+     * keeps the same billing/audit hooks. A faulty listener (one that throws) is isolated by the
+     * executor and never breaks the tool pipeline.
+     *
+     * @param listener the listener to register; {@code null} is silently ignored
+     */
+    public void addExecutionListener(ToolExecutionListener listener) {
+        executor.addExecutionListener(listener);
+    }
+
+    /**
      * Execute a tool with the given parameters.
      *
      * <p>Example usage:
@@ -780,6 +795,11 @@ public class Toolkit {
 
         // Preserve user-defined chunk callbacks across toolkit copies (Issue #870)
         copy.executor.setChunkCallback(this.executor.getChunkCallback());
+
+        // Preserve execution listeners (billing/audit hooks) across toolkit copies
+        for (ToolExecutionListener listener : this.executor.getExecutionListeners()) {
+            copy.executor.addExecutionListener(listener);
+        }
 
         return copy;
     }
