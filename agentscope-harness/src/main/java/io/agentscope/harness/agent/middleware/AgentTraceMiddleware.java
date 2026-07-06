@@ -126,12 +126,6 @@ public class AgentTraceMiddleware implements HarnessRuntimeMiddleware {
                             // Always surface the model's text, even when it accompanies tool calls
                             // (a tool-call turn often carries a "thinking out loud" preamble that
                             // would otherwise be silently dropped).
-                            if (hasText) {
-                                log.info(
-                                        "[{}] POST_REASONING | text: {}",
-                                        name,
-                                        truncate(text, 120));
-                            }
                             if (toolCalls.isEmpty()) {
                                 // No tool call ends the ReAct loop. If there was also no text, the
                                 // model returned an empty completion — make that explicit instead
@@ -249,8 +243,6 @@ public class AgentTraceMiddleware implements HarnessRuntimeMiddleware {
                             + " preamble: {}",
                     name,
                     truncate(text, 120));
-        } else {
-            log.info("[{}] POST_CALL | response: {}", name, truncate(text, 120));
         }
     }
 
