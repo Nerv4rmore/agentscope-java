@@ -180,17 +180,26 @@ public class AgentTraceMiddleware implements HarnessRuntimeMiddleware {
                 .doOnNext(
                         ev -> {
                             if (ev instanceof ToolResultStartEvent start) {
-                                toolNames.put(start.getToolCallId(), start.getToolCallName());
-                                toolText.computeIfAbsent(
-                                        start.getToolCallId(), k -> new StringBuilder());
-                            } else if (ev instanceof ToolResultTextDeltaEvent delta) {
-                                if (delta.getDelta() != null) {
-                                    toolText.computeIfAbsent(
-                                                    delta.getToolCallId(), k -> new StringBuilder())
-                                            .append(delta.getDelta());
+                                // 工具调用 id 在异常场景下可能为 null（如模型返回 name=null 的工具调用），
+                                // ConcurrentHashMap 不允许 null key，这里提前跳过，避免抛 NPE 打断流。
+                                String id = start.getToolCallId();
+                                if (id == null) {
+                                    return;
                                 }
+                                toolNames.put(id, start.getToolCallName());
+                                toolText.computeIfAbsent(id, k -> new StringBuilder());
+                            } else if (ev instanceof ToolResultTextDeltaEvent delta) {
+                                String id = delta.getToolCallId();
+                                if (id == null || delta.getDelta() == null) {
+                                    return;
+                                }
+                                toolText.computeIfAbsent(id, k -> new StringBuilder())
+                                        .append(delta.getDelta());
                             } else if (ev instanceof ToolResultEndEvent end) {
                                 String id = end.getToolCallId();
+                                if (id == null) {
+                                    return;
+                                }
                                 String toolName = toolNames.getOrDefault(id, "<unknown>");
                                 String text =
                                         toolText.getOrDefault(id, new StringBuilder()).toString();
