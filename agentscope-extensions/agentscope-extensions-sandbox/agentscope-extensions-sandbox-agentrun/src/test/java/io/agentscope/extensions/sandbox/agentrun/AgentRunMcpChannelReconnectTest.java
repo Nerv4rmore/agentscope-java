@@ -57,6 +57,24 @@ class AgentRunMcpChannelReconnectTest {
     }
 
     @Test
+    void agentRunSessionExpiredIsDetected() throws Exception {
+        // AgentRun returns {"Code":"SessionExpired","Message":"session <id> is expired"} after the
+        // sandbox idle-timeout reclaims the session. The MCP SDK surfaces this as a plain
+        // RuntimeException whose message embeds the JSON — neither a typed
+        // McpTransportSessionNotFoundException nor matching "session not found". Without explicit
+        // recognition, recreateSandbox() never fires and start() fails permanently.
+        assertTrue(
+                isSessionLost(
+                        new RuntimeException(
+                                "Failed to send message: AggregateResponseEvent[...data="
+                                        + "{\"RequestId\":\"1-6a4f69e9-015c168c-4b9304b3dbe8\","
+                                        + "\"Code\":\"SessionExpired\",\"Message\":\"session"
+                                        + " 9ec21cc6-18e4-4bdc-bb96-22072a8fa88f is expired\"}]")));
+        assertTrue(isSessionLost(new RuntimeException("SessionExpired")));
+        assertTrue(isSessionLost(new RuntimeException("session 9ec21cc6 is expired")));
+    }
+
+    @Test
     void unrelatedErrorsAreNotTreatedAsSessionLoss() throws Exception {
         assertFalse(isSessionLost(new RuntimeException("command timed out")));
         assertFalse(isSessionLost(new IllegalStateException("tool not found")));

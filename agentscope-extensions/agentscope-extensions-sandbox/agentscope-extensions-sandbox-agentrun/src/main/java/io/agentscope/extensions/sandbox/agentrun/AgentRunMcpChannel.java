@@ -127,9 +127,13 @@ final class AgentRunMcpChannel implements AutoCloseable {
                     command,
                     cwd,
                     e.getMessage());
+            // 保留原始异常作为 cause：isSessionLost 会沿 cause 链查找
+            // McpTransportSessionNotFoundException 及 message 子串，丢弃 cause 会使
+            // 基于 instanceof 的检测失效（即便 SDK 后续改抛类型化异常也认不出 session 丢失）。
             throw new SandboxException.SandboxRuntimeException(
                     SandboxErrorCode.EXEC_TIMEOUT,
-                    "AgentRun MCP callTool failed: " + e.getMessage());
+                    "AgentRun MCP callTool failed: " + e.getMessage(),
+                    e);
         }
         if (result == null) {
             log.warn(
@@ -251,6 +255,16 @@ final class AgentRunMcpChannel implements AutoCloseable {
                         || lower.contains("http 404")
                         || lower.contains("err_not_found")
                         || lower.contains("not_found")) {
+                    return true;
+                }
+                // MCP session 过期：AgentRun 在 session 被 idle-timeout 回收后返回 JSON
+                // {"Code":"SessionExpired","Message":"session <id> is expired"}。SDK 把整段
+                // JSON 拼进 RuntimeException 的 message（非 McpTransportSessionNotFoundException），
+                // 因此必须靠子串识别，否则 isSessionLost 返回 false，recreateSandbox 不触发，
+                // 沙箱 start 直接失败。匹配 Code 值 "sessionexpired" 与 Message 措辞 "is expired"。
+                if (lower.contains("sessionexpired")
+                        || lower.contains("session expired")
+                        || lower.contains("is expired")) {
                     return true;
                 }
             }
