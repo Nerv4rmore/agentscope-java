@@ -105,7 +105,13 @@ public class SandboxManager {
                                         + " (scope={}, stateLen={})",
                                 scopeKey.get(),
                                 stateJson.get() != null ? stateJson.get().length() : 0);
-                        SandboxState state = client.deserializeState(stateJson.get());
+                        SandboxState state =
+                                client.deserializeState(
+                                        stateJson.get(), sandboxContext.getSnapshotSpec());
+                        // Overwrite stale WorkspaceSpec with current application config
+                        if (sandboxContext.getWorkspaceSpec() != null) {
+                            state.setWorkspaceSpec(sandboxContext.getWorkspaceSpec().copy());
+                        }
                         Sandbox sandbox = client.resume(state);
                         return SandboxAcquireResult.selfManaged(sandbox, lease);
                     }

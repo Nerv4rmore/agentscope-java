@@ -85,6 +85,7 @@ import io.agentscope.core.middleware.MiddlewareBase;
 import io.agentscope.core.middleware.MiddlewareChain;
 import io.agentscope.core.middleware.ModelCallInput;
 import io.agentscope.core.middleware.ReasoningInput;
+import io.agentscope.core.model.ChatResponse;
 import io.agentscope.core.model.ChatUsage;
 import io.agentscope.core.model.ExecutionConfig;
 import io.agentscope.core.model.GenerateOptions;
@@ -165,7 +166,9 @@ import reactor.core.scheduler.Schedulers;
  *
  * <p><b>Usage Example:</b>
  * <pre>{@code
- * // Create a model
+ * import io.agentscope.extensions.model.dashscope.DashScopeChatModel;
+ *
+ * // Create a model (requires dependency: agentscope-extensions-model-dashscope)
  * DashScopeChatModel model = DashScopeChatModel.builder()
  *     .apiKey(System.getenv("DASHSCOPE_API_KEY"))
  *     .modelName("qwen-plus")
@@ -1040,7 +1043,17 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                         ? model.supportsNativeStructuredOutputWithTools()
                         : model.supportsNativeStructuredOutput();
         if (useNative) {
-            return doNativeStructuredCall(msgs, jsonSchema);
+            return doNativeStructuredCall(msgs, jsonSchema)
+                    .onErrorResume(
+                            e -> {
+                                log.warn(
+                                        "Native structured output failed ({}) — falling back to"
+                                                + " synthetic tool path",
+                                        e.getMessage() != null
+                                                ? e.getMessage()
+                                                : e.getClass().getSimpleName());
+                                return doFallbackStructuredCall(msgs, jsonSchema);
+                            });
         }
         return doFallbackStructuredCall(msgs, jsonSchema);
     }
@@ -1077,11 +1090,21 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                                             .strict(true)
                                             .build());
 
+                    int contextSizeBefore = scope.state.contextMutable().size();
+
                     return scope.doCallInner(msgs)
                             .flatMap(
                                     result -> {
                                         Msg out = wrapNativeStructuredResult(result);
                                         return saveStateToSession(scope).thenReturn(out);
+                                    })
+                            .doOnError(
+                                    e -> {
+                                        List<Msg> ctx = scope.state.contextMutable();
+                                        while (ctx.size() > contextSizeBefore) {
+                                            ctx.remove(ctx.size() - 1);
+                                        }
+                                        scope.nativeResponseFormat = null;
                                     });
                 });
     }
@@ -1914,7 +1937,7 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                                         event.getEffectiveGenerateOptions() != null
                                                 ? event.getEffectiveGenerateOptions()
                                                 : buildGenerateOptions();
-                                if (nativeResponseFormat != null) {
+                                if (nativeResponseFormat != null && soTool == null) {
                                     options =
                                             GenerateOptions.mergeOptions(
                                                     GenerateOptions.builder()
@@ -2099,7 +2122,7 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                             rc,
                             MiddlewareBase::onModelCall,
                             modelCallCore)
-                    .apply(new ModelCallInput(messages, tools, options, model))
+                    .apply(new ModelCallInput(messages, tools, options, modelForCall()))
                     .doOnNext(this::publishEvent);
         }
 
@@ -3069,11 +3092,16 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
             List<Msg> messageList = prepareSummaryMessages();
             GenerateOptions generateOptions = buildGenerateOptions();
             ReasoningContext context = new ReasoningContext(getName());
+            Model summaryModel = modelForCall();
             publishEvent(new ExceedMaxItersEvent("", maxIters, maxIters));
 
             return hookDispatcher
                     .firePreSummary(
-                            messageList, generateOptions, model.getModelName(), maxIters, systemMsg)
+                            messageList,
+                            generateOptions,
+                            summaryModel.getModelName(),
+                            maxIters,
+                            systemMsg)
                     .flatMap(
                             preSummaryEvent -> {
                                 List<Msg> effectiveMessages =
@@ -3083,7 +3111,11 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                                 GenerateOptions effectiveOptions =
                                         preSummaryEvent.getEffectiveGenerateOptions();
 
-                                return summaryStream(context, effectiveMessages, effectiveOptions)
+                                return summaryStream(
+                                                context,
+                                                effectiveMessages,
+                                                effectiveOptions,
+                                                summaryModel)
                                         .then(
                                                 Mono.defer(
                                                         () ->
@@ -3096,7 +3128,7 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                                                                 .firePostSummary(
                                                                         msg,
                                                                         effectiveOptions,
-                                                                        model.getModelName())
+                                                                        summaryModel.getModelName())
                                                                 .map(
                                                                         postEvent -> {
                                                                             Msg finalMsg =
@@ -3122,10 +3154,14 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
          * @param context   reasoning context for chunk accumulation
          * @param messages  the messages to send to the model
          * @param options   generation options
+         * @param model     the model used for this summary call
          * @return event stream from the summary model call
          */
         Flux<AgentEvent> summaryStream(
-                ReasoningContext context, List<Msg> messages, GenerateOptions options) {
+                ReasoningContext context,
+                List<Msg> messages,
+                GenerateOptions options,
+                Model model) {
 
             Function<ModelCallInput, Flux<AgentEvent>> summaryModelCallCore =
                     mci -> summaryModelCallStream(context, mci, options);
@@ -3161,7 +3197,8 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                                                                             msg,
                                                                             context,
                                                                             hookOptions,
-                                                                            model.getModelName())
+                                                                            mci.model()
+                                                                                    .getModelName())
                                                                     .contextWrite(
                                                                             ctx ->
                                                                                     ctx.putAll(
@@ -3391,6 +3428,18 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
         // Start with user-configured generateOptions if available
         GenerateOptions baseOptions = generateOptions;
 
+        // Layer the agent-level retry budget underneath explicit per-call settings.
+        if (modelConfig != null) {
+            GenerateOptions retryBudgetOptions =
+                    GenerateOptions.builder()
+                            .executionConfig(
+                                    ExecutionConfig.builder()
+                                            .maxAttempts(modelConfig.maxRetries())
+                                            .build())
+                            .build();
+            baseOptions = GenerateOptions.mergeOptions(baseOptions, retryBudgetOptions);
+        }
+
         // If modelExecutionConfig is set, merge it into the options
         if (modelExecutionConfig != null) {
             GenerateOptions execConfigOptions =
@@ -3399,6 +3448,51 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
         }
 
         return baseOptions != null ? baseOptions : GenerateOptions.builder().build();
+    }
+
+    private Model modelForCall() {
+        Model fallbackModel = modelConfig.fallbackModel();
+        if (fallbackModel == null) {
+            return model;
+        }
+
+        AtomicReference<Model> activeModel = new AtomicReference<>(model);
+        return new Model() {
+            @Override
+            public Flux<ChatResponse> stream(
+                    List<Msg> messages, List<ToolSchema> tools, GenerateOptions options) {
+                Flux<ChatResponse> primaryFlux = model.stream(messages, tools, options);
+                return primaryFlux.switchOnFirst(
+                        (signal, flux) -> {
+                            if (signal.isOnError()) {
+                                Throwable error = signal.getThrowable();
+                                activeModel.set(fallbackModel);
+                                log.warn(
+                                        "Primary model {} failed, switching to fallback {}",
+                                        model.getModelName(),
+                                        fallbackModel.getModelName(),
+                                        error);
+                                return fallbackModel.stream(messages, tools, options);
+                            }
+                            return flux;
+                        });
+            }
+
+            @Override
+            public String getModelName() {
+                return activeModel.get().getModelName();
+            }
+
+            @Override
+            public boolean supportsNativeStructuredOutput() {
+                return activeModel.get().supportsNativeStructuredOutput();
+            }
+
+            @Override
+            public int getContextWindowSize() {
+                return activeModel.get().getContextWindowSize();
+            }
+        };
     }
 
     @Override
@@ -3424,7 +3518,15 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                                     .content(TextBlock.builder().text(recoveryText).build())
                                     .build();
                     scope.state.contextMutable().add(recoveryMsg);
-                    return Mono.just(recoveryMsg);
+                    return saveStateToSession(scope)
+                            .thenReturn(recoveryMsg)
+                            .onErrorResume(
+                                    e -> {
+                                        log.warn(
+                                                "Failed to save agent state after user interrupt",
+                                                e);
+                                        return Mono.just(recoveryMsg);
+                                    });
                 });
     }
 
@@ -3820,11 +3922,10 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
 
         /**
          * Configures the model from a string id resolved via {@link ModelRegistry}: a named
-         * registration ({@link ModelRegistry#register(String, Model)}) or a built-in pattern such
-         * as {@code openai:gpt-5.5}, {@code dashscope:qwen-max}, {@code anthropic:claude-sonnet-4-5},
-         * {@code gemini:gemini-2.0-flash}, or {@code ollama:llama3}. API keys for auto-created models
-         * come from standard environment variables ({@code OPENAI_API_KEY}, {@code DASHSCOPE_API_KEY},
-         * etc.).
+         * registration ({@link ModelRegistry#register(String, Model)}) or an extension provider
+         * pattern such as {@code openai:gpt-5.5}, {@code dashscope:qwen-max}, {@code
+         * anthropic:claude-sonnet-4-5}, {@code gemini:gemini-2.0-flash}, or {@code ollama:llama3}.
+         * Extension modules read API keys from their standard environment variables when auto-created.
          *
          * @param modelId registry id or {@code provider:model} string
          * @return this builder
@@ -4209,7 +4310,7 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
          *     {@code skillBox(...)} with {@code skillRepository(...)} is untested — new code
          *     should prefer {@link #skillRepository(AgentSkillRepository)}.
          */
-        @Deprecated(forRemoval = true, since = "2.0.0")
+        @Deprecated(since = "2.0.0")
         public Builder skillBox(SkillBox skillBox) {
             this.skillBox = skillBox;
             return this;
@@ -4312,6 +4413,11 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
             b.model = agent.getModel();
             b.maxIters = agent.getMaxIters();
             b.generateOptions = agent.getGenerateOptions();
+            ModelConfig srcModelConfig = agent.getModelConfig();
+            if (srcModelConfig != null) {
+                b.flatMaxRetries = srcModelConfig.maxRetries();
+                b.flatFallbackModel = srcModelConfig.fallbackModel();
+            }
             b.toolkit = agent.getToolkit().copy();
             return b;
         }

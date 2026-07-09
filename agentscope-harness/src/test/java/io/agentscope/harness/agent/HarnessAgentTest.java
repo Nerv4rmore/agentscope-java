@@ -39,6 +39,7 @@ import io.agentscope.core.middleware.MiddlewareBase;
 import io.agentscope.core.model.ChatResponse;
 import io.agentscope.core.model.Model;
 import io.agentscope.core.model.ToolSchema;
+import io.agentscope.core.shutdown.GracefulShutdownMiddleware;
 import io.agentscope.core.skill.SkillFilter;
 import io.agentscope.core.state.AgentStateStore;
 import io.agentscope.core.tool.AgentTool;
@@ -57,14 +58,17 @@ import io.agentscope.harness.agent.subagent.AgentSpecLoader;
 import io.agentscope.harness.agent.subagent.SubagentDeclaration;
 import io.agentscope.harness.agent.subagent.WorkspaceMode;
 import io.agentscope.harness.agent.workspace.WorkspaceConstants;
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.mockito.ArgumentCaptor;
@@ -78,6 +82,24 @@ import reactor.core.publisher.Mono;
 class HarnessAgentTest {
 
     @TempDir Path workspace;
+
+    @AfterEach
+    void cleanupTempDir() {
+        if (workspace != null && Files.exists(workspace)) {
+            try (var files = Files.walk(workspace)) {
+                files.sorted(Comparator.reverseOrder())
+                        .filter(p -> !p.equals(workspace))
+                        .forEach(
+                                p -> {
+                                    try {
+                                        Files.deleteIfExists(p);
+                                    } catch (IOException ignored) {
+                                    }
+                                });
+            } catch (IOException ignored) {
+            }
+        }
+    }
 
     @Test
     void workspaceAgentsMd_readableViaWorkspaceManager() throws Exception {
@@ -618,11 +640,19 @@ class HarnessAgentTest {
                 child.getDelegate().getMiddlewares().stream()
                         .filter(m -> m instanceof AgentTraceMiddleware)
                         .count();
+        long gracefulShutdownMiddlewareCount =
+                child.getDelegate().getMiddlewares().stream()
+                        .filter(m -> m instanceof GracefulShutdownMiddleware)
+                        .count();
         assertEquals(1, copiedUserMiddlewareCount, "user middleware should copy once");
         assertEquals(
                 1,
                 agentTraceMiddlewareCount,
                 "runtime AgentTraceMiddleware should not be duplicated when cloning");
+        assertEquals(
+                1,
+                gracefulShutdownMiddlewareCount,
+                "system GracefulShutdownMiddleware should not be duplicated when cloning");
 
         RuntimeContext parentContext = RuntimeContext.builder().sessionId("parent").build();
         HarnessAgent generalPurpose =
