@@ -35,7 +35,6 @@ import io.agentscope.extensions.model.openai.formatter.OpenAIResponsesFormatter;
 import java.time.Instant;
 import java.util.List;
 import java.util.Objects;
-
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import reactor.core.publisher.Flux;
