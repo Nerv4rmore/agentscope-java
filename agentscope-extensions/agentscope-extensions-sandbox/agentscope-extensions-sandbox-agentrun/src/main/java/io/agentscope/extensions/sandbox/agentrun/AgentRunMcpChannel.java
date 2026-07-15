@@ -55,13 +55,26 @@ final class AgentRunMcpChannel implements AutoCloseable {
     private final AgentRunSandboxClientOptions opt;
     private final String url;
     private volatile McpClientWrapper client;
+    /**
+     * 重连锁：保证同一 channel 上并发检测到 session 丢失时，只有一个线程执行 close+connect
+     * 重建，其余线程等待后在已重建的新 session 上重试。避免多线程同时 close/connect 导致
+     * 重复 initialize 或 client 引用错乱。
+     */
+    private final Object reconnectLock = new Object();
 
     AgentRunMcpChannel(AgentRunSandboxClientOptions opt) {
         this.opt = Objects.requireNonNull(opt, "opt");
         this.url = resolveUrl(opt);
     }
 
-    /** Connects the MCP client. Idempotent — repeated calls are a no-op. */
+    /**
+     * 连接 MCP 客户端。幂等——重复调用为空操作。
+     *
+     * <p>注意：此方法仅判断 {@code client != null} 就直接复用，不会探测服务端 session 是否仍然存活。
+     * AgentRun 服务端会在 idle-timeout 后回收 MCP session，但客户端对象不会感知，因此跨轮次
+     * 复用时可能命中已过期的 session。真正的过期恢复由 {@link #callWithReconnect} 在每次
+     * callTool 失败时按 {@link #isSessionLost(Throwable)} 检测并重建连接。
+     */
     void connect() {
         if (client != null) {
             // 诊断：MCP channel 已连接，复用现有 session（channelCache 按 sandboxId 复用的体现）
@@ -92,6 +105,120 @@ final class AgentRunMcpChannel implements AutoCloseable {
                 Integer.toHexString(System.identityHashCode(this)));
     }
 
+    /**
+     * 执行一次 MCP callTool 调用，若检测到 session 丢失（过期/回收/404）则关闭旧连接、
+     * 重新握手并重试一次。
+     *
+     * <p>懒创建沙箱后，两次沙箱调用之间可能间隔很久（多轮纯文本对话），AgentRun 服务端的
+     * MCP session 会被 idle-timeout 回收。此时 {@link #connect()} 的 REUSE 分支仍认为已连接，
+     * 首次 callTool 会返回 SessionExpired。此方法统一在 exec/readFile/writeFile 三条路径上
+     * 捕获 session 丢失异常，断开旧 channel 并重建新 session 后重试，避免把过期错误抛给上层。
+     *
+     * <p>session 丢失有两种表现形式：
+     * <ul>
+     *   <li>SDK 抛异常（HTTP 层 SessionExpired）——通过 {@link #isSessionLost(Throwable)} 检测；</li>
+     *   <li>MCP 返回 {@code isError()==true} 的结果（结果文本含 "SessionExpired"/"Sandbox not found"）
+     *       ——通过 {@link #resultIndicatesSessionLost(McpSchema.CallToolResult)} 检测。</li>
+     * </ul>
+     *
+     * @param toolName MCP 工具名
+     * @param args     调用参数
+     * @param timeout  单次 callTool 超时
+     * @return MCP 调用结果
+     */
+    private McpSchema.CallToolResult callWithReconnect(
+            String toolName, Map<String, Object> args, Duration timeout) {
+        ensureConnected();
+        try {
+            McpSchema.CallToolResult result = doCallTool(toolName, args, timeout);
+            // 结果层 session 丢失（isError=true 且文本含 session 失效特征）也需要重连重试
+            if (resultIndicatesSessionLost(result)) {
+                return reconnectAndRetry(toolName, args, timeout, extractText(result));
+            }
+            return result;
+        } catch (Exception firstErr) {
+            if (!isSessionLost(firstErr)) {
+                // 非 session 丢失的异常直接抛出，不重试
+                throw firstErr;
+            }
+            return reconnectAndRetry(toolName, args, timeout, firstErr.getMessage());
+        }
+    }
+
+    /**
+     * 关闭旧 channel、重建 session 并重试一次 callTool。
+     *
+     * <p>使用 {@link #reconnectLock} 保证并发安全：多个线程同时检测到 session 丢失时，
+     * 只有持锁线程执行 close+connect 重建；其余线程排队拿锁后，{@code connect()} 发现
+     * client 已被前一个线程重建，直接复用新 session，不会重复 initialize。重试的 callTool
+     * 在锁外执行，避免持锁期间因命令执行耗时阻塞其他线程。
+     */
+    private McpSchema.CallToolResult reconnectAndRetry(
+            String toolName, Map<String, Object> args, Duration timeout, String reason) {
+        log.warn(
+                "[sandbox-diag] mcp.call session lost, reconnecting: tool={}, channel={},"
+                        + " reason={}",
+                toolName,
+                Integer.toHexString(System.identityHashCode(this)),
+                reason);
+        synchronized (reconnectLock) {
+            // 关闭旧 channel（其 session 已失效），强制 connect() 重新 initialize 建立新 session。
+            // 若已有其他线程持锁完成了重建，close() 是空操作（client==null），connect() 复用新 session。
+            close();
+            connect();
+        }
+        // 重试在锁外执行，避免持锁期间阻塞过久（callTool 可能耗时较长）
+        return doCallTool(toolName, args, timeout);
+    }
+
+    /**
+     * 判断 MCP 返回的 error 结果是否表明 session 已丢失（过期/沙箱回收/404）。
+     * 与 {@link #isSessionLost(Throwable)} 的文本匹配保持一致，只是数据来源从异常 message
+     * 换成了结果文本。
+     */
+    private boolean resultIndicatesSessionLost(McpSchema.CallToolResult result) {
+        if (result == null || !Boolean.TRUE.equals(result.isError())) {
+            return false;
+        }
+        String text = extractText(result);
+        if (text == null || text.isEmpty()) {
+            return false;
+        }
+        String lower = text.toLowerCase();
+        return lower.contains("session not found")
+                || lower.contains("sessionexpired")
+                || lower.contains("session expired")
+                || lower.contains("is expired")
+                || lower.contains("sandbox not found")
+                || lower.contains("http 404")
+                || lower.contains("err_not_found")
+                || lower.contains("not_found");
+    }
+
+    /** 真正执行 callTool 并阻塞等待结果，集中处理超时与异常包装。 */
+    private McpSchema.CallToolResult doCallTool(
+            String toolName, Map<String, Object> args, Duration timeout) {
+        McpSchema.CallToolResult result;
+        try {
+            result = client.callTool(toolName, args).block(timeout);
+        } catch (Exception e) {
+            // 诊断：MCP callTool 抛异常（如 session 失效），记录工具与异常，定位 MCP 层失效
+            log.warn(
+                    "[sandbox-diag] mcp.callTool ERROR: tool={}, channel={}, error={}",
+                    toolName,
+                    Integer.toHexString(System.identityHashCode(this)),
+                    e.getMessage());
+            // 保留原始异常作为 cause：isSessionLost 会沿 cause 链查找
+            // McpTransportSessionNotFoundException 及 message 子串，丢弃 cause 会使
+            // 基于 instanceof 的检测失效（即便 SDK 后续改抛类型化异常也认不出 session 丢失）。
+            throw new SandboxException.SandboxRuntimeException(
+                    SandboxErrorCode.EXEC_TIMEOUT,
+                    "AgentRun MCP callTool failed: " + e.getMessage(),
+                    e);
+        }
+        return result;
+    }
+
     /** Result of a shell command executed in the sandbox. */
     static final class ExecResult {
         final int exitCode;
@@ -107,34 +234,15 @@ final class AgentRunMcpChannel implements AutoCloseable {
 
     /** Runs {@code command} via the AgentRun {@code process_exec_cmd} MCP tool. */
     ExecResult exec(String command, String cwd, int timeoutSeconds) {
-        ensureConnected();
         Map<String, Object> args = new LinkedHashMap<>();
         args.put("command", command);
         if (cwd != null && !cwd.isBlank()) {
             args.put("cwd", cwd);
         }
         args.put("timeout", Math.max(1, timeoutSeconds));
-        McpSchema.CallToolResult result;
-        try {
-            result =
-                    client.callTool(TOOL_EXEC, args)
-                            .block(Duration.ofSeconds(Math.max(5, timeoutSeconds) + 30L));
-        } catch (Exception e) {
-            // 诊断：MCP callTool 抛异常（如 session 失效），记录命令与异常，定位 MCP 层失效
-            log.warn(
-                    "[sandbox-diag] mcp.exec CALL ERROR: channel={}, cmd={}, cwd={}, error={}",
-                    Integer.toHexString(System.identityHashCode(this)),
-                    command,
-                    cwd,
-                    e.getMessage());
-            // 保留原始异常作为 cause：isSessionLost 会沿 cause 链查找
-            // McpTransportSessionNotFoundException 及 message 子串，丢弃 cause 会使
-            // 基于 instanceof 的检测失效（即便 SDK 后续改抛类型化异常也认不出 session 丢失）。
-            throw new SandboxException.SandboxRuntimeException(
-                    SandboxErrorCode.EXEC_TIMEOUT,
-                    "AgentRun MCP callTool failed: " + e.getMessage(),
-                    e);
-        }
+        McpSchema.CallToolResult result =
+                callWithReconnect(
+                        TOOL_EXEC, args, Duration.ofSeconds(Math.max(5, timeoutSeconds) + 30L));
         if (result == null) {
             log.warn(
                     "[sandbox-diag] mcp.exec NULL: channel={}, cmd={}, cwd={}",
@@ -146,8 +254,7 @@ final class AgentRunMcpChannel implements AutoCloseable {
         }
         if (Boolean.TRUE.equals(result.isError())) {
             String msg = extractText(result);
-            // 诊断：MCP 返回 error（如 "Sandbox not found" 404），记录命令与错误文本，
-            // 这是第二轮复用报错的直接来源
+            // 诊断：MCP 返回 error（如 "Sandbox not found" 404），记录命令与错误文本
             log.warn(
                     "[sandbox-diag] mcp.exec RESULT ERROR: channel={}, cmd={}, cwd={}, error={}",
                     Integer.toHexString(System.identityHashCode(this)),
@@ -163,11 +270,10 @@ final class AgentRunMcpChannel implements AutoCloseable {
 
     /** Reads a file via the AgentRun {@code read_file} MCP tool, returning its text content. */
     String readFile(String absolutePath) {
-        ensureConnected();
         Map<String, Object> args = new LinkedHashMap<>();
         args.put("path", absolutePath);
         McpSchema.CallToolResult result =
-                client.callTool(TOOL_READ_FILE, args).block(Duration.ofSeconds(120));
+                callWithReconnect(TOOL_READ_FILE, args, Duration.ofSeconds(120));
         if (result == null || Boolean.TRUE.equals(result.isError())) {
             throw new SandboxException.SandboxRuntimeException(
                     SandboxErrorCode.WORKSPACE_ARCHIVE_READ_ERROR,
@@ -183,12 +289,11 @@ final class AgentRunMcpChannel implements AutoCloseable {
 
     /** Writes a file via the AgentRun {@code write_file} MCP tool. */
     void writeFile(String absolutePath, String content) {
-        ensureConnected();
         Map<String, Object> args = new LinkedHashMap<>();
         args.put("path", absolutePath);
         args.put("content", content != null ? content : "");
         McpSchema.CallToolResult result =
-                client.callTool(TOOL_WRITE_FILE, args).block(Duration.ofSeconds(120));
+                callWithReconnect(TOOL_WRITE_FILE, args, Duration.ofSeconds(120));
         if (result == null || Boolean.TRUE.equals(result.isError())) {
             throw new SandboxException.SandboxRuntimeException(
                     SandboxErrorCode.WORKSPACE_ARCHIVE_WRITE_ERROR,
