@@ -147,8 +147,7 @@ public class OpenAIResponsesModel extends ChatModelBase {
             return client.stream(apiKey, baseUrl, request, effectiveOptions)
                     .handle(
                             (event, sink) -> {
-                                ChatResponse chatResponse =
-                                        formatter.parseResponse(event, start);
+                                ChatResponse chatResponse = formatter.parseResponse(event, start);
                                 if (chatResponse != null) {
                                     sink.next(chatResponse);
                                 }
