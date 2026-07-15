@@ -22,12 +22,12 @@ import java.util.List;
 /**
  * Responses API 响应 {@code output} 数组元素。
  *
- * <p>每个 item 有 {@code type} 判别字段。最小实现处理两种类型：
- * message（助手消息）和 function_call（工具调用请求）。
+ * <p>每个 item 有 {@code type} 判别字段。处理三种类型：
+ * message（助手消息）、function_call（工具调用请求）、reasoning（推理摘要）。
  *
  * <p>字段名使用 camelCase + {@code @JsonProperty} 指定 snake_case JSON 名，
  * 与 {@link OpenAIRequest} 保持一致的序列化模式。
- * {@code @JsonIgnoreProperties} 容忍未处理的其他 item 类型（reasoning、web_search_call 等）。
+ * {@code @JsonIgnoreProperties} 容忍未处理的其他 item 类型（web_search_call 等）。
  */
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class ResponsesOutputItem {
@@ -56,6 +56,14 @@ public class ResponsesOutputItem {
 
     /** Item status: "in_progress", "completed", or "incomplete". */
     private String status;
+
+    /**
+     * Reasoning summary parts (for type="reasoning").
+     *
+     * <p>Each part is an object {@code {"type":"summary_text","text":"..."}}.
+     * 只在非流式响应或 {@code response.completed} 事件内嵌的完整 response 中出现。
+     */
+    private List<Object> summary;
 
     public ResponsesOutputItem() {}
 
@@ -121,5 +129,13 @@ public class ResponsesOutputItem {
 
     public void setStatus(String status) {
         this.status = status;
+    }
+
+    public List<Object> getSummary() {
+        return summary;
+    }
+
+    public void setSummary(List<Object> summary) {
+        this.summary = summary;
     }
 }

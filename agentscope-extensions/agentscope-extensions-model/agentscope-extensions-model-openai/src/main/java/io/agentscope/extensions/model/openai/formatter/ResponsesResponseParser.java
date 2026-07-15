@@ -17,6 +17,7 @@ package io.agentscope.extensions.model.openai.formatter;
 
 import io.agentscope.core.message.ContentBlock;
 import io.agentscope.core.message.TextBlock;
+import io.agentscope.core.message.ThinkingBlock;
 import io.agentscope.core.message.ToolUseBlock;
 import io.agentscope.core.model.ChatResponse;
 import io.agentscope.core.model.ChatUsage;
@@ -42,14 +43,24 @@ import org.slf4j.LoggerFactory;
  *
  * <p>Mirrors {@link OpenAIResponseParser} but handles the Responses API schema:
  * <ul>
- *   <li>Non-streaming: reads from {@link ResponsesResponse#getOutput()} array</li>
+ *   <li>Non-streaming: reads from {@link ResponsesResponse#getOutput()} array, including
+ *       {@code message} (text), {@code function_call} (tool use), and {@code reasoning}
+ *       (reasoning summary → {@link ThinkingBlock}) items</li>
  *   <li>Streaming: dispatches on {@link ResponsesStreamEvent#getType()} to handle
- *       text deltas, function call argument deltas, completion usage, and errors</li>
+ *       text deltas, reasoning summary deltas, function call argument deltas, completion
+ *       usage, and errors</li>
  * </ul>
  *
  * <p><b>Streaming function call fragments</b>: incremental argument chunks use the
  * {@code __fragment__} placeholder name (same convention as {@link OpenAIResponseParser}),
  * so the agent layer's accumulation logic works unchanged.
+ *
+ * <p><b>Reasoning summary streaming</b>: {@code response.reasoning_summary_text.delta}
+ * events build {@link ThinkingBlock}s carrying the delta text, mirroring how
+ * {@link OpenAIResponseParser} handles {@code reasoning_content}. The
+ * {@code reasoning_summary_part.added/done} and {@code reasoning_summary_text.done}
+ * boundary events are skipped — {@code ReActAgent}'s block-type-transition logic infers
+ * {@code thinking.start/delta/end} boundaries automatically.
  */
 public class ResponsesResponseParser {
 
@@ -93,6 +104,15 @@ public class ResponsesResponseParser {
                         ToolUseBlock toolUse = parseFunctionCallItem(item);
                         if (toolUse != null) {
                             blocks.add(toolUse);
+                        }
+                    }
+                    case "reasoning" -> {
+                        // 提取 reasoning item 的 summary 摘要文本，构建 ThinkingBlock。
+                        // summary 是一个 part 数组，每个 part 形如
+                        // {"type":"summary_text","text":"..."}，拼接所有 text 字段。
+                        String summaryText = extractReasoningSummaryText(item);
+                        if (summaryText != null && !summaryText.isEmpty()) {
+                            blocks.add(ThinkingBlock.builder().thinking(summaryText).build());
                         }
                     }
                     default ->
@@ -149,6 +169,19 @@ public class ResponsesResponseParser {
                 // Arguments are accumulated from deltas; the done event is not needed separately.
                 return null;
             }
+            case "response.reasoning_summary_text.delta" -> {
+                // 推理摘要增量文本：构建 ThinkingBlock，与 Chat Completions 的
+                // reasoning_content 流式处理方式一致。ReActAgent 的 ModelCallBlockLifecycle
+                // 通过 thinkingStarted 标志 + block 类型转换自动推断 thinking.start/delta/end
+                // 边界，无需在此显式发射 start/end 事件。
+                return parseReasoningSummaryDelta(event);
+            }
+            case "response.reasoning_summary_part.added",
+                    "response.reasoning_summary_part.done",
+                    "response.reasoning_summary_text.done" -> {
+                // 边界/终结事件由 ReActAgent 的 block 类型转换逻辑自动处理，无需单独发射。
+                return null;
+            }
             case "response.completed" -> {
                 return parseCompleted(event, startTime);
             }
@@ -157,7 +190,7 @@ public class ResponsesResponseParser {
             }
             default -> {
                 // Skip lifecycle/structural events (created, in_progress, content_part,
-                // output_item.done, etc.)
+                // output_item.added for non-function items, output_item.done, etc.)
                 return null;
             }
         }
@@ -170,6 +203,22 @@ public class ResponsesResponseParser {
         }
         TextBlock textBlock = TextBlock.builder().text(delta).build();
         return ChatResponse.builder().content(Collections.singletonList(textBlock)).build();
+    }
+
+    /**
+     * 解析 reasoning summary 增量文本事件，构建 ThinkingBlock。
+     *
+     * <p>与 {@link OpenAIResponseParser} 处理 {@code reasoning_content} 的方式一致：
+     * 每个增量 chunk 构建一个带 delta 文本的 ThinkingBlock，由 ReActAgent 的
+     * ThinkingAccumulator 累加拼接。
+     */
+    private ChatResponse parseReasoningSummaryDelta(ResponsesStreamEvent event) {
+        String delta = event.getDelta();
+        if (delta == null || delta.isEmpty()) {
+            return null;
+        }
+        ThinkingBlock thinkingBlock = ThinkingBlock.builder().thinking(delta).build();
+        return ChatResponse.builder().content(Collections.singletonList(thinkingBlock)).build();
     }
 
     private ChatResponse parseOutputItemAdded(ResponsesStreamEvent event) {
@@ -228,6 +277,31 @@ public class ResponsesResponseParser {
         }
         StringBuilder sb = new StringBuilder();
         for (Object part : content) {
+            if (part instanceof Map) {
+                Map<String, Object> partMap = (Map<String, Object>) part;
+                Object text = partMap.get("text");
+                if (text != null) {
+                    sb.append(text);
+                }
+            }
+        }
+        return sb.toString();
+    }
+
+    /**
+     * 从 reasoning output item 的 {@code summary} 数组中提取拼接的摘要文本。
+     *
+     * <p>每个 summary part 形如 {@code {"type":"summary_text","text":"..."}}，
+     * 拼接所有 part 的 {@code text} 字段。
+     */
+    @SuppressWarnings("unchecked")
+    private String extractReasoningSummaryText(ResponsesOutputItem item) {
+        List<Object> summary = item.getSummary();
+        if (summary == null || summary.isEmpty()) {
+            return null;
+        }
+        StringBuilder sb = new StringBuilder();
+        for (Object part : summary) {
             if (part instanceof Map) {
                 Map<String, Object> partMap = (Map<String, Object>) part;
                 Object text = partMap.get("text");
