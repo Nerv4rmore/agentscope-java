@@ -145,12 +145,14 @@ public class OpenAIResponsesModel extends ChatModelBase {
             // (response.created/in_progress/output_item.done 等) 在 parser 中返回 null，
             // 而 Reactor 的 map 操作符不允许返回 null，handle 可安全跳过这些事件。
             return client.stream(apiKey, baseUrl, request, effectiveOptions)
-                    .handle((event, sink) -> {
-                        ChatResponse chatResponse = formatter.parseResponse(event, start);
-                        if (chatResponse != null) {
-                            sink.next(chatResponse);
-                        }
-                    });
+                    .handle(
+                            (event, sink) -> {
+                                ChatResponse chatResponse =
+                                        formatter.parseResponse(event, start);
+                                if (chatResponse != null) {
+                                    sink.next(chatResponse);
+                                }
+                            });
         } else {
             return Flux.defer(
                             () -> {
