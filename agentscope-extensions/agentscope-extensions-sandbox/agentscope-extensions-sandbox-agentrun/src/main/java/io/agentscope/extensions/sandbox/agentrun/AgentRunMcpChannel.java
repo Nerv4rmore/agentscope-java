@@ -55,6 +55,7 @@ final class AgentRunMcpChannel implements AutoCloseable {
     private final AgentRunSandboxClientOptions opt;
     private final String url;
     private volatile McpClientWrapper client;
+
     /**
      * 重连锁：保证同一 channel 上并发检测到 session 丢失时，只有一个线程执行 close+connect
      * 重建，其余线程等待后在已重建的新 session 上重试。避免多线程同时 close/connect 导致
