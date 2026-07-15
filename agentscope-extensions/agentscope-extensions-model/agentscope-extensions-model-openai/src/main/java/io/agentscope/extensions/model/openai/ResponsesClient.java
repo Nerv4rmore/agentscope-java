@@ -250,18 +250,24 @@ public class ResponsesClient {
     }
 
     private ResponsesStreamEvent parseStreamData(String data) {
+        if (log.isDebugEnabled()) {
+            log.debug("Responses SSE data: {}", data);
+        }
         try {
             if (data == null || data.isEmpty()) {
+                log.debug("Ignoring empty Responses SSE data");
                 return null;
             }
             return JsonUtils.getJsonCodec().fromJson(data, ResponsesStreamEvent.class);
         } catch (JsonException e) {
             log.warn(
-                    "Failed to parse Responses SSE data: {}",
+                    "Failed to parse Responses SSE data - JSON error: {}. Content: {}.",
+                    e.getMessage(),
                     data.length() > 100 ? data.substring(0, 100) + "..." : data);
             return null;
         } catch (Exception e) {
-            log.warn("Unexpected error parsing Responses SSE data: {}", e.getMessage());
+            log.warn(
+                    "Failed to parse Responses SSE data - unexpected error: {}", e.getMessage(), e);
             return null;
         }
     }
