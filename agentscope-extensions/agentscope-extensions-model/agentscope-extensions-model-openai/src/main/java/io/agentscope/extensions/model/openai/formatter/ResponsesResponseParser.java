@@ -201,7 +201,6 @@ public class ResponsesResponseParser {
         if (delta == null || delta.isEmpty()) {
             return null;
         }
-        log.debug("Output text delta: len={}", delta.length());
         TextBlock textBlock = TextBlock.builder().text(delta).build();
         return ChatResponse.builder().content(Collections.singletonList(textBlock)).build();
     }
@@ -224,24 +223,17 @@ public class ResponsesResponseParser {
 
     private ChatResponse parseOutputItemAdded(ResponsesStreamEvent event) {
         ResponsesOutputItem item = event.getItem();
-        if (item == null) {
-            return null;
-        }
-        if (!"function_call".equals(item.getType())) {
-            // 非 function_call 的 output_item.added（如 reasoning、message）不产生工具调用，
-            // 记录实际 type 便于排查 OpenRouter 等转发层是否返回了非标准类型。
-            log.debug("Skipping output_item.added with non-function type: {}", item.getType());
+        if (item == null || !"function_call".equals(item.getType())) {
             return null;
         }
         // Emit the tool-call start: id and name are known, content is empty.
-        String toolCallId = item.getCallId() != null ? item.getCallId() : item.getId();
-        log.debug(
-                "Function call started: id={}, name={}, callId={}",
-                item.getId(),
-                item.getName(),
-                item.getCallId());
         ToolUseBlock toolUse =
-                new ToolUseBlock(toolCallId, item.getName(), Collections.emptyMap(), "", null);
+                new ToolUseBlock(
+                        item.getCallId() != null ? item.getCallId() : item.getId(),
+                        item.getName(),
+                        Collections.emptyMap(),
+                        "",
+                        null);
         return ChatResponse.builder().content(Collections.singletonList(toolUse)).build();
     }
 
@@ -250,10 +242,6 @@ public class ResponsesResponseParser {
         if (delta == null || delta.isEmpty()) {
             return null;
         }
-        log.debug(
-                "Function call argument delta: itemId={}, deltaLen={}",
-                event.getItemId(),
-                delta.length());
         // Emit a fragment ToolUseBlock. The agent layer accumulates these by
         // name=FRAGMENT_PLACEHOLDER.
         ToolUseBlock fragment =
@@ -264,14 +252,8 @@ public class ResponsesResponseParser {
     private ChatResponse parseCompleted(ResponsesStreamEvent event, Instant startTime) {
         ResponsesResponse response = event.getResponse();
         if (response == null) {
-            log.warn("response.completed event has null response body");
             return null;
         }
-        log.debug(
-                "Response completed: id={}, status={}, outputCount={}",
-                response.getId(),
-                response.getStatus(),
-                response.getOutput() != null ? response.getOutput().size() : 0);
         ChatUsage usage = buildUsage(response.getUsage(), startTime);
         // content 必须设为非 null 的空列表，否则 ReasoningContext 等下游消费者
         // 迭代 getContent() 时会抛 NPE（与 OpenAIResponseParser 保持一致：始终设 content）。
