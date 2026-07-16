@@ -145,11 +145,22 @@ public class OpenAIResponsesFormatter
             request.setParallelToolCalls(parallelToolCalls);
         }
 
-        // Reasoning effort → nested reasoning object
+        // Reasoning effort → nested reasoning object。
+        // Responses API 必须显式带 reasoning.summary，否则只会内部推理但不下发任何
+        // reasoning_summary_text.delta 事件（前端拿不到思考内容）。这里默认请求 summary="auto"，
+        // 让模型自行决定摘要粒度；stream 解析侧已就绪解析该事件为 ThinkingBlock。
         String reasoningEffort =
                 getOptionOrDefault(options, defaultOptions, GenerateOptions::getReasoningEffort);
         if (reasoningEffort != null && !reasoningEffort.isBlank()) {
-            request.setReasoning(new ResponsesReasoning(reasoningEffort.trim()));
+            ResponsesReasoning reasoning = new ResponsesReasoning(reasoningEffort.trim());
+            reasoning.setSummary("auto");
+            request.setReasoning(reasoning);
+        } else {
+            // 即使未配 reasoning_effort，只要是 reasoning 模型（如默认 effort）也需要带 summary
+            // 才能回传思考内容。此处兜底设置 summary="auto"，effort 由 API 默认值决定。
+            ResponsesReasoning reasoning = new ResponsesReasoning();
+            reasoning.setSummary("auto");
+            request.setReasoning(reasoning);
         }
 
         // Stateless: always set store=false (OpenRouter doesn't support server-side state,
