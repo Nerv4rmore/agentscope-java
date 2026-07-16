@@ -250,24 +250,15 @@ public class ResponsesClient {
     }
 
     private ResponsesStreamEvent parseStreamData(String data) {
+        if (log.isDebugEnabled()) {
+            log.debug("Responses SSE data: {}", data);
+        }
         try {
             if (data == null || data.isEmpty()) {
                 log.debug("Ignoring empty Responses SSE data");
                 return null;
             }
-            ResponsesStreamEvent event =
-                    JsonUtils.getJsonCodec().fromJson(data, ResponsesStreamEvent.class);
-            if (log.isDebugEnabled()) {
-                String type = event != null ? event.getType() : null;
-                if (isVerboseEventType(type)) {
-                    // 高频文本/参数增量事件只记录类型，避免文本内容刷屏
-                    log.debug("Responses SSE event: {}", type);
-                } else {
-                    // 结构性/低频事件记录完整 JSON，便于排查事件丢失或格式异常
-                    log.debug("Responses SSE event [{}]: {}", type, data);
-                }
-            }
-            return event;
+            return JsonUtils.getJsonCodec().fromJson(data, ResponsesStreamEvent.class);
         } catch (JsonException e) {
             log.warn(
                     "Failed to parse Responses SSE data - JSON error: {}. Content: {}.",
@@ -279,20 +270,6 @@ public class ResponsesClient {
                     "Failed to parse Responses SSE data - unexpected error: {}", e.getMessage(), e);
             return null;
         }
-    }
-
-    /**
-     * 判断事件类型是否为高频增量事件（文本 delta、参数 delta、reasoning summary delta）。
-     *
-     * <p>这类事件每次只携带一小段文本，出现频率高且内容无诊断价值，只记录类型名避免刷屏。
-     * 其他结构性事件（created/in_progress/output_item.added/completed/failed 等）频率低、
-     * 字段多，记录完整 JSON 以便排查事件丢失或格式异常。
-     */
-    private static boolean isVerboseEventType(String type) {
-        if (type == null) {
-            return false;
-        }
-        return type.endsWith(".delta");
     }
 
     // --- URL building (duplicated from OpenAIClient, which has private methods) ---
