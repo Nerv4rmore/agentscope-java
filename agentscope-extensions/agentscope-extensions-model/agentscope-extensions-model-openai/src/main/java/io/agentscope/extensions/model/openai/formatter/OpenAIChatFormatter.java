@@ -77,8 +77,28 @@ public class OpenAIChatFormatter extends OpenAIBaseFormatter {
         // Apply reasoning effort
         String reasoningEffort =
                 getOptionOrDefault(options, defaultOptions, GenerateOptions::getReasoningEffort);
+        String baseUrl = getOptionOrDefault(options, defaultOptions, GenerateOptions::getBaseUrl);
+        boolean isOpenRouter = baseUrl != null && baseUrl.contains("openrouter.ai");
+
         if (reasoningEffort != null) {
-            request.setReasoningEffort(reasoningEffort);
+            if (isOpenRouter) {
+                // OpenRouter 使用统一的嵌套 reasoning 参数（如 {"reasoning":{"effort":"high"}}）
+                // 来控制 Claude/Gemini 等模型的扩展思考。平铺的 reasoning_effort 字段
+                // OpenRouter 不识别，必须用嵌套对象。同时设置 include_reasoning=true（遗留参数）
+                // 确保 reasoning_content 在流式 delta 中下发可读文本，否则 OpenRouter 只返回
+                // 加密签名（reasoning.encrypted），前端只看到 thinking.start/end 而无 thinking.delta。
+                Map<String, Object> reasoning = new HashMap<>();
+                reasoning.put("effort", reasoningEffort);
+                request.addExtraParam("reasoning", reasoning);
+                request.setIncludeReasoning(Boolean.TRUE);
+            } else {
+                // 标准 OpenAI 官方 API 使用平铺的 reasoning_effort 字段。
+                request.setReasoningEffort(reasoningEffort);
+            }
+        } else if (isOpenRouter) {
+            // 即使未配 reasoning_effort，OpenRouter 也需要 include_reasoning=true 让
+            // 默认启用 thinking 的模型（如 Gemini）下发可读推理文本。
+            request.setIncludeReasoning(Boolean.TRUE);
         }
         // Apply thinking budget
         Integer thinkingBudget =
