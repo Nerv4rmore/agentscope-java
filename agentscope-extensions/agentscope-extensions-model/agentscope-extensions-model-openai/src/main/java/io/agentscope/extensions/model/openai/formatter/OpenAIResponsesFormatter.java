@@ -24,6 +24,7 @@ import io.agentscope.core.model.ToolChoice;
 import io.agentscope.core.model.ToolSchema;
 import io.agentscope.extensions.model.openai.dto.ResponsesFunctionTool;
 import io.agentscope.extensions.model.openai.dto.ResponsesInputItem;
+import io.agentscope.extensions.model.openai.dto.ResponsesPromptCacheOptions;
 import io.agentscope.extensions.model.openai.dto.ResponsesReasoning;
 import io.agentscope.extensions.model.openai.dto.ResponsesRequest;
 import io.agentscope.extensions.model.openai.dto.ResponsesResponse;
@@ -154,15 +155,30 @@ public class OpenAIResponsesFormatter
         if (reasoningEffort != null && !reasoningEffort.isBlank()) {
             ResponsesReasoning reasoning = new ResponsesReasoning(reasoningEffort.trim());
             reasoning.setSummary("auto");
+            // 只回传当前轮次的 reasoning，避免多轮对话历史 reasoning 累积消耗大量输入 token
+            reasoning.setContext("current_turn");
             request.setReasoning(reasoning);
         } else {
             // 即使未配 reasoning_effort，只要是 reasoning 模型（如默认 effort）也需要带 summary
-            // 才能回传思考内容。此处兜底设置 summary="auto"，effort 由 API 默认值决定。
+            // 才能回传思考内容。此处兗底设置 summary="auto"，effort 由 API 默认值决定。
             ResponsesReasoning reasoning = new ResponsesReasoning();
             reasoning.setSummary("auto");
+            reasoning.setContext("current_turn");
             request.setReasoning(reasoning);
         }
-
+        
+        // 截断策略：上下文超窗口时自动从对话开头丢弃旧消息，避免 400 报错
+        request.setTruncation("auto");
+        
+        // Prompt caching：gpt-5.6 及之后模型支持，implicit 模式让 OpenAI 自动创建缓存断点，
+        // 缓存命中时输入 token 半价计费。cache_key 用模型名分桶，同模型同系统提示词的请求共享缓存。
+        String modelName = getOptionOrDefault(options, defaultOptions, GenerateOptions::getModelName);
+        if (modelName != null && !modelName.isBlank()) {
+            request.setPromptCacheKey(modelName);
+        }
+        ResponsesPromptCacheOptions cacheOptions = new ResponsesPromptCacheOptions("implicit");
+        request.setPromptCacheOptions(cacheOptions);
+        
         // Stateless: always set store=false (OpenRouter doesn't support server-side state,
         // and the agent manages conversation context itself)
         request.setStore(false);

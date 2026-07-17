@@ -42,9 +42,17 @@ public class ResponsesReasoning {
     @JsonProperty("effort")
     private String effort;
 
-    /** Reasoning summary mode (not used in minimal implementation). */
+    /** Reasoning summary mode: "auto", "concise", or "detailed". */
     @JsonProperty("summary")
     private String summary;
+
+    /**
+     * 控制哪些历史 reasoning 项回传给模型：
+     * "auto"（模型自决）、"current_turn"（仅当前轮次）、"all_turns"（全部历史）。
+     * 设为 "current_turn" 可显著减少多轮对话的输入 token。
+     */
+    @JsonProperty("context")
+    private String context;
 
     public ResponsesReasoning() {}
 
@@ -71,5 +79,13 @@ public class ResponsesReasoning {
 
     public void setSummary(String summary) {
         this.summary = summary;
+    }
+
+    public String getContext() {
+        return context;
+    }
+
+    public void setContext(String context) {
+        this.context = context;
     }
 }

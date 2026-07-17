@@ -100,6 +100,20 @@ public class OpenAIChatFormatter extends OpenAIBaseFormatter {
             // 默认启用 thinking 的模型（如 Gemini）下发可读推理文本。
             request.setIncludeReasoning(Boolean.TRUE);
         }
+
+        // OpenRouter 专有优化：
+        if (isOpenRouter) {
+            // 1. 请求级 prompt 缓存：自动对系统提示词、工具定义等稳定前缀进行 Anthropic 风格缓存，
+            //    缓存命中时输入 token 按 1/10 价格计费。
+            Map<String, String> cacheControl = new HashMap<>();
+            cacheControl.put("type", "ephemeral");
+            request.addExtraParam("cache_control", cacheControl);
+
+            // 2. 按价格排序 provider：同一模型可能有多个 provider，选最便宜的。
+            Map<String, String> provider = new HashMap<>();
+            provider.put("sort", "price");
+            request.addExtraParam("provider", provider);
+        }
         // Apply thinking budget
         Integer thinkingBudget =
                 getOptionOrDefault(options, defaultOptions, GenerateOptions::getThinkingBudget);

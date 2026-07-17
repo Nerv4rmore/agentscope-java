@@ -71,6 +71,25 @@ public class ResponsesRequest {
     @JsonProperty("parallel_tool_calls")
     private Boolean parallelToolCalls;
 
+    /**
+     * 截断策略："auto" 时上下文超窗口会自动从对话开头丢弃旧消息；"disabled"（默认）时超窗口返回 400。
+     */
+    private String truncation;
+
+    /**
+     * Prompt 缓存键：用于帮助 OpenAI 对相似请求进行缓存匹配，提高缓存命中率。
+     * 通常传入 userId 或用户标识。
+     */
+    @JsonProperty("prompt_cache_key")
+    private String promptCacheKey;
+
+    /**
+     * Prompt 缓存选项（mode / ttl）。gpt-5.6 及之后模型支持。
+     * 设 mode="implicit" 让 OpenAI 自动创建隐式缓存断点，缓存命中时输入 token 半价。
+     */
+    @JsonProperty("prompt_cache_options")
+    private ResponsesPromptCacheOptions promptCacheOptions;
+
     public ResponsesRequest() {}
 
     public String getModel() {
@@ -169,6 +188,30 @@ public class ResponsesRequest {
         this.parallelToolCalls = parallelToolCalls;
     }
 
+    public String getTruncation() {
+        return truncation;
+    }
+
+    public void setTruncation(String truncation) {
+        this.truncation = truncation;
+    }
+
+    public String getPromptCacheKey() {
+        return promptCacheKey;
+    }
+
+    public void setPromptCacheKey(String promptCacheKey) {
+        this.promptCacheKey = promptCacheKey;
+    }
+
+    public ResponsesPromptCacheOptions getPromptCacheOptions() {
+        return promptCacheOptions;
+    }
+
+    public void setPromptCacheOptions(ResponsesPromptCacheOptions promptCacheOptions) {
+        this.promptCacheOptions = promptCacheOptions;
+    }
+
     public static Builder builder() {
         return new Builder();
     }
@@ -234,6 +277,21 @@ public class ResponsesRequest {
 
         public Builder parallelToolCalls(Boolean parallelToolCalls) {
             request.setParallelToolCalls(parallelToolCalls);
+            return this;
+        }
+
+        public Builder truncation(String truncation) {
+            request.setTruncation(truncation);
+            return this;
+        }
+
+        public Builder promptCacheKey(String promptCacheKey) {
+            request.setPromptCacheKey(promptCacheKey);
+            return this;
+        }
+
+        public Builder promptCacheOptions(ResponsesPromptCacheOptions promptCacheOptions) {
+            request.setPromptCacheOptions(promptCacheOptions);
             return this;
         }
 
