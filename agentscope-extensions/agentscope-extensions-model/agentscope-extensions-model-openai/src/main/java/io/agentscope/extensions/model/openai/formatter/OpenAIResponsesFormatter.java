@@ -166,19 +166,20 @@ public class OpenAIResponsesFormatter
             reasoning.setContext("current_turn");
             request.setReasoning(reasoning);
         }
-        
+
         // 截断策略：上下文超窗口时自动从对话开头丢弃旧消息，避免 400 报错
         request.setTruncation("auto");
-        
+
         // Prompt caching：gpt-5.6 及之后模型支持，implicit 模式让 OpenAI 自动创建缓存断点，
         // 缓存命中时输入 token 半价计费。cache_key 用模型名分桶，同模型同系统提示词的请求共享缓存。
-        String modelName = getOptionOrDefault(options, defaultOptions, GenerateOptions::getModelName);
+        String modelName =
+                getOptionOrDefault(options, defaultOptions, GenerateOptions::getModelName);
         if (modelName != null && !modelName.isBlank()) {
             request.setPromptCacheKey(modelName);
         }
         ResponsesPromptCacheOptions cacheOptions = new ResponsesPromptCacheOptions("implicit");
         request.setPromptCacheOptions(cacheOptions);
-        
+
         // Stateless: always set store=false (OpenRouter doesn't support server-side state,
         // and the agent manages conversation context itself)
         request.setStore(false);
