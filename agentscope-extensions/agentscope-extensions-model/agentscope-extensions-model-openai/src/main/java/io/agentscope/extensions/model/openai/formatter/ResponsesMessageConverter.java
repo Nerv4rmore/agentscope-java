@@ -16,13 +16,18 @@
 package io.agentscope.extensions.model.openai.formatter;
 
 import io.agentscope.core.message.ContentBlock;
+import io.agentscope.core.message.ImageBlock;
 import io.agentscope.core.message.Msg;
 import io.agentscope.core.message.MsgRole;
+import io.agentscope.core.message.TextBlock;
 import io.agentscope.core.message.ToolResultBlock;
 import io.agentscope.core.message.ToolUseBlock;
 import io.agentscope.core.util.JsonUtils;
 import io.agentscope.extensions.model.openai.dto.ResponsesInputItem;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.function.Function;
 
 /**
@@ -102,8 +107,67 @@ public class ResponsesMessageConverter {
         ResponsesInputItem item = new ResponsesInputItem();
         item.setType("message");
         item.setRole("user");
-        item.setContent(textExtractor.apply(msg));
+
+        // 检测消息中是否包含图片块，有则构建 Responses API 多模态 content 数组
+        List<ImageBlock> imageBlocks = msg.getContentBlocks(ImageBlock.class);
+        if (imageBlocks != null && !imageBlocks.isEmpty()) {
+            item.setContent(buildMultimodalContent(msg, imageBlocks));
+        } else {
+            item.setContent(textExtractor.apply(msg));
+        }
         return item;
+    }
+
+    /**
+     * 构建 Responses API 多模态 content 数组：[{"type":"input_text","text":"..."}, {"type":"input_image","image_url":"..."}]
+     *
+     * <p>按消息内原始块顺序输出：文本块转为 input_text，图片块转为 input_image。
+     * 图片 URL 支持公网链接和 base64 data URI 两种形式。
+     */
+    private List<Map<String, Object>> buildMultimodalContent(Msg msg, List<ImageBlock> imageBlocks) {
+        List<Map<String, Object>> parts = new ArrayList<>();
+
+        // 按原始 content 块顺序遍历，保持文本与图片的相对位置
+        List<ContentBlock> allBlocks = msg.getContent();
+        if (allBlocks != null) {
+            for (ContentBlock block : allBlocks) {
+                if (block instanceof TextBlock textBlock) {
+                    String text = textBlock.getText();
+                    if (text != null && !text.isEmpty()) {
+                        Map<String, Object> textPart = new LinkedHashMap<>();
+                        textPart.put("type", "input_text");
+                        textPart.put("text", text);
+                        parts.add(textPart);
+                    }
+                } else if (block instanceof ImageBlock imageBlock) {
+                    Map<String, Object> imagePart = new LinkedHashMap<>();
+                    imagePart.put("type", "input_image");
+                    imagePart.put("image_url",
+                            OpenAIConverterUtils.convertImageSourceToUrl(imageBlock.getSource()));
+                    parts.add(imagePart);
+                }
+            }
+        }
+
+        // 兜底：若原始块遍历未产出任何 part（理论上不应发生），用 textExtractor 兜底
+        if (parts.isEmpty()) {
+            String text = textExtractor.apply(msg);
+            if (text != null && !text.isEmpty()) {
+                Map<String, Object> textPart = new LinkedHashMap<>();
+                textPart.put("type", "input_text");
+                textPart.put("text", text);
+                parts.add(textPart);
+            }
+            for (ImageBlock imageBlock : imageBlocks) {
+                Map<String, Object> imagePart = new LinkedHashMap<>();
+                imagePart.put("type", "input_image");
+                imagePart.put("image_url",
+                        OpenAIConverterUtils.convertImageSourceToUrl(imageBlock.getSource()));
+                parts.add(imagePart);
+            }
+        }
+
+        return parts;
     }
 
     /**
