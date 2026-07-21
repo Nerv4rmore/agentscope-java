@@ -249,7 +249,7 @@ public class MemoryFlushMiddleware implements HarnessRuntimeMiddleware {
      * namespace (see {@link #timerKeyFor(RuntimeContext)}).
      *
      * <p>Package-private for unit testing of the trigger gate without standing up a full
-     * {@code ReActAgent}.
+     * {@code Agent}.
      */
     boolean shouldFlushNow(RuntimeContext rc) {
         switch (flushTrigger.mode()) {
