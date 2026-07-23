@@ -23,7 +23,6 @@ import io.agentscope.harness.agent.sandbox.SandboxException;
 import io.agentscope.harness.agent.sandbox.WorkspaceMountSupport;
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
-import java.util.Base64;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -31,126 +30,158 @@ import org.slf4j.LoggerFactory;
  * {@link io.agentscope.harness.agent.sandbox.Sandbox} backed by an Alibaba Cloud AgentRun sandbox
  * (FC 3.0 Sandbox API 2025-09-10).
  *
- * <p>Execution runs over the AgentRun MCP server bundled with the sandbox template. When the
- * sandbox state declares {@code workspaceOnNas=true}, persistence is delegated entirely to the
- * NAS mount and {@link #doPersistWorkspace()} is a no-op; otherwise the sandbox falls back to a
- * tar-via-MCP archive identical in shape to Daytona's payload.
+ * <p>All operations — sandbox lifecycle, command execution, file upload/download — run over the
+ * AgentRun data-plane REST API. When the sandbox state declares {@code workspaceOnNas=true},
+ * persistence is delegated entirely to the NAS mount and {@link #doPersistWorkspace()} is a no-op;
+ * otherwise the sandbox falls back to a tar-via-HTTP archive (pack on the sandbox, download the
+ * tarball, and reverse on hydrate).
  *
- * <p><b>纯 MCP 方案：</b>沙箱实例由 MCP server 在 initialize 握手时自动创建，不再通过控制面
- * {@code createSandbox} 显式创建。这样只有一个沙箱实例（MCP 创建的），避免"控制面建一个 +
- * MCP 又建一个"的双沙箱问题。代价是沙箱实例不跨 JVM 重启复用（重启后 MCP 重新连接会创建新
- * 沙箱，workspace 走 Branch D 重新投射）。
+ * <p><b>HTTP REST 方案：</b>沙箱实例通过控制面 {@code POST /sandboxes} 显式创建（带确定性
+ * sandboxId），命令执行走 {@code POST /sandboxes/{id}/processes/cmd}，文件上传/下载走
+ * {@code /sandboxes/{id}/filesystem/upload|download}。不再依赖 MCP 协议，避免 MCP session 管理
+ * 的复杂性。沙箱实例由 {@code sandboxIdleTimeoutSeconds} 控制 idle 回收；resume 时通过
+ * {@code GET /sandboxes/{id}} 探活，若已被回收则重建。
  */
 public class AgentRunSandbox extends AbstractBaseSandbox {
 
     private static final Logger log = LoggerFactory.getLogger(AgentRunSandbox.class);
 
     private static final int OUTPUT_TRUNCATE_BYTES = 512 * 1024;
-    private static final int TAR_TIMEOUT_SECONDS = 300;
-    private static final int B64_CHUNK = 4000;
+    private static final int SANDBOX_READY_WAIT_SECONDS = 60;
+    private static final String WS_TAR_PATH = "/tmp/agentscope-ws.tar";
 
     private final AgentRunSandboxState arState;
     private final AgentRunSandboxClientOptions options;
     private final AgentRunDataPlaneHttp http;
-    // Non-final: start() may replace the channel when recreating the sandbox after an MCP
-    // session-loss (the old channel's session is torn down and a fresh one established against
-    // the newly created sandbox instance).
-    private AgentRunMcpChannel mcp;
-    // Guards against infinite recreate loops: a single start() call recreates the sandbox at
-    // most once. If the recreated instance also fails, the error propagates to the caller.
-    private boolean recreated;
 
     public AgentRunSandbox(
             AgentRunSandboxState state,
             AgentRunSandboxClientOptions options,
-            AgentRunDataPlaneHttp http,
-            AgentRunMcpChannel mcp) {
+            AgentRunDataPlaneHttp http) {
         super(state);
         this.arState = state;
         this.options = options;
         this.http = http;
-        this.mcp = mcp;
     }
 
     @Override
     public void start() throws Exception {
-        // 诊断：start 入口，记录 sandboxId / sessionId / workspaceRootReady / recreated，便于追踪复用与重建
         log.info(
                 "[sandbox-diag] start ENTER: sandboxId={}, sessionId={}, workspaceRootReady={},"
-                        + " workspaceOnNas={}, recreated={}, projectionHash={}",
+                        + " workspaceOnNas={}, projectionHash={}",
                 arState.getSandboxId(),
                 arState.getSessionId(),
                 arState.isWorkspaceRootReady(),
                 arState.isWorkspaceOnNas(),
-                recreated,
                 arState.getWorkspaceProjectionHash());
         if (WorkspaceMountSupport.hasBindMounts(arState.getWorkspaceSpec())) {
             log.warn(
                     "[sandbox-agentrun] WorkspaceSpec contains bind_mount entries; "
                             + "AgentRun does not apply host bind mounts — paths are not mounted.");
         }
-        try {
-            doStart();
-        } catch (Exception e) {
-            // 诊断：start 失败，记录异常类型与 isSessionLost 判断结果，定位为何未触发重建
-            log.warn(
-                    "[sandbox-diag] start FAILED: sandboxId={}, errorType={}, msg={},"
-                            + " isSessionLost={}, recreated={}",
-                    arState.getSandboxId(),
-                    e.getClass().getSimpleName(),
-                    e.getMessage(),
-                    AgentRunMcpChannel.isSessionLost(e),
-                    recreated);
-            if (!AgentRunMcpChannel.isSessionLost(e) || recreated) {
-                throw e;
-            }
-            recreated = true;
-            log.warn(
-                    "[sandbox-agentrun] MCP session lost during start ({}); recreating sandbox"
-                            + " instance '{}'",
-                    e.getMessage(),
-                    arState.getSandboxId());
-            recreateSandbox();
-            doStart();
-        }
-    }
-
-    /**
-     * 纯 MCP 方案下的重建：关闭旧 MCP channel（其 session 绑定的沙箱已失效），让下次
-     * {@code connect()} 重新 initialize 建立新 session，由 MCP server 自动创建新沙箱实例。
-     *
-     * <p>不再调用 {@code http.deleteSandbox}：纯 MCP 方案下没有通过 createSandbox 显式创建
-     * 的沙箱实例，确定性 sandboxId 只是 channelCache 的 key，删除它无意义。沙箱实例由
-     * MCP server 创建和回收（idle timeout），重建只需断开旧 MCP session 即可。
-     */
-    private void recreateSandbox() throws Exception {
-        // Close the stale MCP channel (its session is gone) so connect() builds a fresh one.
-        try {
-            mcp.close();
-        } catch (Exception ignore) {
-            // best-effort
-        }
-        // Force a full workspace re-init on the fresh instance.
-        arState.setWorkspaceRootReady(false);
-        arState.setWorkspaceProjectionHash(null);
+        doStart();
     }
 
     private void doStart() throws Exception {
-        // 纯 MCP 方案：不再调用 ensureSandbox/createSandbox。MCP server 在 initialize 握手时
-        // 会自动创建沙箱实例，后续 mcp.exec 都落在该实例上。这样只有一个沙箱（MCP 创建的），
-        // 不再出现 ensureSandbox 建一个、MCP 又建一个的"双沙箱"问题。
-        log.info("[sandbox-diag] doStart step1 mcp.connect: sandboxId={}", arState.getSandboxId());
-        mcp.connect();
+        // HTTP REST 方案：显式创建/探活沙箱实例，再走 4-Branch 工作区初始化。
+        log.info(
+                "[sandbox-diag] doStart step1 ensureSandboxInstance: sandboxId={}",
+                arState.getSandboxId());
+        ensureSandboxInstance();
         log.info("[sandbox-diag] doStart step2 super.start: sandboxId={}", arState.getSandboxId());
         super.start();
         log.info("[sandbox-diag] doStart DONE: sandboxId={}", arState.getSandboxId());
+    }
+
+    /**
+     * 确保沙箱实例处于可用状态。统一处理三种场景：
+     * <ol>
+     *   <li>全新创建：getSandbox 返回 404 → createSandbox + waitUntilReady</li>
+     *   <li>resume 存活实例：getSandbox 返回 READY/RUNNING → 复用</li>
+     *   <li>resume 已回收实例：getSandbox 返回 TERMINATED/FAILED → delete + create + wait</li>
+     * </ol>
+     *
+     * <p>沙箱实例由 {@code sandboxIdleTimeoutSeconds} 控制 idle 回收。resume 时持久化的
+     * sandboxId 对应的实例可能已被回收（404）或已终止，此时需要重建。重建后若工作区在
+     * NAS 挂载上（workspaceOnNas=true），4-Branch 走 Branch A 自动恢复；否则走 Branch D
+     * 重新初始化。
+     */
+    private void ensureSandboxInstance() throws Exception {
+        String sandboxId = arState.getSandboxId();
+        if (sandboxId == null || sandboxId.isBlank()) {
+            throw new SandboxException.SandboxConfigurationException(
+                    "AgentRun sandboxId is required (set on AgentRunSandboxState)");
+        }
+
+        com.fasterxml.jackson.databind.JsonNode existing = http.getSandboxOrNull(sandboxId);
+        if (existing == null) {
+            // 场景 1：实例不存在（404），全新创建
+            log.info(
+                    "[sandbox-diag] ensureSandboxInstance: CREATE (not found) sandboxId={}",
+                    sandboxId);
+            createAndReady(sandboxId);
+            return;
+        }
+
+        String status = AgentRunDataPlaneHttp.readStatus(existing);
+        log.info(
+                "[sandbox-diag] ensureSandboxInstance: EXISTS sandboxId={}, status={}",
+                sandboxId,
+                status);
+        if (status != null) {
+            String upper = status.toUpperCase();
+            if (upper.contains("READY") || upper.contains("RUNNING")) {
+                // 场景 2：实例存活，复用
+                return;
+            }
+            if (upper.contains("FAILED") || upper.contains("TERMINATED")) {
+                // 场景 3：实例已终止，删除后重建
+                log.info(
+                        "[sandbox-diag] ensureSandboxInstance: RECREATE (terminal) sandboxId={},"
+                                + " status={}",
+                        sandboxId,
+                        status);
+                try {
+                    http.deleteSandbox(sandboxId);
+                } catch (Exception e) {
+                    log.warn(
+                            "[sandbox-agentrun] delete before recreate failed (ignoring): {}",
+                            e.getMessage());
+                }
+                // 重建后工作区丢失，强制走 Branch B/D 重新初始化
+                arState.setWorkspaceRootReady(false);
+                arState.setWorkspaceProjectionHash(null);
+                createAndReady(sandboxId);
+                return;
+            }
+        }
+        // 状态未知，保守起见尝试复用（若不可用后续 exec 会 404 触发恢复）
+        log.warn(
+                "[sandbox-agentrun] ensureSandboxInstance: unknown status '{}', assuming reusable",
+                status);
+    }
+
+    private void createAndReady(String sandboxId) throws Exception {
+        com.fasterxml.jackson.databind.JsonNode resp = http.createSandbox(sandboxId);
+        // 若 API 返回了不同的 sandboxId，更新 state（通常返回值与请求一致）
+        if (resp != null && resp.has("sandboxId")) {
+            String respId = resp.get("sandboxId").asText();
+            if (respId != null && !respId.isBlank() && !respId.equals(sandboxId)) {
+                log.info(
+                        "[sandbox-agentrun] createSandbox returned different sandboxId: {} → {}",
+                        sandboxId,
+                        respId);
+                arState.setSandboxId(respId);
+            }
+        }
+        http.waitUntilReady(arState.getSandboxId(), SANDBOX_READY_WAIT_SECONDS);
     }
 
     @Override
     public void stop() throws Exception {
         if (arState.isWorkspaceOnNas()) {
             try {
-                mcp.exec("sync", null, 5);
+                http.exec(arState.getSandboxId(), "sync", null, 5);
             } catch (Exception e) {
                 log.warn("[sandbox-agentrun] sync before stop failed: {}", e.getMessage());
             }
@@ -163,22 +194,12 @@ public class AgentRunSandbox extends AbstractBaseSandbox {
         // The sandbox instance survives across acquire/release cycles: AgentRun reclaims it via
         // the configured idle timeout (sandboxIdleTimeoutSeconds), not on shutdown. Real teardown
         // is done via destroyInstance(), called only from AgentRunSandboxClient#delete().
-        //
-        // NOTE: do NOT close the MCP channel here either. The channel is cached per-sandboxId by
-        // AgentRunSandboxClient and reused across acquire/release cycles so the MCP session
-        // survives — closing it here would force a re-initialize on the next resume, which the
-        // AgentRun MCP server rejects ("Session not found").
     }
 
     /**
      * Destroys the backend sandbox instance via an HTTP delete. Called only from {@link
      * AgentRunSandboxClient#delete} for explicit teardown — {@link #shutdown()} is intentionally a
      * no-op so instances live across turns.
-     *
-     * <p>纯 MCP 方案下，真实沙箱实例由 MCP server 创建（随机 id），持久化的派生 sandboxId 只是
-     * channelCache 的 key，对应的 HTTP 沙箱可能不存在，{@code deleteSandbox} 会静默 404。
-     * 真正的清理靠 {@link AgentRunSandboxClient#delete} 里关闭 MCP channel（断开 session），
-     * 沙箱实例随后由 AgentRun idle-timeout 自然回收。
      */
     void destroyInstance() throws Exception {
         if (!arState.isSandboxOwned()) {
@@ -203,16 +224,36 @@ public class AgentRunSandbox extends AbstractBaseSandbox {
     @Override
     protected ExecResult doExec(RuntimeContext runtimeContext, String command, int timeoutSeconds)
             throws Exception {
-        AgentRunMcpChannel.ExecResult r =
-                mcp.exec(command, relativeOrAbsoluteCwd(), timeoutSeconds);
-        String out = r.stdout != null ? r.stdout : "";
+        String sandboxId = arState.getSandboxId();
+        try {
+            return execOnce(sandboxId, command, timeoutSeconds);
+        } catch (Exception e) {
+            // 实例可能被 idle-timeout 回收（HTTP 404），重建后重试一次
+            if (AgentRunDataPlaneHttp.isNotFound(e)) {
+                log.warn(
+                        "[sandbox-agentrun] doExec: sandbox not found (404), recreating instance"
+                                + " sandboxId={}",
+                        sandboxId);
+                arState.setWorkspaceRootReady(false);
+                arState.setWorkspaceProjectionHash(null);
+                ensureSandboxInstance();
+                return execOnce(arState.getSandboxId(), command, timeoutSeconds);
+            }
+            throw e;
+        }
+    }
+
+    private ExecResult execOnce(String sandboxId, String command, int timeoutSeconds)
+            throws Exception {
+        ExecResult r = http.exec(sandboxId, command, relativeOrAbsoluteCwd(), timeoutSeconds);
+        String out = r.stdout() != null ? r.stdout() : "";
         boolean truncated = out.length() >= OUTPUT_TRUNCATE_BYTES;
         if (truncated) {
             out = out.substring(0, OUTPUT_TRUNCATE_BYTES);
         }
-        ExecResult result = new ExecResult(r.exitCode, out, r.stderr, truncated);
+        ExecResult result = new ExecResult(r.exitCode(), out, r.stderr(), truncated);
         if (!result.ok()) {
-            throw new SandboxException.ExecException(r.exitCode, out, r.stderr);
+            throw new SandboxException.ExecException(r.exitCode(), out, r.stderr());
         }
         return result;
     }
@@ -224,54 +265,51 @@ public class AgentRunSandbox extends AbstractBaseSandbox {
             return InputStream.nullInputStream();
         }
         String root = arState.getWorkspaceRoot();
-        String cmd = "tar -cf - -C " + shellSingleQuote(root) + " . | base64 -w0";
-        AgentRunMcpChannel.ExecResult r = mcp.exec(cmd, null, TAR_TIMEOUT_SECONDS);
-        if (r.exitCode != 0) {
+        String sandboxId = arState.getSandboxId();
+        // 在沙箱内打包 tar，再通过 HTTP 下载
+        String packCmd =
+                "tar -cf " + shellSingleQuote(WS_TAR_PATH) + " -C " + shellSingleQuote(root) + " .";
+        ExecResult pack = http.exec(sandboxId, packCmd, null, 30);
+        if (pack.exitCode() != 0) {
             throw new SandboxException.SandboxRuntimeException(
                     SandboxErrorCode.WORKSPACE_ARCHIVE_WRITE_ERROR,
-                    "AgentRun tar failed (exit=" + r.exitCode + "): " + r.stderr);
+                    "AgentRun tar failed (exit=" + pack.exitCode() + "): " + pack.stderr());
         }
-        String b64 = (r.stdout != null ? r.stdout : "").replace("\n", "").replace("\r", "");
-        byte[] raw = Base64.getDecoder().decode(b64);
-        return new ByteArrayInputStream(raw);
+        byte[] tarBytes = http.downloadFile(sandboxId, WS_TAR_PATH);
+        // 清理临时文件
+        try {
+            http.exec(sandboxId, "rm -f " + shellSingleQuote(WS_TAR_PATH), null, 10);
+        } catch (Exception e) {
+            log.debug("[sandbox-agentrun] cleanup of {} failed: {}", WS_TAR_PATH, e.getMessage());
+        }
+        return new ByteArrayInputStream(tarBytes);
     }
 
     @Override
     protected void doHydrateWorkspace(InputStream archive) throws Exception {
         String root = arState.getWorkspaceRoot();
+        String sandboxId = arState.getSandboxId();
         byte[] all = archive.readAllBytes();
         log.info("[sandbox-projection] doHydrateWorkspace: root={}, tarBytes={}", root, all.length);
         if (all.length == 0) {
             log.info("[sandbox-projection] doHydrateWorkspace: empty archive, skipping");
             return;
         }
-        String b64 = Base64.getEncoder().encodeToString(all);
-        mcp.exec("rm -f /tmp/agentscope-ws.b64", null, 30);
-        for (int i = 0; i < b64.length(); i += B64_CHUNK) {
-            String chunk = b64.substring(i, Math.min(b64.length(), i + B64_CHUNK));
-            String py =
-                    "import pathlib; pathlib.Path('/tmp/agentscope-ws.b64').open('a').write("
-                            + jsonLiteral(chunk)
-                            + ")";
-            AgentRunMcpChannel.ExecResult chunkRes =
-                    mcp.exec("python3 -c " + shellSingleQuote(py), null, 120);
-            if (chunkRes.exitCode != 0) {
-                throw new SandboxException.SandboxRuntimeException(
-                        SandboxErrorCode.WORKSPACE_ARCHIVE_READ_ERROR,
-                        "AgentRun chunk write failed: " + chunkRes.stderr);
-            }
-        }
-        String pyFin =
-                "import base64,pathlib,subprocess; d="
-                        + jsonLiteral(root)
-                        + "; raw=base64.standard_b64decode(pathlib.Path('/tmp/agentscope-ws.b64').read_text());"
-                        + " subprocess.run(['tar','xf','-','-C',d],input=raw,check=True)";
-        AgentRunMcpChannel.ExecResult finRes =
-                mcp.exec("python3 -c " + shellSingleQuote(pyFin), null, TAR_TIMEOUT_SECONDS);
-        if (finRes.exitCode != 0) {
+        // 通过 /filesystem/upload 上传 tar 到 /tmp，再在沙箱内解压
+        http.uploadFile(sandboxId, WS_TAR_PATH, all);
+        String extractCmd =
+                "tar -xf " + shellSingleQuote(WS_TAR_PATH) + " -C " + shellSingleQuote(root);
+        ExecResult extract = http.exec(sandboxId, extractCmd, null, 30);
+        if (extract.exitCode() != 0) {
             throw new SandboxException.SandboxRuntimeException(
                     SandboxErrorCode.WORKSPACE_ARCHIVE_READ_ERROR,
-                    "AgentRun tar extract failed: " + finRes.stderr);
+                    "AgentRun tar extract failed: " + extract.stderr());
+        }
+        // 清理临时文件
+        try {
+            http.exec(sandboxId, "rm -f " + shellSingleQuote(WS_TAR_PATH), null, 10);
+        } catch (Exception e) {
+            log.debug("[sandbox-agentrun] cleanup of {} failed: {}", WS_TAR_PATH, e.getMessage());
         }
     }
 
@@ -279,17 +317,17 @@ public class AgentRunSandbox extends AbstractBaseSandbox {
     protected void doSetupWorkspace() throws Exception {
         String root = arState.getWorkspaceRoot();
         log.info("[sandbox-projection] doSetupWorkspace: mkdir -p {}", root);
-        AgentRunMcpChannel.ExecResult res =
-                mcp.exec("mkdir -p " + shellSingleQuote(root), null, 30);
-        if (res.exitCode != 0) {
+        ExecResult res =
+                http.exec(arState.getSandboxId(), "mkdir -p " + shellSingleQuote(root), null, 30);
+        if (res.exitCode() != 0) {
             throw new SandboxException.SandboxRuntimeException(
                     SandboxErrorCode.WORKSPACE_ARCHIVE_WRITE_ERROR,
                     "Failed to create workspace directory "
                             + root
                             + " (exitCode="
-                            + res.exitCode
+                            + res.exitCode()
                             + ", stderr="
-                            + res.stderr
+                            + res.stderr()
                             + ")."
                             + " The sandbox user may lack write permission on the parent."
                             + " Verify workspaceRoot is under a writable path (e.g. /home/user/).");
@@ -303,7 +341,11 @@ public class AgentRunSandbox extends AbstractBaseSandbox {
             return;
         }
         try {
-            mcp.exec("rm -rf " + shellSingleQuote(arState.getWorkspaceRoot()), null, 30);
+            http.exec(
+                    arState.getSandboxId(),
+                    "rm -rf " + shellSingleQuote(arState.getWorkspaceRoot()),
+                    null,
+                    30);
         } catch (Exception e) {
             // best-effort
         }
@@ -312,6 +354,24 @@ public class AgentRunSandbox extends AbstractBaseSandbox {
     @Override
     protected String getWorkspaceRoot() {
         return arState.getWorkspaceRoot();
+    }
+
+    /**
+     * Uploads a file via the dedicated {@code POST /filesystem/upload} endpoint instead of the
+     * default exec-based base64 approach. Supports binary content and is more efficient.
+     */
+    @Override
+    public void uploadFile(String path, byte[] content) throws Exception {
+        http.uploadFile(arState.getSandboxId(), path, content);
+    }
+
+    /**
+     * Downloads a file via the dedicated {@code GET /filesystem/download} endpoint instead of the
+     * default exec-based base64 approach. Supports binary content and is more efficient.
+     */
+    @Override
+    public byte[] downloadFile(String path) throws Exception {
+        return http.downloadFile(arState.getSandboxId(), path);
     }
 
     private String relativeOrAbsoluteCwd() {

@@ -15,6 +15,7 @@
  */
 package io.agentscope.extensions.sandbox.agentrun;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertSame;
 
@@ -24,57 +25,70 @@ import java.lang.reflect.Field;
 import org.junit.jupiter.api.Test;
 
 /**
- * Verifies the per-sandboxId MCP channel cache in {@link AgentRunSandboxClient}: the same
- * sandboxId reuses one channel across resume cycles (keeping the MCP session alive), different
- * sandboxIds get distinct channels, and {@code delete} evicts the cached channel.
+ * Verifies the build/resume behaviour of {@link AgentRunSandboxClient} after the MCP→HTTP
+ * migration: each resume produces a fresh {@link AgentRunSandbox} (no channel cache), the state is
+ * refreshed from live options, and delete is safe to call on non-owned sandboxes.
  */
 class AgentRunSandboxClientChannelCacheTest {
 
-    private static AgentRunSandboxClient clientWithDefaultUrl() {
+    private static AgentRunSandboxClient clientWithDefaults() {
         AgentRunSandboxClientOptions opts = new AgentRunSandboxClientOptions();
-        opts.setMcpServerUrl("https://example.com/mcp");
+        opts.setApiKey("test-key");
+        opts.setAccountId("1234567890");
+        opts.setRegion("cn-hangzhou");
+        opts.setTemplateName("agentscope-default");
         return new AgentRunSandboxClient(opts, null);
     }
 
     @Test
-    void sameSandboxIdReusesChannelAcrossResumes() throws Exception {
-        AgentRunSandboxClient client = clientWithDefaultUrl();
+    void resumeProducesSandboxWithRefreshedState() {
+        AgentRunSandboxClient client = clientWithDefaults();
+        AgentRunSandboxState state = stateWithSandboxId("01KE8DAJ35JC8SKP9CNFRZ8CW7");
+
+        Sandbox first = client.resume(state);
+
+        // The resumed sandbox should carry the sandboxId from the persisted state.
+        assertEquals(
+                "01KE8DAJ35JC8SKP9CNFRZ8CW7",
+                ((AgentRunSandboxState) first.getState()).getSandboxId());
+    }
+
+    @Test
+    void eachResumeProducesIndependentSandboxInstance() throws Exception {
+        AgentRunSandboxClient client = clientWithDefaults();
         AgentRunSandboxState state = stateWithSandboxId("01KE8DAJ35JC8SKP9CNFRZ8CW7");
 
         Sandbox first = client.resume(state);
         Sandbox second = client.resume(state);
 
-        // Same sandboxId → same cached channel instance (MCP session survives across cycles).
-        assertSame(channelOf(first), channelOf(second));
+        // No channel cache → each resume builds a fresh AgentRunSandbox (different http instance).
+        assertNotSame(httpOf(first), httpOf(second));
     }
 
     @Test
-    void differentSandboxIdsGetDistinctChannels() throws Exception {
-        AgentRunSandboxClient client = clientWithDefaultUrl();
-
-        Sandbox a = client.resume(stateWithSandboxId("01KE8DAJ35JC8SKP9CNFRZ8CW7"));
-        Sandbox b = client.resume(stateWithSandboxId("01KE8DAJ35JC8SKP9CNFRZ8CW8"));
-
-        assertNotSame(channelOf(a), channelOf(b));
-    }
-
-    @Test
-    void deleteEvictsCachedChannelSoNextResumeGetsFreshOne() throws Exception {
-        AgentRunSandboxClient client = clientWithDefaultUrl();
+    void resumeSameStatePreservesSandboxId() {
+        AgentRunSandboxClient client = clientWithDefaults();
         AgentRunSandboxState state = stateWithSandboxId("01KE8DAJ35JC8SKP9CNFRZ8CW7");
-        // Not sandbox-owned so shutdown()/close() won't fire real HTTP deletes or MCP calls
-        // during the test — we only care about the channel-cache eviction behaviour here.
+
+        Sandbox first = client.resume(state);
+        Sandbox second = client.resume(state);
+
+        // Same persisted sandboxId → both sandboxes reference the same logical instance.
+        assertSame(
+                ((AgentRunSandboxState) first.getState()).getSandboxId(),
+                ((AgentRunSandboxState) second.getState()).getSandboxId());
+    }
+
+    @Test
+    void deleteIsSafeForNonOwnedSandbox() {
+        AgentRunSandboxClient client = clientWithDefaults();
+        AgentRunSandboxState state = stateWithSandboxId("01KE8DAJ35JC8SKP9CNFRZ8CW7");
+        // Not sandbox-owned so destroyInstance() won't fire a real HTTP delete during the test.
         state.setSandboxOwned(false);
 
         Sandbox first = client.resume(state);
-        AgentRunMcpChannel firstChannel = channelOf(first);
-
-        // delete should remove the cached channel for this sandboxId.
+        // Should not throw — delete on a non-owned sandbox is a no-op for destroyInstance.
         client.delete(first);
-
-        Sandbox second = client.resume(state);
-        // A fresh channel is built after eviction — different instance, new MCP session.
-        assertNotSame(firstChannel, channelOf(second));
     }
 
     private static AgentRunSandboxState stateWithSandboxId(String sandboxId) {
@@ -85,7 +99,6 @@ class AgentRunSandboxClientChannelCacheTest {
         state.setTemplateName("agentscope-default");
         state.setAccountId("123456789012");
         state.setRegion("cn-hangzhou");
-        state.setMcpServerUrl("https://example.com/mcp");
         state.setSandboxOwned(false);
         WorkspaceSpec ws = new WorkspaceSpec();
         ws.setRoot("/home/user/workspace");
@@ -93,10 +106,10 @@ class AgentRunSandboxClientChannelCacheTest {
         return state;
     }
 
-    /** Reflectively reads the private {@code mcp} field from an {@link AgentRunSandbox}. */
-    private static AgentRunMcpChannel channelOf(Sandbox sandbox) throws Exception {
-        Field f = sandbox.getClass().getDeclaredField("mcp");
+    /** Reflectively reads the private {@code http} field from an {@link AgentRunSandbox}. */
+    private static Object httpOf(Sandbox sandbox) throws Exception {
+        Field f = sandbox.getClass().getDeclaredField("http");
         f.setAccessible(true);
-        return (AgentRunMcpChannel) f.get(sandbox);
+        return f.get(sandbox);
     }
 }

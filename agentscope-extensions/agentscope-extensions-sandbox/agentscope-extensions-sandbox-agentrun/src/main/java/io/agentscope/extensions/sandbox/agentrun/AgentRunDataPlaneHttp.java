@@ -19,6 +19,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.agentscope.harness.agent.sandbox.ExecResult;
 import io.agentscope.harness.agent.sandbox.SandboxErrorCode;
 import io.agentscope.harness.agent.sandbox.SandboxException;
 import java.io.IOException;
@@ -26,6 +27,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 import okhttp3.MediaType;
+import okhttp3.MultipartBody;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.RequestBody;
@@ -112,6 +114,140 @@ final class AgentRunDataPlaneHttp {
      */
     static String readStatus(JsonNode sandbox) {
         return textStatus(sandbox);
+    }
+
+    /**
+     * Returns the sandbox object if it exists, or {@code null} when the data plane responds
+     * HTTP 404 (instance not found — e.g. reclaimed by idle timeout).
+     *
+     * <p>All other errors propagate. Use this to probe whether a persisted sandboxId is still alive
+     * before deciding to reuse or recreate.
+     */
+    JsonNode getSandboxOrNull(String sandboxId) throws IOException {
+        try {
+            return getSandbox(sandboxId);
+        } catch (SandboxException e) {
+            if (isNotFound(e)) {
+                return null;
+            }
+            throw e;
+        }
+    }
+
+    /** True when the given error is an HTTP 404 from the data plane (sandbox not found). */
+    static boolean isNotFound(Throwable e) {
+        Throwable cur = e;
+        while (cur != null) {
+            String msg = cur.getMessage();
+            if (msg != null && msg.contains("HTTP 404")) {
+                return true;
+            }
+            cur = cur.getCause();
+        }
+        return false;
+    }
+
+    /**
+     * Executes a shell command in the sandbox via {@code POST /sandboxes/{id}/processes/cmd}.
+     *
+     * <p>The data plane gateway enforces a hard 30-second timeout regardless of the requested
+     * {@code timeoutSeconds}. The response carries {@code exitCode}, {@code stdout} and
+     * {@code stderr}.
+     *
+     * @param sandboxId target sandbox instance id
+     * @param command shell command string
+     * @param cwd working directory; omitted from the request body when {@code null}/blank
+     * @param timeoutSeconds requested timeout (capped to 30 by the gateway)
+     * @return exec result with exit code, stdout and stderr
+     */
+    ExecResult exec(String sandboxId, String command, String cwd, int timeoutSeconds)
+            throws IOException {
+        ObjectNode body = json.createObjectNode();
+        body.put("command", command);
+        if (cwd != null && !cwd.isBlank()) {
+            body.put("cwd", cwd);
+        }
+        // Gateway hard-caps at 30s; send the smaller of requested/default to be explicit.
+        body.put("timeout", Math.min(30, Math.max(1, timeoutSeconds)));
+
+        String url = sandboxUrl(sandboxId) + "/processes/cmd";
+        JsonNode resp =
+                AgentRunRetry.withRetries(
+                        opt.getMaxRetries(), () -> unwrapData(postJson(url, body)));
+        return parseExecResult(resp);
+    }
+
+    /**
+     * Uploads a file into the sandbox via {@code POST /sandboxes/{id}/filesystem/upload}
+     * (multipart, max 100 MB). Parent directories are auto-created by the data plane.
+     *
+     * @param sandboxId target sandbox instance id
+     * @param path absolute destination path inside the sandbox
+     * @param content raw file bytes
+     */
+    void uploadFile(String sandboxId, String path, byte[] content) throws IOException {
+        String url = sandboxUrl(sandboxId) + "/filesystem/upload";
+        // AgentRun expects multipart/form-data with a "file" part (binary content) and an
+        // optional "path" form field for the destination. Use the basename as the file part's
+        // filename to avoid issues with absolute paths in the Content-Disposition header.
+        String filename = path;
+        int lastSlash = path.lastIndexOf('/');
+        if (lastSlash >= 0 && lastSlash < path.length() - 1) {
+            filename = path.substring(lastSlash + 1);
+        }
+        // OkHttp 5.x: use ByteString to wrap the raw bytes for the file part body.
+        okhttp3.RequestBody filePart =
+                okhttp3.RequestBody.create(
+                        okio.ByteString.of(content), MediaType.get("application/octet-stream"));
+        MultipartBody multipart =
+                new MultipartBody.Builder()
+                        .setType(MultipartBody.FORM)
+                        .addFormDataPart("file", filename, filePart)
+                        .addFormDataPart("path", path)
+                        .build();
+        Request req = baseRequest().url(url).post(multipart).build();
+        try (Response res = http.newCall(req).execute()) {
+            String text = res.body() != null ? res.body().string() : "";
+            if (!res.isSuccessful()) {
+                throw new SandboxException.SandboxRuntimeException(
+                        SandboxErrorCode.WORKSPACE_ARCHIVE_WRITE_ERROR,
+                        "AgentRun upload failed: HTTP "
+                                + res.code()
+                                + " "
+                                + res.message()
+                                + ": "
+                                + text);
+            }
+        }
+    }
+
+    /**
+     * Downloads a file from the sandbox via {@code GET /sandboxes/{id}/filesystem/download?path=}.
+     *
+     * @param sandboxId target sandbox instance id
+     * @param path absolute source path inside the sandbox
+     * @return raw file bytes
+     */
+    byte[] downloadFile(String sandboxId, String path) throws IOException {
+        String url =
+                sandboxUrl(sandboxId)
+                        + "/filesystem/download?path="
+                        + java.net.URLEncoder.encode(path, java.nio.charset.StandardCharsets.UTF_8);
+        Request req = baseRequest().url(url).get().build();
+        try (Response res = http.newCall(req).execute()) {
+            if (!res.isSuccessful()) {
+                String text = res.body() != null ? res.body().string() : "";
+                throw new SandboxException.SandboxRuntimeException(
+                        SandboxErrorCode.WORKSPACE_ARCHIVE_READ_ERROR,
+                        "AgentRun download failed: HTTP "
+                                + res.code()
+                                + " "
+                                + res.message()
+                                + ": "
+                                + text);
+            }
+            return res.body() != null ? res.body().bytes() : new byte[0];
+        }
     }
 
     /**
@@ -228,6 +364,59 @@ final class AgentRunDataPlaneHttp {
             b.addHeader("X-Acs-Parent-Id", opt.getAccountId());
         }
         return b;
+    }
+
+    /** Builds the {@code /sandboxes/{sandboxId}} URL prefix used by all per-instance endpoints. */
+    private String sandboxUrl(String sandboxId) {
+        return opt.getResolvedDataPlaneBaseUrl() + "/sandboxes/" + sandboxId;
+    }
+
+    /**
+     * Parses an exec response into an {@link ExecResult}.
+     *
+     * <p>Accepts both nested {@code {result:{exitCode,stdout,stderr}}} and flat shapes, and the
+     * field aliases {@code exit_code}/{@code output} (mirrors the old MCP payload parser).
+     */
+    private static ExecResult parseExecResult(JsonNode resp) {
+        if (resp == null) {
+            return new ExecResult(-1, "", "AgentRun exec returned null response", false);
+        }
+        JsonNode node = resp;
+        JsonNode resultNode = resp.get("result");
+        if (resultNode != null && resultNode.isObject()) {
+            node = resultNode;
+        }
+        int exitCode = readInt(node, "exitCode", "exit_code", -1);
+        String stdout = readText(node, "stdout", "output", "");
+        String stderr = readText(node, "stderr", "");
+        return new ExecResult(exitCode, stdout, stderr, false);
+    }
+
+    private static int readInt(JsonNode node, String primary, String fallback, int def) {
+        JsonNode n = node.get(primary);
+        if (n == null || !n.canConvertToInt()) {
+            n = node.get(fallback);
+        }
+        return (n != null && n.canConvertToInt()) ? n.asInt() : def;
+    }
+
+    private static String readText(JsonNode node, String primary, String fallback, String def) {
+        JsonNode n = node.get(primary);
+        if (n == null || n.isNull()) {
+            n = node.get(fallback);
+        }
+        if (n == null || n.isNull()) {
+            return def;
+        }
+        return n.isTextual() ? n.asText() : n.toString();
+    }
+
+    private static String readText(JsonNode node, String primary, String def) {
+        JsonNode n = node.get(primary);
+        if (n == null || n.isNull()) {
+            return def;
+        }
+        return n.isTextual() ? n.asText() : n.toString();
     }
 
     private String requireApiKey() {
