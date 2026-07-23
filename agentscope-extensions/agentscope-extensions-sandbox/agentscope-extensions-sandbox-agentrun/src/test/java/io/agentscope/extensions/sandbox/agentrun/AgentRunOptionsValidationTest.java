@@ -27,8 +27,7 @@ class AgentRunOptionsValidationTest {
         return new AgentRunSandboxClientOptions()
                 .setApiKey("test-key")
                 .setTemplateName("agentscope-default")
-                .setAccountId("1234567890")
-                .setRegion("cn-hangzhou");
+                .setMcpServerUrl("https://example.com/mcp");
     }
 
     @Test
@@ -41,8 +40,7 @@ class AgentRunOptionsValidationTest {
         AgentRunSandboxClientOptions opt =
                 new AgentRunSandboxClientOptions()
                         .setTemplateName("t")
-                        .setAccountId("1234567890")
-                        .setRegion("cn-hangzhou");
+                        .setMcpServerUrl("https://example.com/mcp");
         Assertions.assertThrows(
                 SandboxException.SandboxConfigurationException.class, opt::validate);
     }
@@ -52,14 +50,13 @@ class AgentRunOptionsValidationTest {
         AgentRunSandboxClientOptions opt =
                 new AgentRunSandboxClientOptions()
                         .setApiKey("k")
-                        .setAccountId("1234567890")
-                        .setRegion("cn-hangzhou");
+                        .setMcpServerUrl("https://example.com/mcp");
         Assertions.assertThrows(
                 SandboxException.SandboxConfigurationException.class, opt::validate);
     }
 
     @Test
-    void missingAccountIdAndRegionAndDataPlaneBaseUrlFails() {
+    void missingMcpServerUrlFails() {
         AgentRunSandboxClientOptions opt =
                 new AgentRunSandboxClientOptions().setApiKey("k").setTemplateName("t");
         Assertions.assertThrows(
@@ -155,11 +152,7 @@ class AgentRunOptionsValidationTest {
 
     @Test
     void resolvedDataPlaneMissingFieldsFails() {
-        // baseValid() now includes accountId+region, so build a minimal options without them
-        AgentRunSandboxClientOptions opt =
-                new AgentRunSandboxClientOptions()
-                        .setApiKey("test-key")
-                        .setTemplateName("agentscope-default");
+        AgentRunSandboxClientOptions opt = baseValid();
         Assertions.assertThrows(
                 SandboxException.SandboxConfigurationException.class,
                 opt::getResolvedDataPlaneBaseUrl);

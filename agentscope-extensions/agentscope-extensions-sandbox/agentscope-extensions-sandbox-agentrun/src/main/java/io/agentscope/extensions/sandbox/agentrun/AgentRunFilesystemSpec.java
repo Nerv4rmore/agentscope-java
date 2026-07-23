@@ -60,6 +60,16 @@ public class AgentRunFilesystemSpec extends SandboxFilesystemSpec {
         return this;
     }
 
+    public AgentRunFilesystemSpec mcpServerUrl(String mcpServerUrl) {
+        options.setMcpServerUrl(mcpServerUrl);
+        return this;
+    }
+
+    public AgentRunFilesystemSpec mcpEndpoint(String mcpEndpoint) {
+        options.setMcpEndpoint(mcpEndpoint);
+        return this;
+    }
+
     public AgentRunFilesystemSpec sandboxIdleTimeoutSeconds(int seconds) {
         options.setSandboxIdleTimeoutSeconds(seconds);
         return this;

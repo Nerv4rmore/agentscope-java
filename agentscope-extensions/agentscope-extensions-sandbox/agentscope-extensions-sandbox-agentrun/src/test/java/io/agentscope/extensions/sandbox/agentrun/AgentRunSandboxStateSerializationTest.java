@@ -33,6 +33,7 @@ class AgentRunSandboxStateSerializationTest {
         state.setTemplateName("agentscope-default");
         state.setAccountId("123456789012");
         state.setRegion("cn-hangzhou");
+        state.setMcpServerUrl("https://example.com/mcp");
         state.setSandboxOwned(true);
         state.setWorkspaceOnNas(true);
         state.setWorkspaceRootReady(true);
@@ -53,6 +54,7 @@ class AgentRunSandboxStateSerializationTest {
         Assertions.assertEquals("agentscope-default", r.getTemplateName());
         Assertions.assertEquals("123456789012", r.getAccountId());
         Assertions.assertEquals("cn-hangzhou", r.getRegion());
+        Assertions.assertEquals("https://example.com/mcp", r.getMcpServerUrl());
         Assertions.assertTrue(r.isSandboxOwned());
         Assertions.assertTrue(r.isWorkspaceOnNas());
         Assertions.assertTrue(r.isWorkspaceRootReady());
@@ -93,29 +95,5 @@ class AgentRunSandboxStateSerializationTest {
         Assertions.assertTrue(
                 a.matches("[0-9A-HJKMNP-TV-Z]+"),
                 "sandbox id must use Crockford base32 alphabet but was: " + a);
-    }
-
-    @Test
-    void deserializesLegacyJsonWithMcpServerUrlWithoutError() {
-        // Old persisted state (pre MCP→HTTP migration) contained a mcpServerUrl field.
-        // FAIL_ON_UNKNOWN_PROPERTIES is disabled, so deserialization must succeed and simply
-        // ignore the now-removed field.
-        String legacyJson =
-                "{\"type\":\"agentrun\",\"sessionId\":\"session-legacy\","
-                        + "\"sandboxId\":\"01KE8DAJ35JC8SKP9CNFRZ8CW7\","
-                        + "\"workspaceRoot\":\"/home/user/workspace\","
-                        + "\"templateName\":\"agentscope-default\","
-                        + "\"accountId\":\"123456789012\",\"region\":\"cn-hangzhou\","
-                        + "\"mcpServerUrl\":\"https://example.com/mcp\","
-                        + "\"sandboxOwned\":true,\"workspaceOnNas\":false,"
-                        + "\"workspaceRootReady\":false}";
-
-        AgentRunSandboxClient client = new AgentRunSandboxClient();
-        SandboxState read = client.deserializeState(legacyJson);
-        Assertions.assertInstanceOf(AgentRunSandboxState.class, read);
-        AgentRunSandboxState r = (AgentRunSandboxState) read;
-        Assertions.assertEquals("session-legacy", r.getSessionId());
-        Assertions.assertEquals("01KE8DAJ35JC8SKP9CNFRZ8CW7", r.getSandboxId());
-        Assertions.assertEquals("/home/user/workspace", r.getWorkspaceRoot());
     }
 }

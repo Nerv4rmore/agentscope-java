@@ -27,6 +27,7 @@ import io.agentscope.harness.agent.sandbox.SandboxContext;
 import io.agentscope.harness.agent.sandbox.SandboxException;
 import io.agentscope.harness.agent.sandbox.SandboxManager;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -172,8 +173,23 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
             byte[] content = file.getValue();
 
             try {
-                active.uploadFile(path, content);
-                results.add(FileUploadResponse.success(path));
+                String base64Content = Base64.getEncoder().encodeToString(content);
+                String escapedPath = shellSingleQuote(path);
+                String cmd =
+                        "mkdir -p $(dirname "
+                                + escapedPath
+                                + ") && "
+                                + "printf '%s' '"
+                                + base64Content
+                                + "' | base64 -d > "
+                                + escapedPath;
+
+                ExecResult result = active.exec(runtimeContext, cmd, null);
+                if (result.ok()) {
+                    results.add(FileUploadResponse.success(path));
+                } else {
+                    results.add(FileUploadResponse.fail(path, result.combinedOutput()));
+                }
             } catch (SandboxException.ExecException e) {
                 String combined =
                         (e.getStdout() != null ? e.getStdout() : "")
@@ -198,8 +214,19 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
 
         for (String path : paths) {
             try {
-                byte[] bytes = active.downloadFile(path);
-                results.add(FileDownloadResponse.success(path, bytes));
+                String escapedPath = shellSingleQuote(path);
+                String cmd = "base64 " + escapedPath;
+
+                ExecResult result = active.exec(runtimeContext, cmd, null);
+                if (result.ok()) {
+                    // MIME decoder tolerates wrapped base64 output from GNU `base64`.
+                    byte[] decoded =
+                            Base64.getMimeDecoder()
+                                    .decode(result.stdout() != null ? result.stdout() : "");
+                    results.add(FileDownloadResponse.success(path, decoded));
+                } else {
+                    results.add(FileDownloadResponse.fail(path, result.combinedOutput()));
+                }
             } catch (SandboxException.ExecException e) {
                 String combined =
                         (e.getStdout() != null ? e.getStdout() : "")
@@ -310,5 +337,9 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
                         "Failed to lazily create sandbox: " + e.getMessage(), e);
             }
         }
+    }
+
+    private String shellSingleQuote(String s) {
+        return "'" + s.replace("'", "'\\''") + "'";
     }
 }
