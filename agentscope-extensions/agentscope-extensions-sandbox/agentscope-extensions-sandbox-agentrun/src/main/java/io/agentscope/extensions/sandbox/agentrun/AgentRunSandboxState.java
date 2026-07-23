@@ -28,7 +28,6 @@ public class AgentRunSandboxState extends SandboxState {
     private String templateName;
     private String accountId;
     private String region;
-    private String mcpServerUrl;
     private boolean sandboxOwned = true;
     private boolean workspaceOnNas = false;
 
@@ -70,14 +69,6 @@ public class AgentRunSandboxState extends SandboxState {
 
     public void setRegion(String region) {
         this.region = region;
-    }
-
-    public String getMcpServerUrl() {
-        return mcpServerUrl;
-    }
-
-    public void setMcpServerUrl(String mcpServerUrl) {
-        this.mcpServerUrl = mcpServerUrl;
     }
 
     public boolean isSandboxOwned() {

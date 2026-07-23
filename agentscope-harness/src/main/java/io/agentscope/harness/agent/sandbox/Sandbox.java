@@ -17,6 +17,7 @@ package io.agentscope.harness.agent.sandbox;
 
 import io.agentscope.core.agent.RuntimeContext;
 import java.io.InputStream;
+import java.util.Base64;
 
 /**
  * An active sandbox with a fully isolated workspace.
@@ -74,4 +75,48 @@ public interface Sandbox extends AutoCloseable {
     InputStream persistWorkspace() throws Exception;
 
     void hydrateWorkspace(InputStream archive) throws Exception;
+
+    /**
+     * Uploads a file's raw bytes into the sandbox workspace.
+     *
+     * <p>Default implementation shells out via {@link #exec}: base64-encodes the content and pipes
+     * it through {@code base64 -d} to the destination path. Backends that expose a dedicated
+     * upload endpoint (e.g. AgentRun {@code POST /filesystem/upload}) should override this for
+     * better efficiency and binary-safety.
+     *
+     * @param path absolute destination path inside the sandbox
+     * @param content raw file bytes
+     * @throws Exception if the upload fails
+     */
+    default void uploadFile(String path, byte[] content) throws Exception {
+        String b64 = Base64.getEncoder().encodeToString(content);
+        String safePath = path.replace("'", "'\"'\"'");
+        String cmd =
+                "mkdir -p $(dirname '"
+                        + safePath
+                        + "') && "
+                        + "printf '%s' '"
+                        + b64
+                        + "' | base64 -d > '"
+                        + safePath
+                        + "'";
+        exec(null, cmd, null);
+    }
+
+    /**
+     * Downloads a file's raw bytes from the sandbox workspace.
+     *
+     * <p>Default implementation shells out via {@link #exec}: runs {@code base64 <path>} and
+     * MIME-decodes the stdout. Backends that expose a dedicated download endpoint (e.g. AgentRun
+     * {@code GET /filesystem/download}) should override this for better efficiency.
+     *
+     * @param path absolute source path inside the sandbox
+     * @return raw file bytes
+     * @throws Exception if the download fails
+     */
+    default byte[] downloadFile(String path) throws Exception {
+        String safePath = path.replace("'", "'\"'\"'");
+        ExecResult r = exec(null, "base64 '" + safePath + "'", null);
+        return Base64.getMimeDecoder().decode(r.stdout() != null ? r.stdout() : "");
+    }
 }

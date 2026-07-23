@@ -37,8 +37,6 @@ public class AgentRunSandboxClientOptions extends SandboxClientOptions {
     private String region;
     private String dataPlaneBaseUrl;
     private String templateName;
-    private String mcpServerUrl;
-    private String mcpEndpoint = "/mcp";
     private int sandboxIdleTimeoutSeconds = 1800;
     private AgentRunNasMountConfig nasConfig;
     private List<AgentRunOssMountConfig> ossMountConfigs = new ArrayList<>();
@@ -71,9 +69,15 @@ public class AgentRunSandboxClientOptions extends SandboxClientOptions {
             throw new SandboxException.SandboxConfigurationException(
                     "AgentRun template name is required (set #setTemplateName)");
         }
-        if (mcpServerUrl == null || mcpServerUrl.isBlank()) {
+        // dataPlaneBaseUrl is resolved from accountId+region when not set explicitly; validate
+        // that at least one path is available so getResolvedDataPlaneBaseUrl() won't fail lazily.
+        if ((dataPlaneBaseUrl == null || dataPlaneBaseUrl.isBlank())
+                && (accountId == null
+                        || accountId.isBlank()
+                        || region == null
+                        || region.isBlank())) {
             throw new SandboxException.SandboxConfigurationException(
-                    "AgentRun MCP server URL is required (set #setMcpServerUrl)");
+                    "AgentRun requires accountId+region or an explicit dataPlaneBaseUrl");
         }
         if (nasConfig != null && nasConfig.getMountDir() != null) {
             requireAllowedMountDir("nasConfig.mountDir", nasConfig.getMountDir());
@@ -182,24 +186,6 @@ public class AgentRunSandboxClientOptions extends SandboxClientOptions {
 
     public AgentRunSandboxClientOptions setTemplateName(String templateName) {
         this.templateName = templateName;
-        return this;
-    }
-
-    public String getMcpServerUrl() {
-        return mcpServerUrl;
-    }
-
-    public AgentRunSandboxClientOptions setMcpServerUrl(String mcpServerUrl) {
-        this.mcpServerUrl = mcpServerUrl;
-        return this;
-    }
-
-    public String getMcpEndpoint() {
-        return mcpEndpoint;
-    }
-
-    public AgentRunSandboxClientOptions setMcpEndpoint(String mcpEndpoint) {
-        this.mcpEndpoint = mcpEndpoint != null && !mcpEndpoint.isBlank() ? mcpEndpoint : "/mcp";
         return this;
     }
 

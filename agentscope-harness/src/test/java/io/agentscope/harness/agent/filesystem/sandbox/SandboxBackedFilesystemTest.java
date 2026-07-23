@@ -33,16 +33,17 @@ class SandboxBackedFilesystemTest {
     private static final RuntimeContext RT = RuntimeContext.empty();
 
     @Test
-    void downloadFiles_decodesWrappedBase64Output() {
+    void downloadFiles_returnsBytesFromSandboxDownloadFile() {
         byte[] expected = new byte[] {1, 2, 3, 4, 5, 6};
         SandboxBackedFilesystem filesystem = new SandboxBackedFilesystem();
-        FakeSandbox sandbox = new FakeSandbox(new ExecResult(0, "AQID\nBAUG", "", false));
+        FakeSandbox sandbox = new FakeSandbox();
+        sandbox.downloadResult = expected;
         filesystem.setSandbox(sandbox);
 
         List<FileDownloadResponse> responses =
                 filesystem.downloadFiles(RT, List.of("/tmp/data.bin"));
 
-        assertEquals("base64 '/tmp/data.bin'", sandbox.lastCommand);
+        assertEquals("/tmp/data.bin", sandbox.lastDownloadPath);
         assertEquals(1, responses.size());
         assertTrue(responses.get(0).isSuccess());
         assertEquals("/tmp/data.bin", responses.get(0).path());
@@ -50,15 +51,16 @@ class SandboxBackedFilesystemTest {
     }
 
     @Test
-    void downloadFiles_decodesEmptyPayloadWhenStdoutIsNull() {
+    void downloadFiles_returnsEmptyBytesWhenDownloadReturnsEmpty() {
         SandboxBackedFilesystem filesystem = new SandboxBackedFilesystem();
-        FakeSandbox sandbox = new FakeSandbox(new ExecResult(0, null, "", false));
+        FakeSandbox sandbox = new FakeSandbox();
+        sandbox.downloadResult = new byte[0];
         filesystem.setSandbox(sandbox);
 
         List<FileDownloadResponse> responses =
                 filesystem.downloadFiles(RT, List.of("/tmp/empty.bin"));
 
-        assertEquals("base64 '/tmp/empty.bin'", sandbox.lastCommand);
+        assertEquals("/tmp/empty.bin", sandbox.lastDownloadPath);
         assertEquals(1, responses.size());
         assertTrue(responses.get(0).isSuccess());
         assertEquals("/tmp/empty.bin", responses.get(0).path());
@@ -66,29 +68,47 @@ class SandboxBackedFilesystemTest {
     }
 
     @Test
-    void downloadFiles_returnsFailureWhenCommandFails() {
+    void downloadFiles_returnsFailureWhenDownloadThrows() {
         SandboxBackedFilesystem filesystem = new SandboxBackedFilesystem();
-        FakeSandbox sandbox = new FakeSandbox(new ExecResult(1, "", "boom", false));
+        FakeSandbox sandbox = new FakeSandbox();
+        sandbox.downloadError =
+                new io.agentscope.harness.agent.sandbox.SandboxException.ExecException(
+                        1, "", "boom");
         filesystem.setSandbox(sandbox);
 
         List<FileDownloadResponse> responses =
                 filesystem.downloadFiles(RT, List.of("/tmp/fail.bin"));
 
-        assertEquals("base64 '/tmp/fail.bin'", sandbox.lastCommand);
+        assertEquals("/tmp/fail.bin", sandbox.lastDownloadPath);
         assertEquals(1, responses.size());
         assertTrue(!responses.get(0).isSuccess());
         assertEquals("/tmp/fail.bin", responses.get(0).path());
-        assertEquals("[stderr] boom", responses.get(0).error());
+    }
+
+    @Test
+    void uploadFiles_delegatesToSandboxUploadFile() {
+        SandboxBackedFilesystem filesystem = new SandboxBackedFilesystem();
+        FakeSandbox sandbox = new FakeSandbox();
+        filesystem.setSandbox(sandbox);
+
+        byte[] content = "hello".getBytes();
+        List<io.agentscope.harness.agent.filesystem.model.FileUploadResponse> responses =
+                filesystem.uploadFiles(
+                        RT, List.of(java.util.Map.entry("/tmp/upload.txt", content)));
+
+        assertEquals("/tmp/upload.txt", sandbox.lastUploadPath);
+        assertArrayEquals(content, sandbox.lastUploadContent);
+        assertEquals(1, responses.size());
+        assertTrue(responses.get(0).isSuccess());
     }
 
     private static final class FakeSandbox implements Sandbox {
 
-        private final ExecResult execResult;
-        private String lastCommand;
-
-        private FakeSandbox(ExecResult execResult) {
-            this.execResult = execResult;
-        }
+        private String lastDownloadPath;
+        private byte[] downloadResult;
+        private Throwable downloadError;
+        private String lastUploadPath;
+        private byte[] lastUploadContent;
 
         @Override
         public void start() {}
@@ -115,8 +135,7 @@ class SandboxBackedFilesystemTest {
         @Override
         public ExecResult exec(
                 RuntimeContext runtimeContext, String command, Integer timeoutSeconds) {
-            this.lastCommand = command;
-            return execResult;
+            return new ExecResult(0, "", "", false);
         }
 
         @Override
@@ -126,5 +145,23 @@ class SandboxBackedFilesystemTest {
 
         @Override
         public void hydrateWorkspace(InputStream archive) {}
+
+        @Override
+        public void uploadFile(String path, byte[] content) {
+            this.lastUploadPath = path;
+            this.lastUploadContent = content;
+        }
+
+        @Override
+        public byte[] downloadFile(String path) throws Exception {
+            this.lastDownloadPath = path;
+            if (downloadError != null) {
+                if (downloadError instanceof Exception) {
+                    throw (Exception) downloadError;
+                }
+                throw new RuntimeException(downloadError);
+            }
+            return downloadResult != null ? downloadResult : new byte[0];
+        }
     }
 }

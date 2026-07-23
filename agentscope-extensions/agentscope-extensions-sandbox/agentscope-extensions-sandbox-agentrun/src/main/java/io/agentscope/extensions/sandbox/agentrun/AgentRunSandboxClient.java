@@ -26,8 +26,6 @@ import io.agentscope.harness.agent.sandbox.snapshot.SandboxSnapshotSpec;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -44,20 +42,6 @@ public class AgentRunSandboxClient implements SandboxClient<AgentRunSandboxClien
 
     private final ObjectMapper objectMapper;
     private final AgentRunSandboxClientOptions defaultOptions;
-
-    /**
-     * Per-sandboxId MCP channel cache. An AgentRun MCP session is bound to a sandbox instance
-     * (identified by sandboxId, derived deterministically from sessionId). Reusing the same
-     * channel across acquire/release cycles keeps the underlying MCP session alive, avoiding the
-     * "Session not found" failures seen when each cycle builds a fresh channel and re-initializes
-     * against an already-running sandbox instance.
-     *
-     * <p>The channel connects to a template-level MCP endpoint (not sandbox-specific), so it is
-     * safe to reuse per sandboxId — the server routes requests to the correct sandbox via the
-     * session. Entries are removed in {@link #delete(Sandbox)} when the sandbox is destroyed.
-     */
-    private final ConcurrentMap<String, AgentRunMcpChannel> channelCache =
-            new ConcurrentHashMap<>();
 
     public AgentRunSandboxClient() {
         this(new AgentRunSandboxClientOptions(), null);
@@ -106,7 +90,6 @@ public class AgentRunSandboxClient implements SandboxClient<AgentRunSandboxClien
         state.setTemplateName(merged.getTemplateName());
         state.setAccountId(merged.getAccountId());
         state.setRegion(merged.getRegion());
-        state.setMcpServerUrl(merged.getMcpServerUrl());
         state.setSandboxId(sandboxId);
         state.setSandboxOwned(true);
         state.setWorkspaceRootReady(false);
@@ -142,8 +125,8 @@ public class AgentRunSandboxClient implements SandboxClient<AgentRunSandboxClien
                 merge(null).getWorkspaceRoot());
         // Refresh runtime configuration from current options. The persisted state may carry
         // stale values (e.g. workspaceRoot changed from /home/agentscope/workspace to
-        // /home/user/workspace, or mcpServerUrl updated). These are operator settings, not
-        // per-sandbox facts, so the live options always win.
+        // /home/user/workspace). These are operator settings, not per-sandbox facts, so the live
+        // options always win.
         AgentRunSandboxClientOptions merged = merge(null);
         String oldRoot = ar.getWorkspaceRoot();
         String newRoot = merged.getWorkspaceRoot();
@@ -151,7 +134,6 @@ public class AgentRunSandboxClient implements SandboxClient<AgentRunSandboxClien
         ar.setTemplateName(merged.getTemplateName());
         ar.setAccountId(merged.getAccountId());
         ar.setRegion(merged.getRegion());
-        ar.setMcpServerUrl(merged.getMcpServerUrl());
         // workspaceOnNas depends on mount config + workspaceRoot, both possibly changed.
         ar.setWorkspaceOnNas(isWorkspaceUnderMounts(merged));
         // Only invalidate the root-ready flag (and projection hash) when workspaceRoot actually
@@ -172,28 +154,10 @@ public class AgentRunSandboxClient implements SandboxClient<AgentRunSandboxClien
         if (sandbox == null) {
             return;
         }
-        // Drop the cached MCP channel for this sandboxId and close it, so the MCP session is
-        // torn down together with the sandbox instance rather than lingering/leaking.
-        String sandboxId = null;
-        if (sandbox.getState() instanceof AgentRunSandboxState ars) {
-            sandboxId = ars.getSandboxId();
-        }
-        if (sandboxId != null && !sandboxId.isBlank()) {
-            AgentRunMcpChannel cached = channelCache.remove(sandboxId);
-            if (cached != null) {
-                try {
-                    cached.close();
-                } catch (Exception e) {
-                    log.warn(
-                            "[sandbox-agentrun] delete: cached channel close failed: {}",
-                            e.getMessage());
-                }
-            }
-        }
-        // Destroy the remote sandbox instance. This is the only place an HTTP delete is issued —
-        // AgentRunSandbox#shutdown() is a no-op so the instance survives across acquire/release
-        // cycles (reclaimed by AgentRun idle timeout), and the explicit delete is reserved for
-        // real teardown.
+        // Destroy the remote sandbox instance via HTTP delete. This is the only place an HTTP
+        // delete is issued — AgentRunSandbox#shutdown() is a no-op so the instance survives across
+        // acquire/release cycles (reclaimed by AgentRun idle timeout), and the explicit delete is
+        // reserved for real teardown.
         if (sandbox instanceof AgentRunSandbox ars) {
             try {
                 ars.destroyInstance();
@@ -230,16 +194,7 @@ public class AgentRunSandboxClient implements SandboxClient<AgentRunSandboxClien
 
     private Sandbox build(AgentRunSandboxState state, AgentRunSandboxClientOptions merged) {
         AgentRunDataPlaneHttp http = new AgentRunDataPlaneHttp(merged);
-        // Reuse the MCP channel for this sandboxId so the MCP session survives across
-        // acquire/release cycles. connect() is idempotent (no-op when already connected), so a
-        // resumed sandbox picks up the live session instead of re-initializing a fresh one.
-        String sandboxId = state.getSandboxId();
-        AgentRunMcpChannel mcp =
-                (sandboxId != null && !sandboxId.isBlank())
-                        ? channelCache.computeIfAbsent(
-                                sandboxId, k -> new AgentRunMcpChannel(merged))
-                        : new AgentRunMcpChannel(merged);
-        return new AgentRunSandbox(state, merged, http, mcp);
+        return new AgentRunSandbox(state, merged, http);
     }
 
     private static boolean isWorkspaceUnderMounts(AgentRunSandboxClientOptions opt) {
@@ -284,12 +239,6 @@ public class AgentRunSandboxClient implements SandboxClient<AgentRunSandboxClien
         if (call.getTemplateName() != null) {
             o.setTemplateName(call.getTemplateName());
         }
-        if (call.getMcpServerUrl() != null) {
-            o.setMcpServerUrl(call.getMcpServerUrl());
-        }
-        if (call.getMcpEndpoint() != null) {
-            o.setMcpEndpoint(call.getMcpEndpoint());
-        }
         if (call.getNasConfig() != null) {
             o.setNasConfig(call.getNasConfig());
         }
@@ -316,8 +265,6 @@ public class AgentRunSandboxClient implements SandboxClient<AgentRunSandboxClien
         o.setRegion(src.getRegion());
         o.setDataPlaneBaseUrl(src.getDataPlaneBaseUrl());
         o.setTemplateName(src.getTemplateName());
-        o.setMcpServerUrl(src.getMcpServerUrl());
-        o.setMcpEndpoint(src.getMcpEndpoint());
         o.setSandboxIdleTimeoutSeconds(src.getSandboxIdleTimeoutSeconds());
         o.setNasConfig(src.getNasConfig());
         o.setOssMountConfigs(src.getOssMountConfigs());
