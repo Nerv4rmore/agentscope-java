@@ -46,7 +46,14 @@ public class ShellExecuteTool {
                     "Execute a shell command. Use for git, npm, build, test, and other terminal"
                         + " operations. Returns combined output and exit code. If a dedicated tool"
                         + " exists (e.g., read_file, write_file), you MUST use it instead of shell"
-                        + " commands.")
+                        + " commands. IMPORTANT: Commands have a HARD 30-second timeout enforced by"
+                        + " the sandbox gateway — any command exceeding 30s will be killed and"
+                        + " return a timeout error. For long-running commands (e.g., pip install,"
+                        + " npm install, large builds, long-running tests), use background"
+                        + " execution: append ' & echo $!' to start the process in the background,"
+                        + " then use 'wait $PID' or check output files to retrieve results."
+                        + " Alternatively, redirect output to a file (e.g., 'cmd > /tmp/out.log"
+                        + " 2>&1 &') and read it afterwards.")
     public String execute(
             RuntimeContext runtimeContext,
             @ToolParam(name = "command", description = "Shell command to execute") String command,
@@ -58,7 +65,9 @@ public class ShellExecuteTool {
                     String workingDirectory,
             @ToolParam(
                             name = "timeout",
-                            description = "Timeout in seconds (default: 30)",
+                            description =
+                                    "Timeout in seconds (default: 30, max: 30 — the sandbox gateway"
+                                            + " enforces a hard 30s limit)",
                             required = false)
                     Integer timeout) {
         String effectiveCommand = command;
