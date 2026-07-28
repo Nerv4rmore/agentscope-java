@@ -25,6 +25,7 @@ import io.agentscope.harness.agent.sandbox.SandboxAcquireResult;
 import io.agentscope.harness.agent.sandbox.SandboxAware;
 import io.agentscope.harness.agent.sandbox.SandboxContext;
 import io.agentscope.harness.agent.sandbox.SandboxException;
+import io.agentscope.harness.agent.sandbox.SandboxFileTransfer;
 import io.agentscope.harness.agent.sandbox.SandboxManager;
 import java.util.ArrayList;
 import java.util.List;
@@ -171,6 +172,18 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
             String path = file.getKey();
             byte[] content = file.getValue();
 
+            if (active instanceof SandboxFileTransfer transfer
+                    && transfer.supportsFileTransfer(path)) {
+                try {
+                    transfer.uploadFile(path, content);
+                    results.add(FileUploadResponse.success(path));
+                } catch (Exception e) {
+                    log.warn("[sandbox-fs] native upload failed for path: {}", path, e);
+                    results.add(FileUploadResponse.fail(path, e.getMessage()));
+                }
+                continue;
+            }
+
             try {
                 active.uploadFile(path, content);
                 results.add(FileUploadResponse.success(path));
@@ -197,6 +210,17 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
         List<FileDownloadResponse> results = new ArrayList<>(paths.size());
 
         for (String path : paths) {
+            if (active instanceof SandboxFileTransfer transfer
+                    && transfer.supportsFileTransfer(path)) {
+                try {
+                    results.add(FileDownloadResponse.success(path, transfer.downloadFile(path)));
+                } catch (Exception e) {
+                    log.warn("[sandbox-fs] native download failed for path: {}", path, e);
+                    results.add(FileDownloadResponse.fail(path, e.getMessage()));
+                }
+                continue;
+            }
+
             try {
                 byte[] bytes = active.downloadFile(path);
                 results.add(FileDownloadResponse.success(path, bytes));
