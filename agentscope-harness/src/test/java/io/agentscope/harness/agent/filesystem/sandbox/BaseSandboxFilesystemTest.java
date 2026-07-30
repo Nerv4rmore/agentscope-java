@@ -20,6 +20,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.agentscope.core.agent.RuntimeContext;
+import io.agentscope.harness.agent.filesystem.model.EditResult;
 import io.agentscope.harness.agent.filesystem.model.ExecuteResponse;
 import io.agentscope.harness.agent.filesystem.model.FileDownloadResponse;
 import io.agentscope.harness.agent.filesystem.model.FileInfo;
@@ -130,6 +131,53 @@ class BaseSandboxFilesystemTest {
             assertTrue(dir.isDirectory());
             assertFalse(dir.modifiedAt().isEmpty(), "dir modifiedAt should be populated");
         }
+
+        @Test
+        void edit_pythonScriptUsesRealNewlinesNotLiteralBackslashN() {
+            // Regression: the edit python script is passed to `python3 -c "..."` inside a
+            // double-quoted shell argument. Bash does NOT interpret \n inside double quotes,
+            // so a literal backslash-n ("\\n" in Java) would collapse the whole script onto
+            // one line and raise a Python SyntaxError. Each statement must end with a real
+            // newline. See the chat-session root-cause analysis for this bug.
+            FakeSandboxFilesystem filesystem = new FakeSandboxFilesystem();
+
+            filesystem.edit(RT, "/workspace/f.txt", "old", "new", false);
+
+            String cmd = filesystem.lastCommand;
+            // The python -c argument body must contain real newlines, not the 2-char "\n".
+            assertTrue(
+                    cmd.startsWith("python3 -c \"import sys, os, base64, json\n"),
+                    "python script must use real newlines between statements, not literal \\n");
+            assertFalse(
+                    cmd.contains("\\n"),
+                    "edit command must not contain literal backslash-n (\"\\\\n\") anywhere — "
+                            + "it would break python3 -c under double quotes");
+            // Sanity: the heredoc EOF marker is still wired up.
+            assertTrue(cmd.contains("<<'__EDIT_EOF__'"), "heredoc sentinel must be present");
+        }
+
+        @Test
+        void edit_parsesCountFromOkResponse() {
+            FakeSandboxFilesystem filesystem = new FakeSandboxFilesystem();
+            filesystem.editResponse = new ExecuteResponse("{\"count\": 1}", 0, false);
+
+            EditResult result = filesystem.edit(RT, "/workspace/f.txt", "old", "new", false);
+
+            assertTrue(result.isSuccess());
+            assertEquals(1, result.occurrences());
+        }
+
+        @Test
+        void edit_mapsStringNotFoundToFailMessage() {
+            FakeSandboxFilesystem filesystem = new FakeSandboxFilesystem();
+            filesystem.editResponse =
+                    new ExecuteResponse("{\"error\": 'string_not_found'}", 0, false);
+
+            EditResult result = filesystem.edit(RT, "/workspace/f.txt", "old", "new", false);
+
+            assertFalse(result.isSuccess());
+            assertTrue(result.error().contains("String not found"));
+        }
     }
 
     // ================================================================
@@ -216,6 +264,9 @@ class BaseSandboxFilesystemTest {
 
         String lastCommand;
 
+        /** When non-null, returned for any `python3` command (used by edit tests). */
+        ExecuteResponse editResponse;
+
         @Override
         public String id() {
             return "fake";
@@ -225,6 +276,9 @@ class BaseSandboxFilesystemTest {
         public ExecuteResponse execute(
                 RuntimeContext runtimeContext, String command, Integer timeoutSeconds) {
             lastCommand = command;
+            if (command.startsWith("python3 -c ") && editResponse != null) {
+                return editResponse;
+            }
             if (command.startsWith("for f in ") && command.contains("stat -c")) {
                 return new ExecuteResponse(
                         "DIR:/workspace/docs\t1719300000\n"
