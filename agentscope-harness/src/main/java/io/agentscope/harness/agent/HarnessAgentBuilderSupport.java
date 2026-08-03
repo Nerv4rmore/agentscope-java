@@ -35,6 +35,7 @@ import io.agentscope.harness.agent.filesystem.spec.LocalFilesystemSpec;
 import io.agentscope.harness.agent.memory.compaction.CompactionConfig;
 import io.agentscope.harness.agent.memory.compaction.ToolResultEvictionConfig;
 import io.agentscope.harness.agent.middleware.DynamicSubagentsMiddleware;
+import io.agentscope.harness.agent.middleware.HarnessRuntimeMiddleware;
 import io.agentscope.harness.agent.middleware.SubagentEntry;
 import io.agentscope.harness.agent.middleware.SubagentsMiddleware;
 import io.agentscope.harness.agent.subagent.AgentSpecLoader;
@@ -380,7 +381,17 @@ final class HarnessAgentBuilderSupport {
         final Model capturedModel = b.model;
         final Toolkit capturedParentToolkit = b.toolkit != null ? b.toolkit.copy() : new Toolkit();
         final Function<String, Model> capturedResolver = b.modelResolver;
-        final List<MiddlewareBase> capturedMiddlewares = List.copyOf(b.middlewares);
+        // 过滤掉 HarnessRuntimeMiddleware 实例（如 SandboxLifecycleMiddleware）——
+        // 子 Agent 共享父 Agent 的沙箱代理（SandboxBackedFilesystem），但不应获得自己的
+        // SandboxLifecycleMiddleware，否则子 Agent 的 releaseForCall 会 setSandbox(null)
+        // 清空父 Agent 仍在使用的沙箱。父 Agent 的 acquireForCall 已绑定生命周期依赖，
+        // 子 Agent 直接复用已注入的 sandbox 即可。
+        final List<MiddlewareBase> capturedMiddlewares = new ArrayList<>();
+        for (MiddlewareBase mw : b.middlewares) {
+            if (mw != null && !(mw instanceof HarnessRuntimeMiddleware)) {
+                capturedMiddlewares.add(mw);
+            }
+        }
         final AbstractFilesystem capturedSharedBackend =
                 sandboxFs != null ? sandboxFs : b.abstractFilesystem;
         final boolean capturedUseLegacyXmlWorkspaceContext = b.useLegacyXmlWorkspaceContext;
