@@ -17,6 +17,7 @@ package io.agentscope.harness.agent;
 
 import io.agentscope.core.agent.Agent;
 import io.agentscope.core.agent.RuntimeContext;
+import io.agentscope.harness.agent.tool.AgentSpawnTool;
 import io.agentscope.core.hook.Hook;
 import io.agentscope.core.middleware.MiddlewareBase;
 import io.agentscope.core.model.ExecutionConfig;
@@ -453,10 +454,18 @@ final class HarnessAgentBuilderSupport {
                                             capturedParentToolkit, decl.getTools()))
                             .workspace(runtimeWorkspace)
                             .defaultSessionId(childSessionId)
-                            .maxIters(decl.getSteps())
-                            .asLeafSubagent()
-                            .useLegacyXmlWorkspaceContext(capturedUseLegacyXmlWorkspaceContext)
-                            .sysPrompt(buildSubagentSysPrompt(sysPromptBase));
+                            .maxIters(decl.getSteps());
+
+            // Conditionally mark as leaf: subagents with can_spawn=true AND spawn
+            // depth below the max can spawn their own sub-subagents. All others
+            // (can_spawn=false or depth-capped) are leaves — no agent_spawn tool.
+            if (!decl.canSpawn()
+                    || readSpawnDepth(parentRc) >= AgentSpawnTool.MAX_SPAWN_DEPTH - 1) {
+                sub.asLeafSubagent();
+            }
+
+            sub.useLegacyXmlWorkspaceContext(capturedUseLegacyXmlWorkspaceContext)
+                    .sysPrompt(buildSubagentSysPrompt(sysPromptBase));
 
             // Overlay declaration-specified temperature/topP on top of the parent's
             // GenerateOptions.
@@ -510,6 +519,18 @@ final class HarnessAgentBuilderSupport {
             sub.middlewares(capturedMiddlewares);
             return sub.build();
         };
+    }
+
+    /**
+     * Reads the spawn depth from the parent's {@link RuntimeContext}, stored there by
+     * {@link AgentSpawnTool#agentSpawn}. Returns 0 if absent (top-level agent).
+     */
+    private static int readSpawnDepth(RuntimeContext parentRc) {
+        if (parentRc == null) {
+            return 0;
+        }
+        Integer depth = parentRc.get(AgentSpawnTool.CTX_SPAWN_DEPTH, Integer.class);
+        return depth != null ? depth : 0;
     }
 
     /**

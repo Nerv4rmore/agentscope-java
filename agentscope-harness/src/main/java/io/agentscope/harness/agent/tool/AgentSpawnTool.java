@@ -92,7 +92,8 @@ public class AgentSpawnTool {
 
     private static final int DEFAULT_TIMEOUT_SECONDS = 30;
     private static final int MAX_TIMEOUT_SECONDS = 600;
-    private static final int MAX_SPAWN_DEPTH = 3;
+    /** Maximum allowed spawn depth (main=0, sub=1, sub-sub=2, max=3). */
+    public static final int MAX_SPAWN_DEPTH = 3;
 
     /**
      * {@link RuntimeContext} string key for a per-call override of subagent user-exposure. Put a
@@ -120,6 +121,16 @@ public class AgentSpawnTool {
      * manager here so concurrent callers never overwrite each other's declarations.
      */
     public static final String CTX_AGENT_MANAGER = "agentscope.subagent.agent_manager";
+
+    /**
+     * {@link RuntimeContext} string key for the spawn depth of the current agent. The top-level
+     * agent has depth 0; each {@code agent_spawn} increments by 1. Stored in the context by
+     * {@link AgentSpawnTool#agentSpawn} so that {@link
+     * io.agentscope.harness.agent.HarnessAgentBuilderSupport#buildDeclaredFactory} can read it
+     * to decide whether the child should be a leaf subagent (no nested spawning) or a non-leaf
+     * (can spawn its own sub-subagents).
+     */
+    public static final String CTX_SPAWN_DEPTH = "agentscope.subagent.spawn_depth";
 
     private static final String BG_RESULT_TEMPLATE =
             """
@@ -242,10 +253,22 @@ public class AgentSpawnTool {
                 agentId,
                 timeoutSeconds,
                 task);
-        int nextDepth = parentSpawnDepth + 1;
+        // Read spawn depth from RuntimeContext (set by parent's agent_spawn call).
+        // Falls back to the constructor field for the top-level agent (depth 0).
+        Integer ctxDepth =
+                runtimeContext != null
+                        ? runtimeContext.get(CTX_SPAWN_DEPTH, Integer.class)
+                        : null;
+        int currentDepth = ctxDepth != null ? ctxDepth : parentSpawnDepth;
+        int nextDepth = currentDepth + 1;
         if (nextDepth > MAX_SPAWN_DEPTH) {
             log.warn("agent_spawn depth exceeded: depth={}, max={}", nextDepth, MAX_SPAWN_DEPTH);
             return Mono.just("Error: Maximum spawn depth exceeded (max=" + MAX_SPAWN_DEPTH + ")");
+        }
+        // Propagate child depth to RuntimeContext so the factory closure can read it
+        // and conditionally skip asLeafSubagent() for can_spawn declarations.
+        if (runtimeContext != null) {
+            runtimeContext.put(CTX_SPAWN_DEPTH, nextDepth);
         }
         String canonLabel = label != null && !label.isBlank() ? label.trim() : null;
         DefaultAgentManager manager = managerFor(runtimeContext);
@@ -526,6 +549,10 @@ public class AgentSpawnTool {
                         new TaskRunSpec.LocalTaskRunSpec(
                                 () -> {
                                     try {
+                                        if (runtimeContext != null) {
+                                            runtimeContext.put(
+                                                    CTX_SPAWN_DEPTH, spawned.depth());
+                                        }
                                         Msg reply =
                                                 manager.invokeAgent(
                                                                 spawned.agent(),
@@ -1171,6 +1198,10 @@ public class AgentSpawnTool {
                         new TaskRunSpec.LocalTaskRunSpec(
                                 () -> {
                                     try {
+                                        if (runtimeContext != null) {
+                                            runtimeContext.put(
+                                                    CTX_SPAWN_DEPTH, spawned.depth());
+                                        }
                                         Msg reply =
                                                 manager.invokeAgent(
                                                                 spawned.agent(),

@@ -92,6 +92,8 @@ public final class SubagentDeclaration {
     private final boolean hidden;
     private final boolean persistSession;
     private final boolean inheritParentPermissions;
+    /** Whether this subagent can spawn its own sub-subagents (requires non-leaf build). */
+    private final boolean canSpawn;
     private final Boolean exposeToUser;
     private final List<String> tools;
     private final List<String> skills;
@@ -116,6 +118,7 @@ public final class SubagentDeclaration {
         this.hidden = b.hidden;
         this.persistSession = b.persistSession;
         this.inheritParentPermissions = b.inheritParentPermissions;
+        this.canSpawn = b.canSpawn;
         this.exposeToUser = b.exposeToUser;
         this.tools = b.tools != null ? List.copyOf(b.tools) : List.of();
         this.skills = b.skills != null ? List.copyOf(b.skills) : List.of();
@@ -249,6 +252,18 @@ public final class SubagentDeclaration {
     }
 
     /**
+     * Whether this subagent declaration permits spawning sub-subagents. When {@code true}
+     * and the spawn depth is below {@link
+     * io.agentscope.harness.agent.tool.AgentSpawnTool#MAX_SPAWN_DEPTH}, the factory skips
+     * {@code asLeafSubagent()} so the child receives its own {@code agent_spawn} tool.
+     * Default is {@code false} — only declarations with {@code can_spawn: true} in their
+     * frontmatter opt in.
+     */
+    public boolean canSpawn() {
+        return canSpawn;
+    }
+
+    /**
      * Per-type policy for exposing spawned instances of this subagent as user-addressable threads.
      *
      * <p>Tri-state:
@@ -325,6 +340,7 @@ public final class SubagentDeclaration {
         private boolean hidden = false;
         private boolean persistSession = false;
         private boolean inheritParentPermissions = true;
+        private boolean canSpawn = false;
         private Boolean exposeToUser;
         private List<String> tools;
         private List<String> skills;
@@ -472,6 +488,17 @@ public final class SubagentDeclaration {
          */
         public Builder inheritParentPermissions(boolean inheritParentPermissions) {
             this.inheritParentPermissions = inheritParentPermissions;
+            return this;
+        }
+
+        /**
+         * Whether this subagent can spawn its own sub-subagents. Default {@code false}.
+         * Set to {@code true} for subagents that need to fan out parallel work (e.g.
+         * slide-designer spawns image-scout). The factory still enforces
+         * {@link io.agentscope.harness.agent.tool.AgentSpawnTool#MAX_SPAWN_DEPTH}.
+         */
+        public Builder canSpawn(boolean canSpawn) {
+            this.canSpawn = canSpawn;
             return this;
         }
 

@@ -307,6 +307,7 @@ public final class AgentSpecLoader {
 
         SubagentDeclaration.Mode declMode = parseDeclarationMode(asString(fm.get("mode")), name);
         boolean hidden = asBoolean(fm.get("hidden"), false);
+        boolean canSpawn = asBoolean(fm.get("can_spawn"), false);
         Boolean exposeToUser = asNullableBoolean(fm.get("expose_to_user"));
         if (exposeToUser == null) {
             exposeToUser = asNullableBoolean(fm.get("exposeToUser"));
@@ -327,6 +328,7 @@ public final class AgentSpecLoader {
                         .variant(variant)
                         .mode(declMode)
                         .hidden(hidden)
+                        .canSpawn(canSpawn)
                         .exposeToUser(exposeToUser)
                         .tools(tools.isEmpty() ? null : tools)
                         .skills(skills.isEmpty() ? null : skills);
