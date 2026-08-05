@@ -67,6 +67,79 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
     // 本次调用懒创建产生的 AcquireResult；未创建沙箱时为 null。release 时消费。
     private volatile SandboxAcquireResult lazyAcquireResult;
 
+    /** Coordinates parent cleanup with detached shared child work. */
+    private final Object lifecycleLock = new Object();
+
+    private int retainedAsyncCalls;
+    private boolean releaseRequested;
+    private boolean releaseCompleted;
+    private Runnable pendingRelease;
+
+    /** A counted reference that keeps this filesystem alive until detached work finishes. */
+    public final class SharedLease implements AutoCloseable {
+        private boolean closed;
+
+        private SharedLease() {}
+
+        @Override
+        public void close() {
+            Runnable releaseAction;
+            synchronized (lifecycleLock) {
+                if (closed) {
+                    return;
+                }
+                closed = true;
+                retainedAsyncCalls--;
+                releaseAction = takePendingReleaseIfReady();
+            }
+            runReleaseAction(releaseAction);
+        }
+    }
+
+    /** Retains this filesystem while a detached local child can outlive its parent call. */
+    public SharedLease retainForAsync() {
+        synchronized (lifecycleLock) {
+            if (releaseCompleted) {
+                throw new IllegalStateException(
+                        "Sandbox filesystem call has already been released");
+            }
+            retainedAsyncCalls++;
+            log.debug("[sandbox-diag] shared retain: refs={}", retainedAsyncCalls);
+            return new SharedLease();
+        }
+    }
+
+    /** Requests parent cleanup, deferring it while detached child references remain. */
+    public void requestRelease(Runnable releaseAction) {
+        Runnable ready;
+        synchronized (lifecycleLock) {
+            if (releaseRequested) {
+                return;
+            }
+            releaseRequested = true;
+            pendingRelease = releaseAction;
+            ready = takePendingReleaseIfReady();
+            log.info("[sandbox-diag] shared release requested: refs={}", retainedAsyncCalls);
+        }
+        runReleaseAction(ready);
+    }
+
+    private Runnable takePendingReleaseIfReady() {
+        if (!releaseRequested || retainedAsyncCalls != 0 || releaseCompleted) {
+            return null;
+        }
+        releaseCompleted = true;
+        Runnable action = pendingRelease;
+        pendingRelease = null;
+        return action;
+    }
+
+    private void runReleaseAction(Runnable action) {
+        if (action != null) {
+            action.run();
+        }
+    }
+
     // 连续“不健康” execute 失败计数（exitCode=-1 且无任何输出）。达到阈值后熔断：
     // 不再透传裸退出码，而是返回明确的止损文本，避免模型把沙箱已死误判为
     // “命令写错”而无限重试探测命令（sess-dec89eb5 事故：echo/ls/pwd 重试 11 轮）。
@@ -103,6 +176,17 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
      * @param sandboxContext 当前调用的沙箱配置（从 RuntimeContext 取出）
      */
     public void bindLifecycle(SandboxManager sandboxManager, SandboxContext sandboxContext) {
+        synchronized (lifecycleLock) {
+            if (releaseCompleted) {
+                releaseRequested = false;
+                releaseCompleted = false;
+                pendingRelease = null;
+            } else if (releaseRequested) {
+                throw new IllegalStateException(
+                        "Cannot bind a new sandbox call while detached shared work is still"
+                                + " active");
+            }
+        }
         this.sandboxManager = sandboxManager;
         this.sandboxContext = sandboxContext;
         this.lazyAcquireResult = null;

@@ -84,6 +84,10 @@ public final class SubagentDeclaration {
     private final Path workspacePath;
     private final String inlineAgentsBody;
     private final String model;
+
+    /** Optional model-tier override (e.g. "default", "fast", "pro"). */
+    private final String modelTier;
+
     private final Double temperature;
     private final Double topP;
     private final String variant;
@@ -92,11 +96,27 @@ public final class SubagentDeclaration {
     private final boolean hidden;
     private final boolean persistSession;
     private final boolean inheritParentPermissions;
+
     /** Whether this subagent can spawn its own sub-subagents (requires non-leaf build). */
     private final boolean canSpawn;
+
     private final Boolean exposeToUser;
     private final List<String> tools;
     private final List<String> skills;
+
+    /**
+     * Skill-gated tool groups to force-activate on this subagent's inherited toolkit at spawn time.
+     *
+     * <p>Solves a visibility gap: a subagent's toolkit is a copy of a snapshot taken at parent
+     * BUILD time, when every skill-gated group is still inactive. Since only ACTIVE tools reach the
+     * model's schema list, a gated tool (e.g. {@code search_images} in the {@code jina-tools} group)
+     * is invisible to the subagent unless it calls {@code load_skill_through_path} itself. Listing
+     * the group here activates it directly, without the subagent spending a turn loading the skill.
+     *
+     * <p>Note this is orthogonal to {@link #tools()}: the {@code tools} allowlist can only REMOVE
+     * inherited tools, it can never activate an inactive group.
+     */
+    private final List<String> activateToolGroups;
 
     /** Base URL of the remote task server (e.g. {@code http://host:8080}). */
     private final String url;
@@ -110,6 +130,7 @@ public final class SubagentDeclaration {
         this.workspacePath = b.workspacePath;
         this.inlineAgentsBody = b.inlineAgentsBody;
         this.model = b.model;
+        this.modelTier = b.modelTier;
         this.temperature = b.temperature;
         this.topP = b.topP;
         this.variant = b.variant;
@@ -122,6 +143,8 @@ public final class SubagentDeclaration {
         this.exposeToUser = b.exposeToUser;
         this.tools = b.tools != null ? List.copyOf(b.tools) : List.of();
         this.skills = b.skills != null ? List.copyOf(b.skills) : List.of();
+        this.activateToolGroups =
+                b.activateToolGroups != null ? List.copyOf(b.activateToolGroups) : List.of();
         this.url = b.url;
         this.headers = b.headers != null && !b.headers.isEmpty() ? Map.copyOf(b.headers) : null;
     }
@@ -172,6 +195,20 @@ public final class SubagentDeclaration {
      */
     public String getModel() {
         return model;
+    }
+
+    /**
+     * Optional model-tier override (e.g. {@code "default"}, {@code "fast"}, {@code "pro"}).
+     *
+     * <p>When non-blank, the spawned subagent uses this tier instead of the parent's. The value
+     * {@code "default"} is a sentinel that tells {@code ModelTierMiddleware} to skip the tier
+     * override and use the agent's built-in fallback model (e.g. qwen3.7-flash). Other values
+     * ({@code "fast"}, {@code "pro"}, {@code "ultra"}) are resolved through the tier system.
+     *
+     * <p>When {@code null} or blank, the parent's tier is inherited unchanged.
+     */
+    public String getModelTier() {
+        return modelTier;
     }
 
     /**
@@ -295,6 +332,17 @@ public final class SubagentDeclaration {
         return skills;
     }
 
+    /**
+     * Skill-gated tool groups to force-activate on this subagent's toolkit at spawn time. Empty
+     * (the default) means no forced activation — the subagent sees only ungrouped tools plus any
+     * group it activates itself via {@code load_skill_through_path}.
+     *
+     * @see #activateToolGroups
+     */
+    public List<String> getActivateToolGroups() {
+        return activateToolGroups;
+    }
+
     /** Returns {@code true} when this declaration targets a remote task HTTP server. */
     public boolean isRemote() {
         return url != null && !url.isBlank();
@@ -332,6 +380,7 @@ public final class SubagentDeclaration {
         private Path workspacePath;
         private String inlineAgentsBody;
         private String model;
+        private String modelTier;
         private Double temperature;
         private Double topP;
         private String variant;
@@ -344,6 +393,7 @@ public final class SubagentDeclaration {
         private Boolean exposeToUser;
         private List<String> tools;
         private List<String> skills;
+        private List<String> activateToolGroups;
         private String url;
         private Map<String, String> headers;
 
@@ -407,6 +457,17 @@ public final class SubagentDeclaration {
          */
         public Builder model(String model) {
             this.model = model;
+            return this;
+        }
+
+        /**
+         * Optional model-tier override (e.g. {@code "default"}, {@code "fast"}, {@code "pro"}).
+         * When set, the spawned subagent uses this tier instead of the parent's.
+         * {@code "default"} = use the agent's built-in fallback model (qwen3.7-flash).
+         * Blank/null = inherit parent tier.
+         */
+        public Builder modelTier(String modelTier) {
+            this.modelTier = modelTier;
             return this;
         }
 
@@ -525,6 +586,15 @@ public final class SubagentDeclaration {
 
         public Builder skills(List<String> skills) {
             this.skills = skills;
+            return this;
+        }
+
+        /**
+         * Skill-gated tool groups to force-activate on the subagent's toolkit at spawn time, so a
+         * gated tool is visible without the subagent calling {@code load_skill_through_path}.
+         */
+        public Builder activateToolGroups(List<String> activateToolGroups) {
+            this.activateToolGroups = activateToolGroups;
             return this;
         }
 

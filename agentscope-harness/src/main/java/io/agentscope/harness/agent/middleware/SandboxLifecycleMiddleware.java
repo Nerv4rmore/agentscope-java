@@ -184,6 +184,10 @@ public class SandboxLifecycleMiddleware implements HarnessRuntimeMiddleware {
      * @param ctx the per-call RuntimeContext (captured at acquire time)
      */
     public void releaseForCall(RuntimeContext ctx) {
+        filesystemProxy.requestRelease(() -> releaseNow(ctx));
+    }
+
+    private void releaseNow(RuntimeContext ctx) {
         // 诊断：每次 agent 调用结束的 release 边界，记录 sessionId/userId，
         // 用于核对同一 SSE 流内 acquire/release 的次数与是否中途 release 清空 sandbox
         log.info(

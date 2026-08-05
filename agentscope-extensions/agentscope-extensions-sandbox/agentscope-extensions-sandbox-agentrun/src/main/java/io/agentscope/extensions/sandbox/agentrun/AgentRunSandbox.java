@@ -200,6 +200,7 @@ public class AgentRunSandbox extends AbstractBaseSandbox {
             }
         }
         throw new SandboxException.SandboxRuntimeException(
+                SandboxErrorCode.EXEC_TIMEOUT,
                 "Sandbox exec channel unhealthy after "
                         + CREATE_MAX_ATTEMPTS
                         + " recreate attempts: "
@@ -228,8 +229,7 @@ public class AgentRunSandbox extends AbstractBaseSandbox {
         try {
             ExecResult r = http.exec(arState.getSandboxId(), PROBE_COMMAND, null, 10);
             String out =
-                    (r.stdout() != null ? r.stdout() : "")
-                            + (r.stderr() != null ? r.stderr() : "");
+                    (r.stdout() != null ? r.stdout() : "") + (r.stderr() != null ? r.stderr() : "");
             if (r.exitCode() == 0 && out.contains(PROBE_EXPECTED)) {
                 return null;
             }

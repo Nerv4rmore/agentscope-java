@@ -173,6 +173,49 @@ class AgentSpawnToolKeyTest {
         assertTrue(restored.contains("done"));
     }
 
+    @Test
+    void siblingSpawnsReceiveDepthOneWithoutMutatingParentContext() {
+        ReActAgent child =
+                ReActAgent.builder()
+                        .name("child")
+                        .sysPrompt("child")
+                        .model(replyingModel())
+                        .build();
+        java.util.List<Integer> observedDepths = new java.util.ArrayList<>();
+        DefaultAgentManager manager =
+                new DefaultAgentManager(
+                        List.of(
+                                new SubagentEntry(
+                                        "planner",
+                                        "planner",
+                                        rc -> {
+                                            observedDepths.add(
+                                                    rc.get(
+                                                            AgentSpawnTool.CTX_SPAWN_DEPTH,
+                                                            Integer.class));
+                                            return child;
+                                        }),
+                                new SubagentEntry(
+                                        "designer",
+                                        "designer",
+                                        rc -> {
+                                            observedDepths.add(
+                                                    rc.get(
+                                                            AgentSpawnTool.CTX_SPAWN_DEPTH,
+                                                            Integer.class));
+                                            return child;
+                                        })),
+                        null);
+        AgentSpawnTool tool = new AgentSpawnTool(manager, new NoopTaskRepository(), 0);
+        RuntimeContext parent = RuntimeContext.builder().sessionId("parent").build();
+
+        tool.agentSpawn(parent, null, "planner", null, null, 0, null).block();
+        tool.agentSpawn(parent, null, "designer", null, null, 0, null).block();
+
+        assertEquals(List.of(1, 1), observedDepths);
+        assertEquals(null, parent.get(AgentSpawnTool.CTX_SPAWN_DEPTH, Integer.class));
+    }
+
     private static Model replyingModel() {
         return new Model() {
             @Override

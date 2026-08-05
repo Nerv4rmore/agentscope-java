@@ -17,6 +17,7 @@ package io.agentscope.harness.agent.filesystem.sandbox;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.agentscope.core.agent.RuntimeContext;
@@ -165,6 +166,37 @@ class SandboxBackedFilesystemTest {
 
         assertTrue(!responses.get(0).isSuccess());
         assertEquals("transfer down", responses.get(0).error());
+    }
+
+    @Test
+    void sharedLease_defersReleaseUntilLastDetachedTaskCompletes() {
+        SandboxBackedFilesystem filesystem = new SandboxBackedFilesystem();
+        java.util.concurrent.atomic.AtomicInteger releases =
+                new java.util.concurrent.atomic.AtomicInteger();
+
+        SandboxBackedFilesystem.SharedLease first = filesystem.retainForAsync();
+        SandboxBackedFilesystem.SharedLease second = filesystem.retainForAsync();
+        filesystem.requestRelease(releases::incrementAndGet);
+
+        assertEquals(0, releases.get());
+        first.close();
+        assertEquals(0, releases.get());
+        second.close();
+        second.close();
+        assertEquals(1, releases.get());
+        assertThrows(IllegalStateException.class, filesystem::retainForAsync);
+    }
+
+    @Test
+    void sharedLease_withoutDetachedWork_releasesImmediately() {
+        SandboxBackedFilesystem filesystem = new SandboxBackedFilesystem();
+        java.util.concurrent.atomic.AtomicInteger releases =
+                new java.util.concurrent.atomic.AtomicInteger();
+
+        filesystem.requestRelease(releases::incrementAndGet);
+        filesystem.requestRelease(releases::incrementAndGet);
+
+        assertEquals(1, releases.get());
     }
 
     private static final class FakeTransferSandbox extends BaseFakeSandbox
