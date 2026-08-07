@@ -1704,6 +1704,26 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
             if (userProvidedResults) {
                 return;
             }
+            patchPendingToolCalls(pendingIds);
+        }
+
+        /**
+         * Patch orphaned tool calls with synthetic error results. Called during
+         * interruption handling before the recovery message is added to context,
+         * ensuring no function_call is left without a function_call_output.
+         */
+        void patchOrphanedPendingToolCalls() {
+            if (!enablePendingToolRecovery) {
+                return;
+            }
+            Set<String> pendingIds = getPendingToolUseIds();
+            if (pendingIds.isEmpty()) {
+                return;
+            }
+            patchPendingToolCalls(pendingIds);
+        }
+
+        private void patchPendingToolCalls(Set<String> pendingIds) {
             log.warn(
                     "Pending tool calls detected without results, auto-generating error results."
                             + " Pending IDs: {}",
@@ -1720,7 +1740,7 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                 ToolResultBlock errorResult =
                         buildErrorToolResult(
                                 toolCall.getId(),
-                                "[ERROR] Previous tool execution failed or was interrupted. Tool: "
+                                "Previous tool execution failed or was interrupted. Tool: "
                                         + toolCall.getName());
                 Msg toolResultMsg =
                         ToolResultMessageBuilder.buildToolResultMsg(
@@ -3595,6 +3615,9 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                         shutdownManager.saveOnInterruptObserved(requestId);
                         return Mono.error(new AgentShuttingDownException());
                     }
+                    // Patch orphaned tool calls before adding the recovery message,
+                    // so the last assistant message is still the one with pending tool calls.
+                    scope.patchOrphanedPendingToolCalls();
                     String recoveryText =
                             "I noticed that you have interrupted me. What can I do for you?";
                     Msg recoveryMsg =
