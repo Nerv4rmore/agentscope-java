@@ -31,7 +31,13 @@ import java.util.concurrent.ConcurrentMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-/** {@link SandboxClient} for Alibaba Cloud AgentRun. */
+/**
+ * {@link SandboxClient} for Alibaba Cloud AgentRun.
+ *
+ * @deprecated Use {@code E2bSandboxClient} from {@code agentscope-extensions-sandbox-ue2b}
+ *     or a direct E2B SDK implementation instead.
+ */
+@Deprecated
 public class AgentRunSandboxClient implements SandboxClient<AgentRunSandboxClientOptions> {
 
     private static final Logger log = LoggerFactory.getLogger(AgentRunSandboxClient.class);

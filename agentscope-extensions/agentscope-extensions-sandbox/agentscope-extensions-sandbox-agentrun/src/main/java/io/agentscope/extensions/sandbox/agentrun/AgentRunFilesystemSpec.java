@@ -22,7 +22,14 @@ import io.agentscope.harness.agent.sandbox.WorkspaceSpec;
 import io.agentscope.harness.agent.sandbox.snapshot.NoopSnapshotSpec;
 import io.agentscope.harness.agent.sandbox.snapshot.SandboxSnapshotSpec;
 
-/** {@link SandboxFilesystemSpec} for the Alibaba Cloud AgentRun store. */
+/**
+ * {@link SandboxFilesystemSpec} for the Alibaba Cloud AgentRun store.
+ *
+ * @deprecated Use {@code agentscope-extensions-sandbox-ue2b} (E2B Java SDK) instead.
+ *     The AgentRun MCP protocol sandbox is superseded by the E2B SDK direct-connection
+ *     approach which provides native Filesystem API, pause/resume, and lazy creation.
+ */
+@Deprecated
 public class AgentRunFilesystemSpec extends SandboxFilesystemSpec {
 
     private SandboxClient<?> client;

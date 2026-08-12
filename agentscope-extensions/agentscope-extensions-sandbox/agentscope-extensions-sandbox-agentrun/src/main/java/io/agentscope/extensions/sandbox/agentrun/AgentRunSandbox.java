@@ -40,7 +40,10 @@ import org.slf4j.LoggerFactory;
  * {@code createSandbox} 显式创建。这样只有一个沙箱实例（MCP 创建的），避免"控制面建一个 +
  * MCP 又建一个"的双沙箱问题。代价是沙箱实例不跨 JVM 重启复用（重启后 MCP 重新连接会创建新
  * 沙箱，workspace 走 Branch D 重新投射）。
+ *
+ * @deprecated Use {@code E2bSandbox} from a direct E2B SDK implementation instead.
  */
+@Deprecated
 public class AgentRunSandbox extends AbstractBaseSandbox {
 
     private static final Logger log = LoggerFactory.getLogger(AgentRunSandbox.class);
