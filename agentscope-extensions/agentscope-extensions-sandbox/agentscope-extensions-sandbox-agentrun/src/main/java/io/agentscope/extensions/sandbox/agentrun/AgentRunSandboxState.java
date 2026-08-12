@@ -17,7 +17,12 @@ package io.agentscope.extensions.sandbox.agentrun;
 
 import io.agentscope.harness.agent.sandbox.SandboxState;
 
-/** Serializable state for an AgentRun-backed sandbox. */
+/**
+ * Serializable state for an AgentRun-backed sandbox.
+ *
+ * @deprecated Use {@code E2bSandboxState} from a direct E2B SDK implementation instead.
+ */
+@Deprecated
 public class AgentRunSandboxState extends SandboxState {
 
     /** Default workspace root path inside an AgentRun sandbox container. */

@@ -1061,6 +1061,15 @@ public class HarnessAgent implements Agent, AutoCloseable {
         final Set<Hook> hooks = new LinkedHashSet<>();
         final List<MiddlewareBase> middlewares = new ArrayList<>();
 
+        /**
+         * Optional text appended to the system prompt AFTER all built-in harness middlewares
+         * (e.g. WorkspaceContextMiddleware, HarnessSkillMiddleware) have run. Registered as the
+         * very last onSystemPrompt middleware in {@code build()}, so it has the final say on the
+         * system prompt's trailing content - the position that most influences a model's output
+         * language. Use for hard constraints that must not be buried by later context injections.
+         */
+        String systemPromptSuffix;
+
         // ---- Harness orchestration fields ----
 
         String agentId;
@@ -1408,6 +1417,21 @@ public class HarnessAgent implements Agent, AutoCloseable {
                     middleware(middleware);
                 }
             }
+            return this;
+        }
+
+        /**
+         * Sets an optional suffix appended to the system prompt after ALL built-in harness
+         * middlewares have run. The suffix is registered as the very last onSystemPrompt
+         * middleware in {@code build()}, so it appears at the trailing end of the final system
+         * prompt - the position that most influences a model's output language and other
+         * hard-to-enforce behaviors. {@code null} or blank clears it.
+         *
+         * @param suffix the trailing text to append to the system prompt
+         * @return this builder
+         */
+        public Builder systemPromptSuffix(String suffix) {
+            this.systemPromptSuffix = suffix;
             return this;
         }
 
@@ -2580,6 +2604,26 @@ public class HarnessAgent implements Agent, AutoCloseable {
 
             // ---- Build inner ReActAgent ----
             inner.toolkit(agentToolkit);
+
+            // ---- System prompt suffix: registered LAST so it runs after all built-in
+            // middlewares (WorkspaceContextMiddleware, HarnessSkillMiddleware, etc.) and thus
+            // appends its text at the very END of the system prompt - the trailing position that
+            // most influences a model's output language. onSystemPrompt is a pipeline (transformer)
+            // pattern executed in registration order, so the last-registered middleware has the
+            // final say on the prompt's trailing content. ----
+            if (systemPromptSuffix != null && !systemPromptSuffix.isBlank()) {
+                final String suffix = systemPromptSuffix;
+                inner.middleware(new MiddlewareBase() {
+                    @Override
+                    public Mono<String> onSystemPrompt(
+                            Agent agent, RuntimeContext ctx, String currentPrompt) {
+                        String base = currentPrompt != null ? currentPrompt : "";
+                        String separator = base.isEmpty() || base.endsWith("\n") ? "" : "\n";
+                        return Mono.just(base + separator + suffix);
+                    }
+                });
+            }
+
             ReActAgent delegate = inner.build();
             selfRef.set(delegate);
 

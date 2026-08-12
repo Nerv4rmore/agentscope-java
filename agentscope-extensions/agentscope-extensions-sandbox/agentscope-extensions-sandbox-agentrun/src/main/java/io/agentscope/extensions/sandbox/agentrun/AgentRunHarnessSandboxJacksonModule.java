@@ -18,7 +18,12 @@ package io.agentscope.extensions.sandbox.agentrun;
 import com.fasterxml.jackson.databind.jsontype.NamedType;
 import com.fasterxml.jackson.databind.module.SimpleModule;
 
-/** Jackson module registering {@link AgentRunSandboxState} under the {@code agentrun} type id. */
+/**
+ * Jackson module registering {@link AgentRunSandboxState} under the {@code agentrun} type id.
+ *
+ * @deprecated Use {@code E2bHarnessSandboxJacksonModule} from a direct E2B SDK implementation instead.
+ */
+@Deprecated
 public final class AgentRunHarnessSandboxJacksonModule extends SimpleModule {
 
     public AgentRunHarnessSandboxJacksonModule() {

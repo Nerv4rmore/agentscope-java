@@ -22,7 +22,12 @@ import java.util.ArrayList;
 import java.util.List;
 import okhttp3.OkHttpClient;
 
-/** Options for {@link AgentRunSandboxClient}. */
+/**
+ * Options for {@link AgentRunSandboxClient}.
+ *
+ * @deprecated Use {@code E2bSandboxClientOptions} from a direct E2B SDK implementation instead.
+ */
+@Deprecated
 public class AgentRunSandboxClientOptions extends SandboxClientOptions {
 
     /** Maximum number of instance-level OSS mounts AgentRun accepts per sandbox. */
