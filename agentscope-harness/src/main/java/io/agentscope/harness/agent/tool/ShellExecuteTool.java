@@ -81,7 +81,7 @@ public class ShellExecuteTool {
                     commandWithWorkingDirectory(
                             wd,
                             command,
-                            false);
+                            System.getProperty("os.name").toLowerCase().contains("win"));
         }
 
         int timeoutSeconds = timeout != null && timeout > 0 ? timeout : 30;
