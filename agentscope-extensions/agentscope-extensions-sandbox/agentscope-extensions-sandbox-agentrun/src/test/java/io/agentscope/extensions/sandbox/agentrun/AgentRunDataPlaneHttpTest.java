@@ -18,6 +18,7 @@ package io.agentscope.extensions.sandbox.agentrun;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.fasterxml.jackson.databind.JsonNode;
@@ -62,6 +63,70 @@ class AgentRunDataPlaneHttpTest {
                         .setDataPlaneBaseUrl(baseUrl)
                         .setHttpClient(new OkHttpClient());
         return new AgentRunDataPlaneHttp(opt);
+    }
+
+    /** Same as {@link #httpWithMock()} but with an explicit read timeout for timeout tests. */
+    private AgentRunDataPlaneHttp httpWithMock(int readTimeoutSeconds) {
+        String baseUrl = mockServer.url("/").toString();
+        if (baseUrl.endsWith("/")) {
+            baseUrl = baseUrl.substring(0, baseUrl.length() - 1);
+        }
+        AgentRunSandboxClientOptions opt =
+                new AgentRunSandboxClientOptions()
+                        .setApiKey("test-key")
+                        .setAccountId("1234567890")
+                        .setRegion("cn-hangzhou")
+                        .setTemplateName("agentscope-default")
+                        .setDataPlaneBaseUrl(baseUrl)
+                        .setHttpClient(
+                                new OkHttpClient.Builder()
+                                        .readTimeout(readTimeoutSeconds, TimeUnit.SECONDS)
+                                        .build());
+        return new AgentRunDataPlaneHttp(opt);
+    }
+
+    @Test
+    void execDoesNotResendCommandAfterReadTimeout() throws Exception {
+        // A read timeout is ambiguous: the command may already be running in the sandbox. Re-sending
+        // would run it twice — for a script with side effects that is silent corruption. It also
+        // used to cost maxRetries x readTimeout of dead time (361s in production).
+        AgentRunDataPlaneHttp http = httpWithMock(1);
+
+        // Enough stalled responses to satisfy every retry, so a retry would be observable.
+        for (int i = 0; i < 3; i++) {
+            mockServer.enqueue(
+                    new MockResponse()
+                            .setResponseCode(200)
+                            .setBody("{\"exitCode\":0}")
+                            .setBodyDelay(10, TimeUnit.SECONDS));
+        }
+
+        long startedAt = System.nanoTime();
+        assertThrows(IOException.class, () -> http.exec("sb-1", "echo hi", null, 30));
+        long elapsedMs = (System.nanoTime() - startedAt) / 1_000_000L;
+
+        assertEquals(
+                1,
+                mockServer.getRequestCount(),
+                "the command must be sent exactly once — a retry could run it twice");
+        assertTrue(
+                elapsedMs < 5_000,
+                "should fail fast rather than burning every retry window, took " + elapsedMs + "ms");
+    }
+
+    @Test
+    void execClampsRequestedTimeoutToGatewayCap() throws Exception {
+        AgentRunDataPlaneHttp http = httpWithMock();
+        mockServer.enqueue(new MockResponse().setResponseCode(200).setBody("{\"exitCode\":0}"));
+
+        http.exec("sb-1", "echo hi", null, 600);
+
+        RecordedRequest req = mockServer.takeRequest(1, TimeUnit.SECONDS);
+        assertNotNull(req);
+        String body = req.getBody().readUtf8();
+        assertTrue(
+                body.contains("\"timeout\":" + AgentRunDataPlaneHttp.GATEWAY_EXEC_TIMEOUT_CAP_SECONDS),
+                "requested timeout should be clamped to the gateway cap, body was: " + body);
     }
 
     @Test

@@ -289,6 +289,7 @@ public class SubagentsMiddleware implements HarnessRuntimeMiddleware {
         if (taskRepository instanceof WorkspaceTaskRepository wtr) {
             wtr.setCompletionCallback(
                     (rc, taskId, subAgentId, sessionId, result) -> {
+                        long callbackStart = System.currentTimeMillis();
                         String userId = rc != null ? rc.getUserId() : null;
                         String hintContent =
                                 String.format(
@@ -309,7 +310,10 @@ public class SubagentsMiddleware implements HarnessRuntimeMiddleware {
                                         hintContent,
                                         "source",
                                         "subagent_task");
+                        long beforeInbox = System.currentTimeMillis();
                         messageBus.inboxPush(sessionId, hintPayload).subscribe();
+                        long afterInbox = System.currentTimeMillis();
+                        long beforeWakeup = System.currentTimeMillis();
                         messageBus
                                 .enqueueWakeup(
                                         userId != null ? userId : "",
@@ -323,11 +327,16 @@ public class SubagentsMiddleware implements HarnessRuntimeMiddleware {
                                                                 + " completion: {}",
                                                         taskId,
                                                         err.getMessage()));
+                        long afterWakeup = System.currentTimeMillis();
                         log.info(
                                 "Subagent task {} completed, pushed to inbox and enqueued wakeup:"
-                                        + " session={}",
+                                        + " session={} | callback_total={}ms"
+                                        + " inbox_push={}ms wakeup_enqueue={}ms",
                                 taskId,
-                                sessionId);
+                                sessionId,
+                                afterWakeup - callbackStart,
+                                afterInbox - beforeInbox,
+                                afterWakeup - beforeWakeup);
                     });
         }
         return this;
