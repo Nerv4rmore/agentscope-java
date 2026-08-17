@@ -38,7 +38,27 @@ final class AgentRunDataPlaneHttp {
 
     private static final MediaType JSON = MediaType.get("application/json; charset=utf-8");
 
+    /**
+     * Hard ceiling the data-plane gateway applies to {@code /processes/cmd}, in seconds. Requesting
+     * more has no effect, so the request body is clamped to this value.
+     */
+    static final int GATEWAY_EXEC_TIMEOUT_CAP_SECONDS = 30;
+
+    /**
+     * Ceiling for a single {@code /processes/cmd} call, in seconds.
+     *
+     * <p>The gateway abandons the command at its own 30s cap, so waiting the generic read timeout
+     * (120s by default) buys nothing — it only delays the error. This bounds the whole call
+     * (connect + write + read) at the cap plus enough margin for connection setup and response
+     * transfer.
+     */
+    private static final int EXEC_CALL_TIMEOUT_SECONDS = GATEWAY_EXEC_TIMEOUT_CAP_SECONDS + 15;
+
     private final OkHttpClient http;
+
+    /** {@link #http} with a bounded {@code callTimeout}, used only for command execution. */
+    private final OkHttpClient execHttp;
+
     private final ObjectMapper json = new ObjectMapper();
     private final AgentRunSandboxClientOptions opt;
 
@@ -54,6 +74,12 @@ final class AgentRunDataPlaneHttp {
                             .readTimeout(opt.getReadTimeoutSeconds(), TimeUnit.SECONDS)
                             .build();
         }
+        // Shares the parent's connection pool and dispatcher; only the timeout differs.
+        this.execHttp =
+                this.http
+                        .newBuilder()
+                        .callTimeout(EXEC_CALL_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                        .build();
     }
 
     /** Creates a sandbox with a deterministic id and returns the sandbox object as JSON. */
@@ -168,12 +194,18 @@ final class AgentRunDataPlaneHttp {
             body.put("cwd", cwd);
         }
         // Gateway hard-caps at 30s; send the smaller of requested/default to be explicit.
-        body.put("timeout", Math.min(30, Math.max(1, timeoutSeconds)));
+        body.put(
+                "timeout", Math.min(GATEWAY_EXEC_TIMEOUT_CAP_SECONDS, Math.max(1, timeoutSeconds)));
 
+        // NON_IDEMPOTENT: on a read timeout the command may already be running in the sandbox, so a
+        // retry would run it a second time. Bounded by execHttp's callTimeout rather than the
+        // generic 120s read timeout, since the gateway has already given up at its own cap.
         String url = sandboxUrl(sandboxId) + "/processes/cmd";
         JsonNode resp =
                 AgentRunRetry.withRetries(
-                        opt.getMaxRetries(), () -> unwrapData(postJson(url, body)));
+                        opt.getMaxRetries(),
+                        AgentRunRetry.Idempotency.NON_IDEMPOTENT,
+                        () -> unwrapData(postJson(execHttp, url, body)));
         return parseExecResult(resp);
     }
 
@@ -429,9 +461,13 @@ final class AgentRunDataPlaneHttp {
     }
 
     private JsonNode postJson(String url, ObjectNode body) throws IOException {
+        return postJson(http, url, body);
+    }
+
+    private JsonNode postJson(OkHttpClient client, String url, ObjectNode body) throws IOException {
         Request req =
                 baseRequest().url(url).post(RequestBody.create(body.toString(), JSON)).build();
-        try (Response res = http.newCall(req).execute()) {
+        try (Response res = client.newCall(req).execute()) {
             String text = res.body() != null ? res.body().string() : "";
             if (!res.isSuccessful()) {
                 throw new SandboxException.SandboxRuntimeException(

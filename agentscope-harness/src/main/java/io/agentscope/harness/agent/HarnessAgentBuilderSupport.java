@@ -24,6 +24,7 @@ import io.agentscope.core.model.GenerateOptions;
 import io.agentscope.core.model.Model;
 import io.agentscope.core.model.ModelRegistry;
 import io.agentscope.core.model.ToolSchema;
+import io.agentscope.core.permission.PermissionContextState;
 import io.agentscope.core.skill.SkillFilter;
 import io.agentscope.core.skill.repository.AgentSkillRepository;
 import io.agentscope.core.skill.repository.FileSystemSkillRepository;
@@ -285,6 +286,10 @@ final class HarnessAgentBuilderSupport {
         final ExecutionConfig capturedModelExec = b.modelExecutionConfig;
         final ExecutionConfig capturedToolExec = b.toolExecutionConfig;
         final GenerateOptions capturedGenOpts = b.generateOptions;
+        // Inherit the parent's permission mode. A subagent has no interactive approval channel,
+        // so any tool call the engine resolves to ASK pauses the child forever — the parent can
+        // only observe the pause, never clear it. See buildDeclaredFactory for the failure trace.
+        final PermissionContextState capturedPermissionContext = b.permissionContext;
         final String capturedEnvMemory = b.environmentMemory;
         final List<Hook> capturedHooks = List.copyOf(b.hooks);
         final List<MiddlewareBase> capturedMiddlewares = List.copyOf(b.middlewares);
@@ -295,6 +300,7 @@ final class HarnessAgentBuilderSupport {
         final boolean capturedDisableShellTool = b.disableShellTool;
         final boolean capturedDisableMemoryTools = b.disableMemoryTools;
         final boolean capturedDisableMemoryHooks = b.disableMemoryHooks;
+        final boolean capturedDisableMemoryMaintenance = b.disableMemoryMaintenance;
         final boolean capturedDisableSessionPersistence = b.disableSessionPersistence;
         final boolean capturedDisableWorkspaceContext = b.disableWorkspaceContext;
         final boolean capturedPlanModeEnabled = b.planModeEnabled;
@@ -339,6 +345,7 @@ final class HarnessAgentBuilderSupport {
             if (capturedDisableShellTool) sub.disableShellTool();
             if (capturedDisableMemoryTools) sub.disableMemoryTools();
             if (capturedDisableMemoryHooks) sub.disableMemoryHooks();
+            if (capturedDisableMemoryMaintenance) sub.disableMemoryMaintenance();
             if (capturedDisableSessionPersistence) sub.disableSessionPersistence();
             if (capturedDisableWorkspaceContext) sub.disableWorkspaceContext();
             configurePlanMode(
@@ -353,6 +360,9 @@ final class HarnessAgentBuilderSupport {
             if (capturedModelExec != null) sub.modelExecutionConfig(capturedModelExec);
             if (capturedToolExec != null) sub.toolExecutionConfig(capturedToolExec);
             if (capturedGenOpts != null) sub.generateOptions(capturedGenOpts);
+            if (capturedPermissionContext != null) {
+                sub.permissionContext(capturedPermissionContext);
+            }
             if (capturedDisableCompaction) {
                 sub.disableCompaction();
             } else if (capturedCompactionConfig != null) {
@@ -400,6 +410,7 @@ final class HarnessAgentBuilderSupport {
         final boolean capturedDisableShellTool = b.disableShellTool;
         final boolean capturedDisableMemoryTools = b.disableMemoryTools;
         final boolean capturedDisableMemoryHooks = b.disableMemoryHooks;
+        final boolean capturedDisableMemoryMaintenance = b.disableMemoryMaintenance;
         final boolean capturedDisableSessionPersistence = b.disableSessionPersistence;
         final boolean capturedPlanModeEnabled = b.planModeEnabled;
         final boolean capturedPlanModeAllowShell = b.planModeAllowShell;
@@ -411,6 +422,14 @@ final class HarnessAgentBuilderSupport {
         // configured on the main agent.
         final ExecutionConfig capturedModelExec = b.modelExecutionConfig;
         final ExecutionConfig capturedToolExec = b.toolExecutionConfig;
+        // Inherit the parent's permission context (e.g. PermissionMode.BYPASS on a headless
+        // server). Declared subagents get gated tool groups activated via `activate_tool_groups`,
+        // and MCP tools without a readOnlyHint resolve to ASK by default in PermissionEngine.
+        // A paused child cannot be resumed from the parent: `agent_send` only appends a message
+        // and re-enters reply(), which re-raises "Agent is paused for human-in-the-loop
+        // confirmation" because the ASKING ToolUseBlocks are still unresolved. Observed with
+        // image-scout issuing 11 parallel search_images calls that never executed.
+        final PermissionContextState capturedPermissionContext = b.permissionContext;
         // Snapshot of main agent's Local filesystem configuration. ISOLATED subagents get a
         // fresh spec carrying the same project / additionalRoots / mode so PathPolicy stays in
         // sync; without this, every isolated subagent would default to project=${user.dir} and
@@ -517,11 +536,15 @@ final class HarnessAgentBuilderSupport {
 
             if (capturedModelExec != null) sub.modelExecutionConfig(capturedModelExec);
             if (capturedToolExec != null) sub.toolExecutionConfig(capturedToolExec);
+            if (capturedPermissionContext != null) {
+                sub.permissionContext(capturedPermissionContext);
+            }
 
             if (capturedDisableFilesystemTools) sub.disableFilesystemTools();
             if (capturedDisableShellTool) sub.disableShellTool();
             if (capturedDisableMemoryTools) sub.disableMemoryTools();
             if (capturedDisableMemoryHooks) sub.disableMemoryHooks();
+            if (capturedDisableMemoryMaintenance) sub.disableMemoryMaintenance();
             if (capturedDisableSessionPersistence) sub.disableSessionPersistence();
             configurePlanMode(
                     sub, capturedPlanModeEnabled, capturedPlanModeAllowShell, capturedPlanFileDir);

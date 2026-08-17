@@ -1058,6 +1058,11 @@ public class HarnessAgent implements Agent, AutoCloseable {
         ExecutionConfig modelExecutionConfig;
         ExecutionConfig toolExecutionConfig;
         GenerateOptions generateOptions;
+        // Mirrored so subagent factories can inherit the parent's permission mode. Without this
+        // children fall back to the default context, where a tool with no matching allow-rule
+        // (notably MCP tools lacking readOnlyHint) resolves to ASK and deadlocks: a spawned agent
+        // has no interactive channel to approve through, and agent_send cannot act as one.
+        PermissionContextState permissionContext;
         final Set<Hook> hooks = new LinkedHashSet<>();
         final List<MiddlewareBase> middlewares = new ArrayList<>();
 
@@ -1534,6 +1539,7 @@ public class HarnessAgent implements Agent, AutoCloseable {
         }
 
         public Builder permissionContext(PermissionContextState permissionContext) {
+            this.permissionContext = permissionContext;
             inner.permissionContext(permissionContext);
             return this;
         }

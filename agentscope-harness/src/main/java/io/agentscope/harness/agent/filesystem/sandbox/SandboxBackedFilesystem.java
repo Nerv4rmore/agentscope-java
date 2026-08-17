@@ -27,10 +27,13 @@ import io.agentscope.harness.agent.sandbox.SandboxContext;
 import io.agentscope.harness.agent.sandbox.SandboxException;
 import io.agentscope.harness.agent.sandbox.SandboxFileTransfer;
 import io.agentscope.harness.agent.sandbox.SandboxManager;
+import java.io.InterruptedIOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -287,8 +290,51 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
                     command,
                     e.getMessage());
             log.error("[sandbox-fs] execute failed: {}", command, e);
+            // 超时是基建故障，不是脚本错误。不说清楚的话模型会当成"脚本写错了"而重写重跑，
+            // 关键信息：命令可能已在沙箱里跑完了——响应丢了，不等于工作没做。
+            if (isTimeout(e)) {
+                return new ExecuteResponse(
+                        "Sandbox timeout: the command did not return in time."
+                                + " This is an infrastructure failure, NOT an error in your"
+                                + " command — do NOT rewrite it and do NOT re-run it as-is."
+                                + " The command may have already completed inside the sandbox"
+                                + " (the response was lost, not necessarily the work): list the"
+                                + " files it should have produced before deciding anything."
+                                + " If you must run it again, first make it finish faster —"
+                                + " the gateway abandons any command that exceeds ~30s, so cap"
+                                + " every network or long-running operation well under that.",
+                        -1,
+                        false);
+            }
             return new ExecuteResponse("Internal sandbox error: " + e.getMessage(), -1, false);
         }
+    }
+
+    /**
+     * True when a failure is a transport timeout rather than a command error.
+     *
+     * <p>Walks the cause chain because the transport exception is usually wrapped. Matches {@link
+     * InterruptedIOException}, which covers both flavours OkHttp raises: a read-timeout expiry
+     * ({@link java.net.SocketTimeoutException}) and a call-timeout expiry (a plain {@code
+     * InterruptedIOException}). The message is also checked, since some layers rewrap the cause as a
+     * generic exception and only preserve the text.
+     */
+    private static boolean isTimeout(Throwable e) {
+        Throwable cur = e;
+        while (cur != null) {
+            if (cur instanceof InterruptedIOException || cur instanceof TimeoutException) {
+                return true;
+            }
+            String msg = cur.getMessage();
+            if (msg != null) {
+                String lower = msg.toLowerCase(Locale.ROOT);
+                if (lower.contains("timeout") || lower.contains("timed out")) {
+                    return true;
+                }
+            }
+            cur = cur.getCause();
+        }
+        return false;
     }
 
     @Override

@@ -52,7 +52,7 @@ public class WaitAsyncResultsTool {
     // value of 2 (4 min) was exhausted after the first subagent, blocking all
     // subsequent waits for the second subagent.
     private static final int MAX_CONSECUTIVE_EMPTY_WAITS = 10;
-    private static final long POLL_INTERVAL_MS = 3000;
+    private static final long POLL_INTERVAL_MS = 1000;
 
     private final MessageBus messageBus;
     private final TaskRepository taskRepository;
