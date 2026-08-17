@@ -36,6 +36,18 @@ public interface SandboxClient<O extends SandboxClientOptions> {
      */
     Sandbox resume(SandboxState state);
 
+    /**
+     * Resumes a sandbox from previously serialized {@link SandboxState} with per-call options.
+     *
+     * <p>Called by {@link SandboxManager#acquire} on the persisted-state (Priority 3) path so
+     * backends can apply per-call values (e.g. a per-session workspace root) when refreshing
+     * the resumed sandbox. The default implementation ignores the options and delegates to
+     * {@link #resume(SandboxState)}.
+     */
+    default Sandbox resume(SandboxState state, O options) {
+        return resume(state);
+    }
+
     void delete(Sandbox sandbox);
 
     String serializeState(SandboxState state);

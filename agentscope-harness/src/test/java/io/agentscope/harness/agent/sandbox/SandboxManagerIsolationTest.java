@@ -19,6 +19,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -75,7 +76,7 @@ class SandboxManagerIsolationTest {
     @Test
     void priority2_externalSessionState_resumedDirectly() throws Exception {
         when(externalState.getSessionId()).thenReturn("explicit-id");
-        when(client.resume(externalState)).thenReturn(resumedSandbox);
+        when(client.resume(eq(externalState), any())).thenReturn(resumedSandbox);
 
         SandboxContext ctx = SandboxContext.builder().externalSandboxState(externalState).build();
 
@@ -92,7 +93,7 @@ class SandboxManagerIsolationTest {
     void priority3_stateStoreHit_resumesSession() throws Exception {
         when(stateStore.load(any())).thenReturn(Optional.of(STATE_JSON));
         when(client.deserializeState(STATE_JSON, null)).thenReturn(resumedState);
-        when(client.resume(resumedState)).thenReturn(resumedSandbox);
+        when(client.resume(eq(resumedState), any())).thenReturn(resumedSandbox);
 
         RuntimeContext rtx = RuntimeContext.builder().sessionId("sess-1").build();
         SandboxContext sCtx =
@@ -146,7 +147,7 @@ class SandboxManagerIsolationTest {
     void userScope_withUserId_loadsFromStore() throws Exception {
         when(stateStore.load(any())).thenReturn(Optional.of(STATE_JSON));
         when(client.deserializeState(STATE_JSON, null)).thenReturn(resumedState);
-        when(client.resume(resumedState)).thenReturn(resumedSandbox);
+        when(client.resume(eq(resumedState), any())).thenReturn(resumedSandbox);
 
         RuntimeContext rtx = RuntimeContext.builder().userId("user-42").build();
         SandboxContext sCtx = SandboxContext.builder().isolationScope(IsolationScope.USER).build();
@@ -160,7 +161,7 @@ class SandboxManagerIsolationTest {
     void priority3_stateStoreHit_passesSnapshotSpecToDeserialize() throws Exception {
         when(stateStore.load(any())).thenReturn(Optional.of(STATE_JSON));
         when(client.deserializeState(STATE_JSON, snapshotSpec)).thenReturn(resumedState);
-        when(client.resume(resumedState)).thenReturn(resumedSandbox);
+        when(client.resume(eq(resumedState), any())).thenReturn(resumedSandbox);
 
         RuntimeContext rtx = RuntimeContext.builder().sessionId("sess-1").build();
         SandboxContext sCtx =

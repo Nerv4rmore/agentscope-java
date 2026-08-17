@@ -124,7 +124,8 @@ public class ResponsesMessageConverter {
      * <p>按消息内原始块顺序输出：文本块转为 input_text，图片块转为 input_image。
      * 图片 URL 支持公网链接和 base64 data URI 两种形式。
      */
-    private List<Map<String, Object>> buildMultimodalContent(Msg msg, List<ImageBlock> imageBlocks) {
+    private List<Map<String, Object>> buildMultimodalContent(
+            Msg msg, List<ImageBlock> imageBlocks) {
         List<Map<String, Object>> parts = new ArrayList<>();
 
         // 按原始 content 块顺序遍历，保持文本与图片的相对位置
@@ -142,7 +143,8 @@ public class ResponsesMessageConverter {
                 } else if (block instanceof ImageBlock imageBlock) {
                     Map<String, Object> imagePart = new LinkedHashMap<>();
                     imagePart.put("type", "input_image");
-                    imagePart.put("image_url",
+                    imagePart.put(
+                            "image_url",
                             OpenAIConverterUtils.convertImageSourceToUrl(imageBlock.getSource()));
                     parts.add(imagePart);
                 }
@@ -161,7 +163,8 @@ public class ResponsesMessageConverter {
             for (ImageBlock imageBlock : imageBlocks) {
                 Map<String, Object> imagePart = new LinkedHashMap<>();
                 imagePart.put("type", "input_image");
-                imagePart.put("image_url",
+                imagePart.put(
+                        "image_url",
                         OpenAIConverterUtils.convertImageSourceToUrl(imageBlock.getSource()));
                 parts.add(imagePart);
             }

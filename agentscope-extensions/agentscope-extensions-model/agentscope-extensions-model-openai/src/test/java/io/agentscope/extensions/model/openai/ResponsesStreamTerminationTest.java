@@ -46,8 +46,7 @@ class ResponsesStreamTerminationTest {
     // Responses API emits typed events; two minimal chunks exercising the parse path.
     private static final String CHUNK_DELTA =
             "{\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}";
-    private static final String CHUNK_COMPLETED =
-            "{\"type\":\"response.completed\"}";
+    private static final String CHUNK_COMPLETED = "{\"type\":\"response.completed\"}";
 
     /**
      * A transport that emits two content chunks and the {@code [DONE]} sentinel, then never
@@ -63,8 +62,7 @@ class ResponsesStreamTerminationTest {
 
             @Override
             public Flux<String> stream(HttpRequest request) {
-                return Flux.just(CHUNK_DELTA, CHUNK_COMPLETED, "[DONE]")
-                        .concatWith(Flux.never());
+                return Flux.just(CHUNK_DELTA, CHUNK_COMPLETED, "[DONE]").concatWith(Flux.never());
             }
 
             @Override

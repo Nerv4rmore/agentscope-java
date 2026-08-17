@@ -61,4 +61,37 @@ public abstract class SandboxClientOptions {
     public String getWorkspaceRoot() {
         return "/workspace";
     }
+
+    /**
+     * Returns a copy of these options with the per-call user id applied.
+     *
+     * <p>Called by {@link SandboxManager#acquire} before invoking
+     * {@link SandboxClient#create}, so concrete backends can resolve per-user configuration
+     * (e.g. a per-user OSS mount path) from the call identity. The default implementation
+     * returns {@code this} unchanged; backends that need the user id override this method
+     * and return a mutable copy.
+     *
+     * @param userId the resolved user id for the current call (may be {@code null})
+     * @return options to pass into {@code create}; {@code this} by default
+     */
+    public SandboxClientOptions withCallUserId(String userId) {
+        return this;
+    }
+
+    /**
+     * Returns a copy of these options with the per-call workspace root applied.
+     *
+     * <p>Called by {@link SandboxManager#acquire} before invoking
+     * {@link SandboxClient#create} or {@link SandboxClient#resume(SandboxState,
+     * SandboxClientOptions)}, so concrete backends can isolate the working directory per
+     * call (e.g. a per-chat-session subdirectory under the shared workspace root). The
+     * default implementation returns {@code this} unchanged; backends that support
+     * per-call workspace roots override this method and return a mutable copy.
+     *
+     * @param workspaceRoot the per-call workspace root inside the sandbox (may be {@code null})
+     * @return options to pass into {@code create}/{@code resume}; {@code this} by default
+     */
+    public SandboxClientOptions withCallWorkspaceRoot(String workspaceRoot) {
+        return this;
+    }
 }

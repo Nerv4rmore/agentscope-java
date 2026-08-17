@@ -2613,15 +2613,17 @@ public class HarnessAgent implements Agent, AutoCloseable {
             // final say on the prompt's trailing content. ----
             if (systemPromptSuffix != null && !systemPromptSuffix.isBlank()) {
                 final String suffix = systemPromptSuffix;
-                inner.middleware(new MiddlewareBase() {
-                    @Override
-                    public Mono<String> onSystemPrompt(
-                            Agent agent, RuntimeContext ctx, String currentPrompt) {
-                        String base = currentPrompt != null ? currentPrompt : "";
-                        String separator = base.isEmpty() || base.endsWith("\n") ? "" : "\n";
-                        return Mono.just(base + separator + suffix);
-                    }
-                });
+                inner.middleware(
+                        new MiddlewareBase() {
+                            @Override
+                            public Mono<String> onSystemPrompt(
+                                    Agent agent, RuntimeContext ctx, String currentPrompt) {
+                                String base = currentPrompt != null ? currentPrompt : "";
+                                String separator =
+                                        base.isEmpty() || base.endsWith("\n") ? "" : "\n";
+                                return Mono.just(base + separator + suffix);
+                            }
+                        });
             }
 
             ReActAgent delegate = inner.build();

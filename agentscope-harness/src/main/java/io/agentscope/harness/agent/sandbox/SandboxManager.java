@@ -41,6 +41,18 @@ public class SandboxManager {
 
     private static final Logger log = LoggerFactory.getLogger(SandboxManager.class);
 
+    /**
+     * {@link RuntimeContext} string-attribute key carrying the per-call workspace root inside
+     * the sandbox (e.g. a per-chat-session working directory). When present, {@link #acquire}
+     * injects it into the per-call {@link SandboxClientOptions} via
+     * {@link SandboxClientOptions#withCallWorkspaceRoot} on both the resume (Priority 2/3) and
+     * create (Priority 4) paths, so backends can isolate each call's file operations into its
+     * own directory while sharing the sandbox instance. Applications derive the value from the
+     * root chat session id (not {@link RuntimeContext#getSessionId()}, which subagents override
+     * with their own {@code sub-*} ids).
+     */
+    public static final String CALL_WORKSPACE_ROOT_KEY = "sandbox.call.workspace.root";
+
     private final SandboxClient<?> client;
     private final SessionSandboxStateStore stateStore;
     private final String agentId;
@@ -76,7 +88,11 @@ public class SandboxManager {
 
         // Priority 2: user-supplied state — guard does not apply
         if (sandboxContext.getExternalSandboxState() != null) {
-            Sandbox sandbox = client.resume(sandboxContext.getExternalSandboxState());
+            Sandbox sandbox =
+                    typedClient()
+                            .resume(
+                                    sandboxContext.getExternalSandboxState(),
+                                    perCallOptions(sandboxContext, null, runtimeContext));
             log.debug(
                     "[sandbox] Priority 2: resuming from explicit state: {}",
                     sandboxContext.getExternalSandboxState().getSessionId());
@@ -112,7 +128,16 @@ public class SandboxManager {
                         if (sandboxContext.getWorkspaceSpec() != null) {
                             state.setWorkspaceSpec(sandboxContext.getWorkspaceSpec().copy());
                         }
-                        Sandbox sandbox = client.resume(state);
+                        // Per-call options 同样传入 resume：后端据此把本次调用的工作区根
+                        //（如会话级工作目录）应用到复用的沙箱 state 上
+                        Sandbox sandbox =
+                                typedClient()
+                                        .resume(
+                                                state,
+                                                perCallOptions(
+                                                        sandboxContext,
+                                                        scopeKey.get().getValue(),
+                                                        runtimeContext));
                         return SandboxAcquireResult.selfManaged(sandbox, lease);
                     }
                     // 诊断：load 返回空 = 上一轮没写成功 / 写入路径与读取路径不一致 / 被清除
@@ -146,14 +171,15 @@ public class SandboxManager {
                             ? sandboxContext.getWorkspaceSpec().copy()
                             : new WorkspaceSpec();
 
-            @SuppressWarnings("unchecked")
-            SandboxClient<SandboxClientOptions> typedClient =
-                    (SandboxClient<SandboxClientOptions>) client;
+            // Resolve the per-call user id (the discriminating value of the isolation key, e.g.
+            // userId for USER scope) so concrete backends can derive per-user sandbox config such
+            // as an OSS bucket mount path scoped to the user.
+            String callUserId = scopeKey.isPresent() ? scopeKey.get().getValue() : null;
+            SandboxClientOptions perCallOptions =
+                    perCallOptions(sandboxContext, callUserId, runtimeContext);
+
             Sandbox sandbox =
-                    typedClient.create(
-                            spec,
-                            sandboxContext.getSnapshotSpec(),
-                            sandboxContext.getClientOptions());
+                    typedClient().create(spec, sandboxContext.getSnapshotSpec(), perCallOptions);
             return SandboxAcquireResult.selfManaged(sandbox, lease);
 
         } catch (Exception e) {
@@ -161,6 +187,29 @@ public class SandboxManager {
             lease.close();
             throw e;
         }
+    }
+
+    /**
+     * Builds the per-call options passed to {@link SandboxClient#create} /
+     * {@link SandboxClient#resume(SandboxState, SandboxClientOptions)}: the per-call user id
+     * (isolation key value) plus the per-call workspace root read from the
+     * {@link #CALL_WORKSPACE_ROOT_KEY} runtime attribute (session-isolated working directory).
+     */
+    private SandboxClientOptions perCallOptions(
+            SandboxContext sandboxContext, String callUserId, RuntimeContext runtimeContext) {
+        String callWorkspaceRoot =
+                runtimeContext != null
+                        ? runtimeContext.get(CALL_WORKSPACE_ROOT_KEY, String.class)
+                        : null;
+        return sandboxContext
+                .getClientOptions()
+                .withCallUserId(callUserId)
+                .withCallWorkspaceRoot(callWorkspaceRoot);
+    }
+
+    @SuppressWarnings("unchecked")
+    private SandboxClient<SandboxClientOptions> typedClient() {
+        return (SandboxClient<SandboxClientOptions>) client;
     }
 
     public void release(SandboxAcquireResult result) {
