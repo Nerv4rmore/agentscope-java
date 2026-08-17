@@ -34,6 +34,8 @@ import io.agentscope.core.state.AgentState;
 import io.agentscope.core.tool.Tool;
 import io.agentscope.core.tool.ToolParam;
 import io.agentscope.harness.agent.HarnessAgent;
+import io.agentscope.harness.agent.filesystem.AbstractFilesystem;
+import io.agentscope.harness.agent.filesystem.sandbox.SandboxBackedFilesystem;
 import io.agentscope.harness.agent.gateway.SessionIdUtils;
 import io.agentscope.harness.agent.gateway.SubagentGatewayBridge;
 import io.agentscope.harness.agent.gateway.channel.OutboundAddress;
@@ -92,7 +94,9 @@ public class AgentSpawnTool {
 
     private static final int DEFAULT_TIMEOUT_SECONDS = 30;
     private static final int MAX_TIMEOUT_SECONDS = 600;
-    private static final int MAX_SPAWN_DEPTH = 3;
+
+    /** Maximum child depth (main=0, sub=1, sub-sub=2; depth 2 is always a leaf). */
+    public static final int MAX_SPAWN_DEPTH = 2;
 
     /**
      * {@link RuntimeContext} string key for a per-call override of subagent user-exposure. Put a
@@ -120,6 +124,27 @@ public class AgentSpawnTool {
      * manager here so concurrent callers never overwrite each other's declarations.
      */
     public static final String CTX_AGENT_MANAGER = "agentscope.subagent.agent_manager";
+
+    /**
+     * {@link RuntimeContext} string key for the spawn depth of the current agent. The top-level
+     * agent has depth 0; each {@code agent_spawn} increments by 1. Stored in the context by
+     * {@link AgentSpawnTool#agentSpawn} so that {@link
+     * io.agentscope.harness.agent.HarnessAgentBuilderSupport#buildDeclaredFactory} can read it
+     * to decide whether the child should be a leaf subagent (no nested spawning) or a non-leaf
+     * (can spawn its own sub-subagents).
+     */
+    public static final String CTX_SPAWN_DEPTH = "agentscope.subagent.spawn_depth";
+
+    /**
+     * {@link RuntimeContext} string key for the model tier. Same value as
+     * {@code ModelTierMiddleware.MODEL_TIER_KEY} in the app layer — the middleware reads this
+     * key on every model call to swap the model instance. When a subagent declaration specifies
+     * {@code model_tier}, {@code agentSpawn} creates a copy of the parent context with this key
+     * overridden, so the child inherits the override without polluting the parent's context.
+     * The sentinel value {@code "default"} tells the middleware to skip the tier override and
+     * use the agent's built-in fallback model (e.g. qwen3.7-flash).
+     */
+    public static final String CTX_MODEL_TIER = "modelTier";
 
     private static final String BG_RESULT_TEMPLATE =
             """
@@ -242,15 +267,24 @@ public class AgentSpawnTool {
                 agentId,
                 timeoutSeconds,
                 task);
-        int nextDepth = parentSpawnDepth + 1;
+        // Read spawn depth from RuntimeContext (set by parent's agent_spawn call).
+        // Falls back to the constructor field for the top-level agent (depth 0).
+        Integer ctxDepth =
+                runtimeContext != null ? runtimeContext.get(CTX_SPAWN_DEPTH, Integer.class) : null;
+        int currentDepth = ctxDepth != null ? ctxDepth : parentSpawnDepth;
+        int nextDepth = currentDepth + 1;
         if (nextDepth > MAX_SPAWN_DEPTH) {
             log.warn("agent_spawn depth exceeded: depth={}, max={}", nextDepth, MAX_SPAWN_DEPTH);
             return Mono.just("Error: Maximum spawn depth exceeded (max=" + MAX_SPAWN_DEPTH + ")");
         }
         String canonLabel = label != null && !label.isBlank() ? label.trim() : null;
         DefaultAgentManager manager = managerFor(runtimeContext);
+        var declOpt = manager.getDeclaration(agentId);
+        // The child receives a detached context carrying its own depth and optional model tier.
+        // Never mutate the parent's context: sibling spawns must observe the same parent depth.
+        final RuntimeContext effectiveRc = childRuntimeContext(runtimeContext, nextDepth, declOpt);
 
-        Optional<Agent> agentOpt = manager.createAgentIfPresent(agentId, runtimeContext);
+        Optional<Agent> agentOpt = manager.createAgentIfPresent(agentId, effectiveRc);
         if (agentOpt.isEmpty()) {
             if (manager.isPrimaryOnly(agentId)) {
                 return Mono.just(
@@ -265,7 +299,6 @@ public class AgentSpawnTool {
         Agent agent = agentOpt.get();
         String currentUserId = runtimeContext != null ? runtimeContext.getUserId() : null;
         String parentSessionId = runtimeContext != null ? runtimeContext.getSessionId() : null;
-        var declOpt = manager.getDeclaration(agentId);
         boolean persist = declOpt.map(SubagentDeclaration::isPersistSession).orElse(false);
 
         String key;
@@ -285,7 +318,7 @@ public class AgentSpawnTool {
                     return Mono.just(spawnInfo + "\nstatus: accepted (reused)");
                 }
                 return execSpawnTask(
-                        existing, runtimeContext, spawnInfo, task, timeoutSeconds, declOpt);
+                        existing, effectiveRc, spawnInfo, task, timeoutSeconds, declOpt);
             }
         } else {
             key = "agent:" + agentId + ":" + UUID.randomUUID();
@@ -318,12 +351,12 @@ public class AgentSpawnTool {
         // (in priority order) a per-call RuntimeContext override, the declaration policy, and the
         // LLM-supplied argument — so application code can force or forbid exposure regardless of
         // what the model decides.
-        boolean effectiveExpose = resolveExposeToUser(exposeToUser, declOpt, runtimeContext);
+        boolean effectiveExpose = resolveExposeToUser(exposeToUser, declOpt, effectiveRc);
         String subagentId = null;
         if (effectiveExpose && gatewayBridge != null) {
             OutboundAddress replyTo =
-                    runtimeContext != null
-                            ? runtimeContext.get("outboundAddress", OutboundAddress.class)
+                    effectiveRc != null
+                            ? effectiveRc.get("outboundAddress", OutboundAddress.class)
                             : null;
             SubagentGatewayBridge.ExposeResult er =
                     gatewayBridge.expose(agentId, sessionId, agent, replyTo);
@@ -348,6 +381,8 @@ public class AgentSpawnTool {
         if (timeoutMs == 0) {
             String taskId = "task_" + UUID.randomUUID();
             final String capturedTask = task;
+            SandboxBackedFilesystem.SharedLease sharedLease =
+                    remote ? null : retainSharedSandbox(effectiveRc);
             TaskRunSpec spec;
             if (remote) {
                 SubagentDeclaration d = declOpt.get();
@@ -365,18 +400,26 @@ public class AgentSpawnTool {
                                                                 sessionId,
                                                                 currentUserId,
                                                                 capturedTask,
-                                                                runtimeContext)
+                                                                effectiveRc)
                                                         .block();
                                         return reply != null ? reply.getTextContent() : "";
                                     } catch (RuntimeException e) {
-                                        return "Error: "
-                                                + (e.getMessage() != null
-                                                        ? e.getMessage()
-                                                        : e.getClass().getSimpleName());
+                                        throw e;
+                                    } finally {
+                                        closeSharedSandbox(sharedLease);
                                     }
                                 });
             }
-            taskRepository.putTask(runtimeContext, taskId, agentId, parentSessionId, spec);
+            try {
+                BackgroundTask backgroundTask =
+                        taskRepository.putTask(effectiveRc, taskId, agentId, parentSessionId, spec);
+                if (backgroundTask != null) {
+                    backgroundTask.onCompletion(() -> closeSharedSandbox(sharedLease));
+                }
+            } catch (RuntimeException e) {
+                closeSharedSandbox(sharedLease);
+                throw e;
+            }
             return withSubagentExposedEvent(
                     Mono.just(
                             spawnInfo
@@ -394,7 +437,7 @@ public class AgentSpawnTool {
                     Mono.fromCallable(
                             () ->
                                     runRemoteSync(
-                                            runtimeContext,
+                                            effectiveRc,
                                             spawnInfo,
                                             agentId,
                                             parentSessionId,
@@ -420,7 +463,7 @@ public class AgentSpawnTool {
                         currentUserId,
                         finalTask,
                         spawned,
-                        runtimeContext,
+                        effectiveRc,
                         finalSpawnInfo,
                         timeoutMs,
                         agentId),
@@ -510,11 +553,16 @@ public class AgentSpawnTool {
         DefaultAgentManager manager = managerFor(runtimeContext);
         propagatePlanMode(parentState, currentUserId, spawned.sessionId(), spawned.agent());
         var declOpt = manager.getDeclaration(spawned.agentId());
+        // Send/reuse/restore also receive a detached context with the known child depth.
+        final RuntimeContext effectiveRc =
+                childRuntimeContext(runtimeContext, spawned.depth(), declOpt);
         boolean remote = declOpt.map(SubagentDeclaration::isRemote).orElse(false);
 
         if (timeoutMs == 0) {
             String taskId = "task_" + UUID.randomUUID();
             final String capturedMessage = message;
+            SandboxBackedFilesystem.SharedLease sharedLease =
+                    remote ? null : retainSharedSandbox(effectiveRc);
             TaskRunSpec spec;
             if (remote) {
                 SubagentDeclaration d = declOpt.get();
@@ -532,19 +580,27 @@ public class AgentSpawnTool {
                                                                 spawned.sessionId(),
                                                                 currentUserId,
                                                                 capturedMessage,
-                                                                runtimeContext)
+                                                                effectiveRc)
                                                         .block();
                                         return reply != null ? reply.getTextContent() : "";
                                     } catch (RuntimeException e) {
-                                        return "Error: "
-                                                + (e.getMessage() != null
-                                                        ? e.getMessage()
-                                                        : e.getClass().getSimpleName());
+                                        throw e;
+                                    } finally {
+                                        closeSharedSandbox(sharedLease);
                                     }
                                 });
             }
-            taskRepository.putTask(
-                    runtimeContext, taskId, spawned.agentId(), parentSessionId, spec);
+            try {
+                BackgroundTask backgroundTask =
+                        taskRepository.putTask(
+                                effectiveRc, taskId, spawned.agentId(), parentSessionId, spec);
+                if (backgroundTask != null) {
+                    backgroundTask.onCompletion(() -> closeSharedSandbox(sharedLease));
+                }
+            } catch (RuntimeException e) {
+                closeSharedSandbox(sharedLease);
+                throw e;
+            }
             return Mono.just(String.format(BG_RESULT_TEMPLATE, taskId, taskId, taskId));
         }
 
@@ -554,7 +610,7 @@ public class AgentSpawnTool {
             return Mono.fromCallable(
                     () ->
                             runRemoteSync(
-                                    runtimeContext,
+                                    effectiveRc,
                                     "agent_key: " + finalKey,
                                     spawned.agentId(),
                                     parentSessionId,
@@ -570,7 +626,7 @@ public class AgentSpawnTool {
                 currentUserId,
                 message.trim(),
                 spawned,
-                runtimeContext,
+                effectiveRc,
                 "agent_key: " + finalKey,
                 timeoutMs,
                 spawned.agentId());
@@ -605,6 +661,42 @@ public class AgentSpawnTool {
                         ? runtimeContext.get(CTX_AGENT_MANAGER, DefaultAgentManager.class)
                         : null;
         return scoped != null ? scoped : agentManager;
+    }
+
+    /** Returns an isolated context carrying child depth and an optional declaration model tier. */
+    private static RuntimeContext childRuntimeContext(
+            RuntimeContext parent, int depth, Optional<SubagentDeclaration> declaration) {
+        RuntimeContext.Builder builder =
+                parent != null ? RuntimeContext.builder(parent) : RuntimeContext.builder();
+        builder.put(CTX_SPAWN_DEPTH, depth);
+        String tier = declaration.map(SubagentDeclaration::getModelTier).orElse(null);
+        if (tier != null && !tier.isBlank()) {
+            builder.put(CTX_MODEL_TIER, tier);
+        }
+        return builder.build();
+    }
+
+    /** Retains the shared sandbox while detached local child work can outlive the parent turn. */
+    private static SandboxBackedFilesystem.SharedLease retainSharedSandbox(RuntimeContext ctx) {
+        if (ctx == null) {
+            return null;
+        }
+        AbstractFilesystem filesystem = ctx.get(AbstractFilesystem.class);
+        if (!(filesystem instanceof SandboxBackedFilesystem sandboxFs)) {
+            return null;
+        }
+        try {
+            return sandboxFs.retainForAsync();
+        } catch (IllegalStateException e) {
+            log.warn("Unable to retain shared sandbox for detached child work: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    private static void closeSharedSandbox(SandboxBackedFilesystem.SharedLease lease) {
+        if (lease != null) {
+            lease.close();
+        }
     }
 
     /**
@@ -751,6 +843,10 @@ public class AgentSpawnTool {
                         Mono.<String>create(
                                 sink -> {
                                     CompletableFuture<Msg> bridge = new CompletableFuture<>();
+                                    SandboxBackedFilesystem.SharedLease sharedLease =
+                                            retainSharedSandbox(runtimeContext);
+                                    bridge.whenComplete(
+                                            (ignored, error) -> closeSharedSandbox(sharedLease));
 
                                     Mono<Msg> inner =
                                             execLocalSync(
@@ -782,6 +878,7 @@ public class AgentSpawnTool {
                                                                     interruptAgent(
                                                                             agent, runtimeContext);
                                                                 }
+                                                                closeSharedSandbox(sharedLease);
                                                             });
 
                                     Disposable innerSub =
@@ -931,7 +1028,14 @@ public class AgentSpawnTool {
             return null;
         }
         Optional<Agent> agentOpt =
-                managerFor(runtimeContext).createAgentIfPresent(entry.agentId(), runtimeContext);
+                managerFor(runtimeContext)
+                        .createAgentIfPresent(
+                                entry.agentId(),
+                                childRuntimeContext(
+                                        runtimeContext,
+                                        entry.depth(),
+                                        managerFor(runtimeContext)
+                                                .getDeclaration(entry.agentId())));
         if (agentOpt.isEmpty()) {
             log.warn(
                     "Failed to restore subagent from state: agentId={} not found in registry",
@@ -1160,6 +1264,8 @@ public class AgentSpawnTool {
         if (timeoutMs == 0) {
             String taskId = "task_" + UUID.randomUUID();
             final String capturedTask = task;
+            SandboxBackedFilesystem.SharedLease sharedLease =
+                    remote ? null : retainSharedSandbox(runtimeContext);
             TaskRunSpec spec;
             if (remote) {
                 SubagentDeclaration d = declOpt.get();
@@ -1181,15 +1287,23 @@ public class AgentSpawnTool {
                                                         .block();
                                         return reply != null ? reply.getTextContent() : "";
                                     } catch (RuntimeException e) {
-                                        return "Error: "
-                                                + (e.getMessage() != null
-                                                        ? e.getMessage()
-                                                        : e.getClass().getSimpleName());
+                                        throw e;
+                                    } finally {
+                                        closeSharedSandbox(sharedLease);
                                     }
                                 });
             }
-            taskRepository.putTask(
-                    runtimeContext, taskId, spawned.agentId(), parentSessionId, spec);
+            try {
+                BackgroundTask backgroundTask =
+                        taskRepository.putTask(
+                                runtimeContext, taskId, spawned.agentId(), parentSessionId, spec);
+                if (backgroundTask != null) {
+                    backgroundTask.onCompletion(() -> closeSharedSandbox(sharedLease));
+                }
+            } catch (RuntimeException e) {
+                closeSharedSandbox(sharedLease);
+                throw e;
+            }
             return Mono.just(
                     spawnInfo + "\n" + String.format(BG_RESULT_TEMPLATE, taskId, taskId, taskId));
         }

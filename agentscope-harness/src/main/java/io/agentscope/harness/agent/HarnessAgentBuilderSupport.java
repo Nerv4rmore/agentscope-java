@@ -35,6 +35,7 @@ import io.agentscope.harness.agent.filesystem.spec.LocalFilesystemSpec;
 import io.agentscope.harness.agent.memory.compaction.CompactionConfig;
 import io.agentscope.harness.agent.memory.compaction.ToolResultEvictionConfig;
 import io.agentscope.harness.agent.middleware.DynamicSubagentsMiddleware;
+import io.agentscope.harness.agent.middleware.HarnessRuntimeMiddleware;
 import io.agentscope.harness.agent.middleware.SubagentEntry;
 import io.agentscope.harness.agent.middleware.SubagentsMiddleware;
 import io.agentscope.harness.agent.subagent.AgentSpecLoader;
@@ -44,6 +45,7 @@ import io.agentscope.harness.agent.subagent.SubagentFactory;
 import io.agentscope.harness.agent.subagent.WorkspaceMode;
 import io.agentscope.harness.agent.subagent.task.TaskRepository;
 import io.agentscope.harness.agent.subagent.task.WorkspaceTaskRepository;
+import io.agentscope.harness.agent.tool.AgentSpawnTool;
 import io.agentscope.harness.agent.workspace.WorkspaceIndex;
 import io.agentscope.harness.agent.workspace.WorkspaceManager;
 import java.nio.file.Files;
@@ -380,7 +382,17 @@ final class HarnessAgentBuilderSupport {
         final Model capturedModel = b.model;
         final Toolkit capturedParentToolkit = b.toolkit != null ? b.toolkit.copy() : new Toolkit();
         final Function<String, Model> capturedResolver = b.modelResolver;
-        final List<MiddlewareBase> capturedMiddlewares = List.copyOf(b.middlewares);
+        // 过滤掉 HarnessRuntimeMiddleware 实例（如 SandboxLifecycleMiddleware）——
+        // 子 Agent 共享父 Agent 的沙箱代理（SandboxBackedFilesystem），但不应获得自己的
+        // SandboxLifecycleMiddleware，否则子 Agent 的 releaseForCall 会 setSandbox(null)
+        // 清空父 Agent 仍在使用的沙箱。父 Agent 的 acquireForCall 已绑定生命周期依赖，
+        // 子 Agent 直接复用已注入的 sandbox 即可。
+        final List<MiddlewareBase> capturedMiddlewares = new ArrayList<>();
+        for (MiddlewareBase mw : b.middlewares) {
+            if (mw != null && !(mw instanceof HarnessRuntimeMiddleware)) {
+                capturedMiddlewares.add(mw);
+            }
+        }
         final AbstractFilesystem capturedSharedBackend =
                 sandboxFs != null ? sandboxFs : b.abstractFilesystem;
         final boolean capturedUseLegacyXmlWorkspaceContext = b.useLegacyXmlWorkspaceContext;
@@ -407,9 +419,11 @@ final class HarnessAgentBuilderSupport {
                 capturedLocalFilesystemSpec = b.localFilesystemSpec;
         final List<AgentSkillRepository> capturedSkillRepos = List.copyOf(b.skillRepositories);
         final Path capturedProjectGlobalSkillsDir = b.projectGlobalSkillsDir;
-        // See buildGeneralPurposeFactory: propagate the parent's (distributed) state store so the
-        // subagent's conversation survives cross-node re-materialization. Null in local defaults.
         final io.agentscope.core.state.AgentStateStore capturedStateStore = b.stateStoreOverride;
+        final io.agentscope.harness.agent.bus.MessageBus capturedMessageBus = b.messageBus;
+        final io.agentscope.harness.agent.bus.AsyncToolRegistry capturedAsyncToolRegistry =
+                b.asyncToolRegistry;
+        final java.time.Duration capturedAsyncToolTimeout = b.asyncToolTimeout;
 
         return (RuntimeContext parentRc) -> {
             if (decl.isRemote()) {
@@ -439,13 +453,30 @@ final class HarnessAgentBuilderSupport {
                             .model(effectiveModel)
                             .toolkit(
                                     allowlistedInheritedToolkit(
-                                            capturedParentToolkit, decl.getTools()))
+                                            capturedParentToolkit,
+                                            decl.getTools(),
+                                            decl.getActivateToolGroups()))
                             .workspace(runtimeWorkspace)
                             .defaultSessionId(childSessionId)
-                            .maxIters(decl.getSteps())
-                            .asLeafSubagent()
-                            .useLegacyXmlWorkspaceContext(capturedUseLegacyXmlWorkspaceContext)
-                            .sysPrompt(buildSubagentSysPrompt(sysPromptBase));
+                            .maxIters(decl.getSteps());
+
+            // Conditionally mark as leaf: subagents with can_spawn=true AND spawn
+            // depth below the max can spawn their own sub-subagents. All others
+            // (can_spawn=false or depth-capped) are leaves — no agent_spawn tool.
+            int spawnDepth = readSpawnDepth(parentRc);
+            boolean leafSubagent = !decl.canSpawn() || spawnDepth >= AgentSpawnTool.MAX_SPAWN_DEPTH;
+            log.info(
+                    "Subagent '{}' build decision: depth={}, canSpawn={}, leaf={}",
+                    decl.getName(),
+                    spawnDepth,
+                    decl.canSpawn(),
+                    leafSubagent);
+            if (leafSubagent) {
+                sub.asLeafSubagent();
+            }
+
+            sub.useLegacyXmlWorkspaceContext(capturedUseLegacyXmlWorkspaceContext)
+                    .sysPrompt(buildSubagentSysPrompt(sysPromptBase));
 
             // Overlay declaration-specified temperature/topP on top of the parent's
             // GenerateOptions.
@@ -474,6 +505,15 @@ final class HarnessAgentBuilderSupport {
             if (capturedStateStore != null) {
                 sub.stateStore(capturedStateStore);
             }
+            if (decl.getWorkspaceMode() == WorkspaceMode.SHARED) {
+                if (capturedMessageBus != null) sub.messageBus(capturedMessageBus);
+                if (capturedAsyncToolRegistry != null) {
+                    sub.asyncToolRegistry(capturedAsyncToolRegistry);
+                }
+                if (capturedAsyncToolTimeout != null) {
+                    sub.asyncToolTimeout(capturedAsyncToolTimeout);
+                }
+            }
 
             if (capturedModelExec != null) sub.modelExecutionConfig(capturedModelExec);
             if (capturedToolExec != null) sub.toolExecutionConfig(capturedToolExec);
@@ -499,6 +539,18 @@ final class HarnessAgentBuilderSupport {
             sub.middlewares(capturedMiddlewares);
             return sub.build();
         };
+    }
+
+    /**
+     * Reads the spawn depth from the parent's {@link RuntimeContext}, stored there by
+     * {@link AgentSpawnTool#agentSpawn}. Returns 0 if absent (top-level agent).
+     */
+    private static int readSpawnDepth(RuntimeContext parentRc) {
+        if (parentRc == null) {
+            return 0;
+        }
+        Integer depth = parentRc.get(AgentSpawnTool.CTX_SPAWN_DEPTH, Integer.class);
+        return depth != null ? depth : 0;
     }
 
     /**
@@ -545,9 +597,34 @@ final class HarnessAgentBuilderSupport {
         return spec;
     }
 
-    /** Returns a defensive copy of inherited parent tools filtered by the optional allowlist. */
-    static Toolkit allowlistedInheritedToolkit(Toolkit parentToolkit, List<String> allowlist) {
+    /**
+     * Returns a defensive copy of inherited parent tools, with {@code activateGroups} force-activated
+     * and then filtered by the optional allowlist.
+     *
+     * <p>{@code activateGroups} exists because {@code parentToolkit} is a snapshot captured at parent
+     * BUILD time, when every skill-gated group is still inactive. Only ACTIVE tools reach
+     * {@link Toolkit#getToolSchemas()} and therefore the model, so a gated tool would otherwise be
+     * permanently invisible to a subagent that never calls {@code load_skill_through_path} itself.
+     *
+     * <p>Activation runs BEFORE allowlist filtering deliberately: the {@code tools} allowlist stays
+     * the single source of truth for what the subagent can see. A group activated here whose tools
+     * are absent from a non-empty allowlist is still removed.
+     */
+    static Toolkit allowlistedInheritedToolkit(
+            Toolkit parentToolkit, List<String> allowlist, List<String> activateGroups) {
         Toolkit toolkit = parentToolkit != null ? parentToolkit.copy() : new Toolkit();
+        if (activateGroups != null && !activateGroups.isEmpty()) {
+            try {
+                toolkit.updateToolGroups(activateGroups, true);
+            } catch (Exception ex) {
+                // A misspelled or absent group must not abort the spawn — the subagent simply
+                // does not get those tools, which surfaces as the pre-existing behaviour.
+                log.warn(
+                        "Failed to activate tool groups {} on subagent toolkit: {}",
+                        activateGroups,
+                        ex.toString());
+            }
+        }
         if (allowlist == null || allowlist.isEmpty()) {
             return toolkit;
         }

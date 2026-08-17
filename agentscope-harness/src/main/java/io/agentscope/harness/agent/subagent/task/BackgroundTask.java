@@ -141,6 +141,13 @@ public class BackgroundTask {
         }
     }
 
+    /** Registers a callback that runs for success, failure, or cancellation. */
+    public void onCompletion(Runnable callback) {
+        if (callback != null) {
+            future.whenComplete((result, error) -> callback.run());
+        }
+    }
+
     /**
      * Cancels the task. Sets the internal cancelled flag so that {@link #getTaskStatus()} returns
      * {@link TaskStatus#CANCELLED} even if the future cannot be interrupted.

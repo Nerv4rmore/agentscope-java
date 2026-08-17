@@ -129,7 +129,7 @@ public class SandboxManager {
                             state.setWorkspaceSpec(sandboxContext.getWorkspaceSpec().copy());
                         }
                         // Per-call options 同样传入 resume：后端据此把本次调用的工作区根
-                        //（如会话级工作目录）应用到复用的沙箱 state 上
+                        // （如会话级工作目录）应用到复用的沙箱 state 上
                         Sandbox sandbox =
                                 typedClient()
                                         .resume(

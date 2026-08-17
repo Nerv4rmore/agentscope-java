@@ -1135,6 +1135,17 @@ public class HarnessAgent implements Agent, AutoCloseable {
         RemoteFilesystemSpec remoteFilesystemSpec;
         LocalFilesystemSpec localFilesystemSpec;
 
+        /**
+         * 预创建的共享沙箱文件系统代理。设置后，{@code build()} 会复用此实例而非 new 一个新的，
+         * 使父 Agent 和 SHARED 模式子 Agent 共享同一个 {@link SandboxBackedFilesystem}——
+         * 子 Agent 看到父 Agent 在沙箱中写的文件，反之亦然。
+         *
+         * <p>调用方应在 {@code buildSubagentEntries} 之前创建此实例并通过
+         * {@link #precreatedSandboxFs(SandboxBackedFilesystem)} 注入，同时传给双参数版
+         * {@code buildSubagentEntries(workspace, sandboxFs)} 以便子 Agent 工厂闭包捕获它。
+         */
+        SandboxBackedFilesystem precreatedSandboxFs;
+
         // AgentStateStore — mirrored only to pass through to inner; the user-set AgentStateStore
         // can also be replaced inside orchestration when none is provided (defaults to a
         // JsonFileAgentStateStore rooted at ~/.agentscope/state/<agentId>/, outside any workspace).
@@ -1632,6 +1643,16 @@ public class HarnessAgent implements Agent, AutoCloseable {
         /** Configures Mode 2 — sandbox filesystem. */
         public Builder filesystem(SandboxFilesystemSpec spec) {
             this.sandboxFilesystemSpec = spec;
+            return this;
+        }
+
+        /**
+         * 注入预创建的共享沙箱文件系统代理。设置后 {@code build()} 会复用此实例而非 new
+         * 一个新的，使父 Agent 与 SHARED 模式子 Agent 共享同一个沙箱。必须配合双参数版
+         * {@code buildSubagentEntries(workspace, sandboxFs)} 使用。
+         */
+        public Builder precreatedSandboxFs(SandboxBackedFilesystem fs) {
+            this.precreatedSandboxFs = fs;
             return this;
         }
 
@@ -2162,7 +2183,10 @@ public class HarnessAgent implements Agent, AutoCloseable {
             SandboxContext defaultSandboxContext = null;
             SandboxBackedFilesystem capturedSandboxFs = null;
             if (sandboxFilesystemSpec != null) {
-                capturedSandboxFs = new SandboxBackedFilesystem();
+                capturedSandboxFs =
+                        precreatedSandboxFs != null
+                                ? precreatedSandboxFs
+                                : new SandboxBackedFilesystem();
                 filesystem = capturedSandboxFs;
 
                 defaultSandboxContext = sandboxFilesystemSpec.toSandboxContext(resolvedWorkspace);

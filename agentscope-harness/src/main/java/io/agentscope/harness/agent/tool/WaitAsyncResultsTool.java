@@ -47,7 +47,11 @@ public class WaitAsyncResultsTool {
     private static final Logger log = LoggerFactory.getLogger(WaitAsyncResultsTool.class);
     private static final int DEFAULT_TIMEOUT_SECONDS = 60;
     private static final int MAX_TIMEOUT_SECONDS = 120;
-    private static final int MAX_CONSECUTIVE_EMPTY_WAITS = 2;
+    // 10 × 120s = 20 min max waiting capacity — covers the longest subagent
+    // (slide-designer: 38 iterations, 53 tool calls, ~20 min). The previous
+    // value of 2 (4 min) was exhausted after the first subagent, blocking all
+    // subsequent waits for the second subagent.
+    private static final int MAX_CONSECUTIVE_EMPTY_WAITS = 10;
     private static final long POLL_INTERVAL_MS = 3000;
 
     private final MessageBus messageBus;

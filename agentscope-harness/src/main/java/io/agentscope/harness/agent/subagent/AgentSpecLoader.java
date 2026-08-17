@@ -304,9 +304,11 @@ public final class AgentSpecLoader {
             topP = asDouble(fm.get("topP"));
         }
         String variant = asString(fm.get("variant"));
+        String modelTier = asString(fm.get("model_tier"));
 
         SubagentDeclaration.Mode declMode = parseDeclarationMode(asString(fm.get("mode")), name);
         boolean hidden = asBoolean(fm.get("hidden"), false);
+        boolean canSpawn = asBoolean(fm.get("can_spawn"), false);
         Boolean exposeToUser = asNullableBoolean(fm.get("expose_to_user"));
         if (exposeToUser == null) {
             exposeToUser = asNullableBoolean(fm.get("exposeToUser"));
@@ -314,6 +316,10 @@ public final class AgentSpecLoader {
 
         List<String> tools = parseToolNames(asString(fm.get("tools")));
         List<String> skills = parseToolNames(asString(fm.get("skills")));
+        // Skill-gated tool groups to force-activate on the subagent's toolkit at spawn time.
+        // Needed because the subagent toolkit is a build-time snapshot in which every gated group
+        // is still inactive, and only ACTIVE tools reach the model's schema list.
+        List<String> activateToolGroups = parseToolNames(asString(fm.get("activate_tool_groups")));
 
         SubagentDeclaration.Builder builder =
                 SubagentDeclaration.builder()
@@ -321,15 +327,19 @@ public final class AgentSpecLoader {
                         .description(description)
                         .workspaceMode(mode)
                         .model(model)
+                        .modelTier(modelTier)
                         .steps(steps)
                         .temperature(temperature)
                         .topP(topP)
                         .variant(variant)
                         .mode(declMode)
                         .hidden(hidden)
+                        .canSpawn(canSpawn)
                         .exposeToUser(exposeToUser)
                         .tools(tools.isEmpty() ? null : tools)
-                        .skills(skills.isEmpty() ? null : skills);
+                        .skills(skills.isEmpty() ? null : skills)
+                        .activateToolGroups(
+                                activateToolGroups.isEmpty() ? null : activateToolGroups);
 
         if (workspacePath != null) {
             builder.workspace(workspacePath);

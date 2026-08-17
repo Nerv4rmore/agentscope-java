@@ -31,6 +31,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -66,6 +67,87 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
     // 本次调用懒创建产生的 AcquireResult；未创建沙箱时为 null。release 时消费。
     private volatile SandboxAcquireResult lazyAcquireResult;
 
+    /** Coordinates parent cleanup with detached shared child work. */
+    private final Object lifecycleLock = new Object();
+
+    private int retainedAsyncCalls;
+    private boolean releaseRequested;
+    private boolean releaseCompleted;
+    private Runnable pendingRelease;
+
+    /** A counted reference that keeps this filesystem alive until detached work finishes. */
+    public final class SharedLease implements AutoCloseable {
+        private boolean closed;
+
+        private SharedLease() {}
+
+        @Override
+        public void close() {
+            Runnable releaseAction;
+            synchronized (lifecycleLock) {
+                if (closed) {
+                    return;
+                }
+                closed = true;
+                retainedAsyncCalls--;
+                releaseAction = takePendingReleaseIfReady();
+            }
+            runReleaseAction(releaseAction);
+        }
+    }
+
+    /** Retains this filesystem while a detached local child can outlive its parent call. */
+    public SharedLease retainForAsync() {
+        synchronized (lifecycleLock) {
+            if (releaseCompleted) {
+                throw new IllegalStateException(
+                        "Sandbox filesystem call has already been released");
+            }
+            retainedAsyncCalls++;
+            log.debug("[sandbox-diag] shared retain: refs={}", retainedAsyncCalls);
+            return new SharedLease();
+        }
+    }
+
+    /** Requests parent cleanup, deferring it while detached child references remain. */
+    public void requestRelease(Runnable releaseAction) {
+        Runnable ready;
+        synchronized (lifecycleLock) {
+            if (releaseRequested) {
+                return;
+            }
+            releaseRequested = true;
+            pendingRelease = releaseAction;
+            ready = takePendingReleaseIfReady();
+            log.info("[sandbox-diag] shared release requested: refs={}", retainedAsyncCalls);
+        }
+        runReleaseAction(ready);
+    }
+
+    private Runnable takePendingReleaseIfReady() {
+        if (!releaseRequested || retainedAsyncCalls != 0 || releaseCompleted) {
+            return null;
+        }
+        releaseCompleted = true;
+        Runnable action = pendingRelease;
+        pendingRelease = null;
+        return action;
+    }
+
+    private void runReleaseAction(Runnable action) {
+        if (action != null) {
+            action.run();
+        }
+    }
+
+    // 连续“不健康” execute 失败计数（exitCode=-1 且无任何输出）。达到阈值后熔断：
+    // 不再透传裸退出码，而是返回明确的止损文本，避免模型把沙箱已死误判为
+    // “命令写错”而无限重试探测命令（sess-dec89eb5 事故：echo/ls/pwd 重试 11 轮）。
+    private final AtomicInteger consecutiveUnhealthyExecs = new AtomicInteger();
+
+    /** 触发熔断的连续不健康失败次数阈值。 */
+    private static final int UNHEALTHY_EXEC_CIRCUIT_BREAK_THRESHOLD = 3;
+
     public SandboxBackedFilesystem() {
         this.fsId = "sandbox-" + UUID.randomUUID().toString().substring(0, 8);
     }
@@ -73,6 +155,11 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
     @Override
     public void setSandbox(Sandbox sandbox) {
         this.sandbox = sandbox;
+        // 新沙箱注入时（新一轮调用或重新 acquire）清零熔断计数，
+        // 让新实例从干净状态开始，避免跨调用误伤
+        if (sandbox != null) {
+            consecutiveUnhealthyExecs.set(0);
+        }
     }
 
     @Override
@@ -89,6 +176,17 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
      * @param sandboxContext 当前调用的沙箱配置（从 RuntimeContext 取出）
      */
     public void bindLifecycle(SandboxManager sandboxManager, SandboxContext sandboxContext) {
+        synchronized (lifecycleLock) {
+            if (releaseCompleted) {
+                releaseRequested = false;
+                releaseCompleted = false;
+                pendingRelease = null;
+            } else if (releaseRequested) {
+                throw new IllegalStateException(
+                        "Cannot bind a new sandbox call while detached shared work is still"
+                                + " active");
+            }
+        }
         this.sandboxManager = sandboxManager;
         this.sandboxContext = sandboxContext;
         this.lazyAcquireResult = null;
@@ -128,6 +226,8 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
                         : command);
         try {
             ExecResult result = active.exec(runtimeContext, command, timeoutSeconds);
+            // 命令通道正常应答（无论业务成败），清零不健康计数
+            consecutiveUnhealthyExecs.set(0);
             // 诊断：execute 成功，记录退出码
             log.info(
                     "[sandbox-diag] execute OK: exitCode={}, truncated={}",
@@ -136,18 +236,47 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
             return new ExecuteResponse(
                     result.combinedOutput(), result.exitCode(), result.truncated());
         } catch (SandboxException.ExecTimeoutException e) {
+            // 超时说明命令通道至少接受了命令，不计为不健康
+            consecutiveUnhealthyExecs.set(0);
             log.warn("[sandbox-diag] execute TIMEOUT: cmd={}", command);
             return new ExecuteResponse(e.getMessage(), 124, false);
         } catch (SandboxException.ExecException e) {
-            log.warn(
-                    "[sandbox-diag] execute EXEC ERROR: exitCode={}, msg={}",
-                    e.getExitCode(),
-                    e.getMessage());
             String combined =
                     (e.getStdout() != null ? e.getStdout() : "")
                             + (e.getStderr() != null && !e.getStderr().isBlank()
                                     ? "\n" + e.getStderr()
                                     : "");
+            // 熔断判定：exitCode=-1 且无输出是“沙箱不健康”信号而非普通命令失败。
+            // 连续达到阈值后返回明确的英文止损文本，让模型停止重试而不是烧迭代。
+            boolean unhealthy = e.getExitCode() == -1 && combined.isBlank();
+            if (unhealthy) {
+                int count = consecutiveUnhealthyExecs.incrementAndGet();
+                if (count >= UNHEALTHY_EXEC_CIRCUIT_BREAK_THRESHOLD) {
+                    log.error(
+                            "[sandbox-diag] execute CIRCUIT BREAK: {} consecutive unhealthy"
+                                    + " execs (exitCode=-1, empty output); refusing further"
+                                    + " retries. cmd={}",
+                            count,
+                            command);
+                    return new ExecuteResponse(
+                            "Sandbox is unavailable (instance unhealthy: every command returns"
+                                    + " exit code -1 with no output, and automatic recreation"
+                                    + " did not recover it). Do NOT retry execute — the shell"
+                                    + " cannot recover in this call. Stop using shell commands,"
+                                    + " finish with whatever files you already have, and tell"
+                                    + " the user the sandbox environment is currently"
+                                    + " unavailable.",
+                            e.getExitCode(),
+                            false);
+                }
+            } else {
+                // 普通命令失败（带退出码或输出）说明通道存活，重置计数
+                consecutiveUnhealthyExecs.set(0);
+            }
+            log.warn(
+                    "[sandbox-diag] execute EXEC ERROR: exitCode={}, msg={}",
+                    e.getExitCode(),
+                    e.getMessage());
             return new ExecuteResponse(combined, e.getExitCode(), false);
         } catch (Exception e) {
             // 诊断：execute 异常被吞成 ExecuteResponse（模型看到错误文本而非抛异常，

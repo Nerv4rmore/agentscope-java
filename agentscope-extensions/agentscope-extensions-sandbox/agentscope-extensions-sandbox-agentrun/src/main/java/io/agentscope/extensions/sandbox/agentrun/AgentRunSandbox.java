@@ -52,6 +52,12 @@ public class AgentRunSandbox extends AbstractBaseSandbox {
     private static final int OUTPUT_TRUNCATE_BYTES = 512 * 1024;
     private static final int SANDBOX_READY_WAIT_SECONDS = 60;
     private static final String WS_TAR_PATH = "/tmp/agentscope-ws.tar";
+    // createAndReady 的最大“创建+探活”尝试次数（首次 + 探活失败后再重建一次）
+    private static final int CREATE_MAX_ATTEMPTS = 2;
+    // 重建后验证 exec 通道是否真正可用的探活命令（无副作用，任意镜像均可用）
+    private static final String PROBE_COMMAND = "echo __agentscope_sandbox_probe__";
+    // 探活命令的预期输出内容
+    private static final String PROBE_EXPECTED = "__agentscope_sandbox_probe__";
 
     private final AgentRunSandboxState arState;
     private final AgentRunSandboxClientOptions options;
@@ -165,6 +171,47 @@ public class AgentRunSandbox extends AbstractBaseSandbox {
     }
 
     private void createAndReady(String sandboxId) throws Exception {
+        Exception lastProbeFailure = null;
+        for (int attempt = 1; attempt <= CREATE_MAX_ATTEMPTS; attempt++) {
+            createOnce(sandboxId);
+            // 探活：实例状态 READY 不代表命令通道可用（sess-dec89eb5 事故：重建
+            // “成功”后所有 execute 返回 exitCode=-1 无输出，模型空转 11 轮）。
+            // 探活失败则删除重建，最多 CREATE_MAX_ATTEMPTS 次。
+            Exception probeError = probeExecOrNull();
+            if (probeError == null) {
+                if (attempt > 1) {
+                    log.info(
+                            "[sandbox-diag] createAndReady: exec probe OK after {} attempts",
+                            attempt);
+                }
+                return;
+            }
+            lastProbeFailure = probeError;
+            log.warn(
+                    "[sandbox-diag] createAndReady: exec probe FAILED (attempt {}/{}), will"
+                            + " recreate. error={}",
+                    attempt,
+                    CREATE_MAX_ATTEMPTS,
+                    probeError.getMessage());
+            // 重建前清理“假活”实例，避免残留
+            try {
+                http.deleteSandbox(arState.getSandboxId());
+            } catch (Exception delErr) {
+                log.warn(
+                        "[sandbox-agentrun] delete unhealthy instance failed (ignoring): {}",
+                        delErr.getMessage());
+            }
+        }
+        throw new SandboxException.SandboxRuntimeException(
+                SandboxErrorCode.EXEC_TIMEOUT,
+                "Sandbox exec channel unhealthy after "
+                        + CREATE_MAX_ATTEMPTS
+                        + " recreate attempts: "
+                        + (lastProbeFailure != null ? lastProbeFailure.getMessage() : "unknown"));
+    }
+
+    /** 单次创建实例并等待状态 READY（不含 exec 通道探活）。 */
+    private void createOnce(String sandboxId) throws Exception {
         com.fasterxml.jackson.databind.JsonNode resp = http.createSandbox(sandboxId);
         // 若 API 返回了不同的 sandboxId，更新 state（通常返回值与请求一致）
         if (resp != null && resp.has("sandboxId")) {
@@ -178,6 +225,21 @@ public class AgentRunSandbox extends AbstractBaseSandbox {
             }
         }
         http.waitUntilReady(arState.getSandboxId(), SANDBOX_READY_WAIT_SECONDS);
+    }
+
+    /** 探测 exec 通道是否真正可用：可用返回 null，否则返回失败异常。 */
+    private Exception probeExecOrNull() {
+        try {
+            ExecResult r = http.exec(arState.getSandboxId(), PROBE_COMMAND, null, 10);
+            String out =
+                    (r.stdout() != null ? r.stdout() : "") + (r.stderr() != null ? r.stderr() : "");
+            if (r.exitCode() == 0 && out.contains(PROBE_EXPECTED)) {
+                return null;
+            }
+            return new SandboxException.ExecException(r.exitCode(), r.stdout(), r.stderr());
+        } catch (Exception e) {
+            return e;
+        }
     }
 
     @Override
@@ -242,8 +304,47 @@ public class AgentRunSandbox extends AbstractBaseSandbox {
                 ensureSandboxInstance();
                 return execOnce(arState.getSandboxId(), command, timeoutSeconds);
             }
+            // “假活”实例：状态仍是 READY 但内部命令通道已死（HTTP 200 + exitCode=-1 +
+            // 无输出）。此时 ensureSandboxInstance 会看到 READY 而直接复用，必须强制
+            // delete + 重建（含探活）后重试一次。sess-dec89eb5 事故：该失败曾被当作
+            // 普通命令失败直接抛出，从此再也不会触发第二次重建，模型重试 11 轮烧光
+            // 迭代预算。
+            if (isUnhealthyExec(e)) {
+                log.warn(
+                        "[sandbox-agentrun] doExec: unhealthy exec channel (exitCode=-1, empty"
+                                + " output), force recreating instance sandboxId={}",
+                        sandboxId);
+                arState.setWorkspaceRootReady(false);
+                arState.setWorkspaceProjectionHash(null);
+                try {
+                    http.deleteSandbox(sandboxId);
+                } catch (Exception delErr) {
+                    log.warn(
+                            "[sandbox-agentrun] delete before force recreate failed (ignoring):"
+                                    + " {}",
+                            delErr.getMessage());
+                }
+                createAndReady(sandboxId);
+                return execOnce(arState.getSandboxId(), command, timeoutSeconds);
+            }
             throw e;
         }
+    }
+
+    /**
+     * 判定“假活”实例的 exec 失败：HTTP 200 但 exitCode=-1 且 stdout/stderr 均为空。普通
+     * 命令失败会携带退出码与输出，只有命令通道本身死亡才会表现为 -1 无输出。
+     */
+    private static boolean isUnhealthyExec(Exception e) {
+        if (!(e instanceof SandboxException.ExecException exec)) {
+            return false;
+        }
+        if (exec.getExitCode() != -1) {
+            return false;
+        }
+        String out = exec.getStdout();
+        String err = exec.getStderr();
+        return (out == null || out.isBlank()) && (err == null || err.isBlank());
     }
 
     private ExecResult execOnce(String sandboxId, String command, int timeoutSeconds)
