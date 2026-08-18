@@ -27,17 +27,13 @@ import io.agentscope.core.util.JsonUtils;
 import io.agentscope.harness.agent.filesystem.AbstractFilesystem;
 import io.agentscope.harness.agent.filesystem.sandbox.AbstractSandboxFilesystem;
 import io.agentscope.harness.agent.memory.compaction.ConversationCompactor;
-import io.agentscope.harness.agent.memory.session.SessionEntry;
-import io.agentscope.harness.agent.memory.session.SessionTree;
+import io.agentscope.harness.agent.memory.session.SessionTranscriptWriter;
 import io.agentscope.harness.agent.workspace.WorkspaceConstants;
 import io.agentscope.harness.agent.workspace.WorkspaceManager;
-import java.nio.file.Path;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.List;
-import java.util.Set;
 import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -193,34 +189,34 @@ public class MemoryFlushManager {
      * Returns the string path of the session JSONL file where messages for the given agent and
      * session are offloaded. Used by the compaction layer to embed the archive location in the
      * summary message so the agent can retrieve full history if needed.
+     *
+     * @deprecated Prefer {@link SessionTranscriptWriter#resolveContextPath}.
      */
+    @Deprecated
     public String resolveOffloadPath(RuntimeContext rc, String agentId, String sessionId) {
-        try {
-            Path p = workspaceManager.resolveSessionContextFile(rc, agentId, sessionId);
-            return p != null ? p.toString() : "";
-        } catch (Exception e) {
-            log.debug(
-                    "Could not resolve offload path for agent={}, session={}: {}",
-                    agentId,
-                    sessionId,
-                    e.getMessage());
-            return "";
-        }
+        return new SessionTranscriptWriter(workspaceManager)
+                .resolveContextPath(rc, agentId, sessionId);
     }
 
     /**
      * Offloads raw messages to the JSONL session tree.
+     *
+     * @deprecated Prefer {@link SessionTranscriptWriter#appendMessages}. Kept as a thin
+     *     delegate so compaction / overflow-recovery call sites keep compiling during the
+     *     migration; new code should use {@link SessionTranscriptWriter} directly.
      */
+    @Deprecated
     public void offloadMessages(
             RuntimeContext rc, List<Msg> messages, String agentId, String sessionId) {
-        offloadToSessionTree(rc, messages, agentId, sessionId);
-
+        new SessionTranscriptWriter(workspaceManager)
+                .appendMessages(rc, messages, agentId, sessionId);
         log.debug(
                 "Offloaded {} messages for agent={}, session={}",
                 messages.size(),
                 agentId,
                 sessionId);
         workspaceManager.updateSessionIndex(rc, agentId, sessionId, "conversation offloaded");
+        offloadToSessionTree(rc, messages, agentId, sessionId);
     }
 
     private void offloadToSessionTree(

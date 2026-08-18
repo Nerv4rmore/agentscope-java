@@ -242,6 +242,13 @@ class ToolExecutor {
             return Mono.just(ToolResultBlock.error(errorMsg));
         }
 
+        // External tool short-circuit: once availability and schema are validated, surface the call
+        // without preset injection or local invocation. SchemaOnlyTool and any
+        // @Tool(externalTool=true) method end up here.
+        if (tool instanceof ToolBase tb && tb.isExternalTool()) {
+            return Mono.just(ToolResultBlock.suspended(toolCall));
+        }
+
         // Merge runtime context: param-level > toolkit default
         io.agentscope.core.agent.RuntimeContext runtimeContext = param.getRuntimeContext();
         @SuppressWarnings("deprecation")
