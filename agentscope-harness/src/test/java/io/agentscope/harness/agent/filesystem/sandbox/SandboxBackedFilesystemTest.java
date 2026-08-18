@@ -356,6 +356,10 @@ class SandboxBackedFilesystemTest {
         private FakeSandbox() {
             super(new ExecResult(0, "", "", false));
         }
+
+        private FakeSandbox(ExecResult execResult) {
+            super(execResult);
+        }
     }
 
     private static class BaseFakeSandbox implements Sandbox {

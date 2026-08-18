@@ -203,7 +203,8 @@ public class MemoryFlushMiddleware implements HarnessRuntimeMiddleware {
                         flushMono = Mono.empty();
                     }
 
-                    // Message offload is owned by TranscriptMiddleware (independent of memory flush).
+                    // Message offload is owned by TranscriptMiddleware (independent of memory
+                    // flush).
                     return flushMono;
                 });
     }
