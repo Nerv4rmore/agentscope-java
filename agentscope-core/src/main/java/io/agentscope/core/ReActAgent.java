@@ -2743,15 +2743,10 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
 
                                 if (successPairs.isEmpty()) {
                                     if (!pendingPairs.isEmpty()) {
-                                        // 外部工具暂停：发出 RequireExternalExecutionEvent，
-                                        // 前端收到 hitl.options 后渲染选项表单，
-                                        // 用户确认后 POST /chat/confirm 恢复会话。
-                                        publishEvent(
-                                                new RequireExternalExecutionEvent(
-                                                        replyId,
-                                                        pendingPairs.stream()
-                                                                .map(Map.Entry::getKey)
-                                                                .toList()));
+                                        // 外部工具暂停：RequireExternalExecutionEvent 已在
+                                        // runToolBatch 的事件流内紧随挂起工具的 ToolResultEndEvent
+                                        // 发出（经 actingStream 的 doOnNext(publishEvent) 发布），
+                                        // 此处不再重复 publish，否则前端 hitl.options 会收到两遍。
                                         return Mono.just(buildSuspendedMsg(pendingPairs));
                                     }
                                     return executeIteration(iter + 1);
@@ -2771,17 +2766,9 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                                                     }
 
                                                     if (!pendingPairs.isEmpty()) {
-                                                        // 部分工具成功、部分外部工具暂停：
-                                                        // 发出 RequireExternalExecutionEvent 通知前端，
-                                                        // 然后暂停 Agent 等待用户确认。
-                                                        publishEvent(
-                                                                new RequireExternalExecutionEvent(
-                                                                        replyId,
-                                                                        pendingPairs.stream()
-                                                                                .map(
-                                                                                        Map.Entry
-                                                                                                ::getKey)
-                                                                                .toList()));
+                                                        // 部分工具成功、部分外部工具暂停：事件已由
+                                                        // runToolBatch 的事件流发出（见上方分支注释），
+                                                        // 此处不重复 publish，直接暂停等待用户确认。
                                                         return Mono.just(
                                                                 buildSuspendedMsg(pendingPairs));
                                                     }
