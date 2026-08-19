@@ -100,6 +100,22 @@ public class CompactionConfig {
             ## SUMMARY
             The most important context, decisions, reasoning, and rejected options.
 
+            ## USER DECISIONS
+            All choices, confirmations, and approvals the user has already provided via \
+            confirmation cards (tool results containing "approved", "skipped", or "instruction" \
+            fields). For each, record:
+            - The specific option values the user selected or confirmed (not just that a choice \
+            was made — record the actual values, e.g. "purpose: 科普/兴趣分享, length: Short 5-10, ...")
+            - Whether the user approved (confirmed), rejected (denied), or skipped
+            - If the tool result text was truncated and you can see "approved": true but not all \
+            option values, still record "user has confirmed" with whatever values are visible — \
+            never summarize an already-confirmed decision as "not yet provided" or "pending"
+
+            CRITICAL: Distinguish between decisions the user has ALREADY made versus requests \
+            still PENDING the user's response. If a tool result contains "approved": true or \
+            "skipped": true, the user has responded — mark it as confirmed/skipped, never as \
+            "awaiting user input".
+
             ## ARTIFACTS
             Files or resources created, modified, or accessed (with specific paths and changes).
 

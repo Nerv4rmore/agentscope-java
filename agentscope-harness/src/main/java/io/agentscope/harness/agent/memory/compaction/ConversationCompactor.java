@@ -64,6 +64,22 @@ public class ConversationCompactor {
     /** Marker stored in message name to identify injected summary messages. */
     public static final String SUMMARY_MSG_NAME = "__compaction_summary__";
 
+    /**
+     * Max chars of a regular tool result rendered into the summarization prompt. Keeps the
+     * summary input bounded for large command outputs.
+     */
+    private static final int TOOL_RESULT_SUMMARY_MAX_CHARS = 500;
+
+    /**
+     * Relaxed char limit for human-in-the-loop confirmation results (tool results carrying
+     * user-approved option values). These results contain the user's actual decisions as JSON
+     * (options + approvedOptions + instruction) and typically run 800-1500 chars; truncating at
+     * the regular 500-char limit hides the very values the summary must preserve. Detecting them
+     * by the "approved" / "skipped" content markers (set by the gateway's confirmation result
+     * builder) avoids coupling the framework to application-specific tool names.
+     */
+    private static final int HITL_RESULT_SUMMARY_MAX_CHARS = 4000;
+
     private final Model model;
     private final MemoryFlushManager flushManager;
 
@@ -433,7 +449,11 @@ public class ConversationCompactor {
                         .append(tr.getName() != null ? tr.getName() : "?")
                         .append("] ");
                 if (!text.isBlank()) {
-                    sb.append(text.length() > 500 ? text.substring(0, 500) + "..." : text);
+                    int limit =
+                            isHitlConfirmationResult(text)
+                                    ? HITL_RESULT_SUMMARY_MAX_CHARS
+                                    : TOOL_RESULT_SUMMARY_MAX_CHARS;
+                    sb.append(text.length() > limit ? text.substring(0, limit) + "..." : text);
                 }
             }
         }
@@ -447,6 +467,16 @@ public class ConversationCompactor {
                 .map(b -> ((TextBlock) b).getText())
                 .filter(t -> t != null && !t.isBlank())
                 .collect(Collectors.joining(" "));
+    }
+
+    /**
+     * Detects human-in-the-loop confirmation results by their content markers. The gateway's
+     * confirmation result builders hardcode {@code "approved"} (approved/denied) or
+     * {@code "skipped"} into the tool result JSON, so checking for these substrings identifies
+     * user-decision results without coupling the framework to application-specific tool names.
+     */
+    private static boolean isHitlConfirmationResult(String text) {
+        return text.contains("\"approved\"") || text.contains("\"skipped\"");
     }
 
     // -------------------------------------------------------------------------
