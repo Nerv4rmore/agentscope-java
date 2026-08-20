@@ -163,7 +163,9 @@ public class SandboxLifecycleMiddleware implements HarnessRuntimeMiddleware {
             return;
         }
         // 常规路径：仅绑定懒创建依赖，沙箱将在首次文件系统操作时按需创建。
-        filesystemProxy.bindLifecycle(sandboxManager, sandboxContext);
+        // 同时快照本次调用的 RuntimeContext：子 Agent 构建期操作（如读 tools.json）可能
+        // 用空 ctx 触发懒创建，requireSandbox 需要该快照兜底解析隔离键与会话工作区根。
+        filesystemProxy.bindLifecycle(sandboxManager, sandboxContext, ctx);
         log.debug("[sandbox-mw] Bound lazy sandbox creation dependencies (no sandbox created yet)");
     }
 

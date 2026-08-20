@@ -76,6 +76,11 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
     // 供 requireSandbox 在首次需要沙箱时按需 acquire + start。
     private volatile SandboxManager sandboxManager;
     private volatile SandboxContext sandboxContext;
+    // 本次调用的 RuntimeContext 快照（携带 userId/sessionId 与会话工作区根等 per-call 属性）。
+    // 兜底场景：子 Agent 构建期操作（如 ToolsConfigLoader 读 tools.json）用
+    // RuntimeContext.empty() 触发懒创建时，工具层 ctx 缺失身份信息，若直接透传会导致
+    // SandboxManager 无法解析隔离键、创建出无会话目录的裸沙箱。见 requireSandbox。
+    private volatile RuntimeContext boundCallContext;
     // 本次调用懒创建产生的 AcquireResult；未创建沙箱时为 null。release 时消费。
     private volatile SandboxAcquireResult lazyAcquireResult;
 
@@ -186,8 +191,11 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
      *
      * @param sandboxManager 沙箱生命周期管理器（acquire/release）
      * @param sandboxContext 当前调用的沙箱配置（从 RuntimeContext 取出）
+     * @param callContext 当前调用的 RuntimeContext 快照（携带 userId/sessionId 与会话工作区
+     *     根），供懒创建时兜底使用；可为 {@code null}
      */
-    public void bindLifecycle(SandboxManager sandboxManager, SandboxContext sandboxContext) {
+    public void bindLifecycle(
+            SandboxManager sandboxManager, SandboxContext sandboxContext, RuntimeContext callContext) {
         synchronized (lifecycleLock) {
             if (releaseCompleted) {
                 releaseRequested = false;
@@ -201,6 +209,7 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
         }
         this.sandboxManager = sandboxManager;
         this.sandboxContext = sandboxContext;
+        this.boundCallContext = callContext;
         this.lazyAcquireResult = null;
     }
 
@@ -461,6 +470,23 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
             throw new SandboxException.SandboxConfigurationException(
                     "No active sandbox — sandbox context not bound for lazy creation");
         }
+        // 兜底：工具层传入的 runtimeContext 可能缺失身份信息（典型场景：子 Agent 构建期
+        // ToolsConfigLoader 用 RuntimeContext.empty() 读 tools.json 触发懒创建）。此时若直接
+        // 透传空 ctx，SandboxManager 将解析不出隔离键与会话工作区根，创建出无会话目录的
+        // 裸沙箱。缺失时回退到 acquireForCall 绑定的本次调用 RuntimeContext 快照。
+        RuntimeContext effectiveRc = runtimeContext;
+        RuntimeContext bound = boundCallContext;
+        if (bound != null
+                && (effectiveRc == null
+                        || (effectiveRc.getUserId() == null
+                                && effectiveRc.getSessionId() == null))) {
+            log.info(
+                    "[sandbox-diag] requireSandbox: tool-layer runtimeContext lacks identity,"
+                            + " falling back to bound call context (userId={}, sessionId={})",
+                    bound.getUserId(),
+                    bound.getSessionId());
+            effectiveRc = bound;
+        }
         // 诊断：懒创建入口，记录当前 sandbox 为 null，将触发 acquire（Priority 3 resume 或 4 create）
         log.info(
                 "[sandbox-diag] requireSandbox LAZY CREATE: sandbox==null, manager={}, ctx={}",
@@ -476,7 +502,7 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
                 return s;
             }
             try {
-                SandboxAcquireResult result = manager.acquire(ctx, runtimeContext);
+                SandboxAcquireResult result = manager.acquire(ctx, effectiveRc);
                 Sandbox acquired = result.getSandbox();
                 try {
                     acquired.start();

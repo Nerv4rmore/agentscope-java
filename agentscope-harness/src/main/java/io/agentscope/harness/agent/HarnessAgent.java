@@ -2632,6 +2632,24 @@ public class HarnessAgent implements Agent, AutoCloseable {
                     waitTaskRepo = sm.getTaskRepository();
                 } else if (capturedSubagentMw instanceof DynamicSubagentsMiddleware dsm) {
                     waitTaskRepo = dsm.getTaskRepository();
+                } else {
+                    // Fallback: when disableSubagents=true, a factory may have added a
+                    // SubagentsMiddleware/DynamicSubagentsMiddleware via Builder.middleware(...).
+                    // That external middleware is NOT captured into capturedSubagentMw (which
+                    // only tracks the framework's internally-built one), so scan the user-added
+                    // middlewares list to wire the same TaskRepository into WaitAsyncResultsTool.
+                    // Without this, wait_async_results returns instantly with
+                    // "task repository is unavailable", forcing the agent into serial polling.
+                    for (MiddlewareBase mw : middlewares) {
+                        if (mw instanceof SubagentsMiddleware sm2) {
+                            waitTaskRepo = sm2.getTaskRepository();
+                            break;
+                        }
+                        if (mw instanceof DynamicSubagentsMiddleware dsm2) {
+                            waitTaskRepo = dsm2.getTaskRepository();
+                            break;
+                        }
+                    }
                 }
                 io.agentscope.harness.agent.tool.WaitAsyncResultsTool waitTool =
                         new io.agentscope.harness.agent.tool.WaitAsyncResultsTool(

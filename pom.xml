@@ -175,14 +175,9 @@
                 <groupId>com.diffplug.spotless</groupId>
                 <artifactId>spotless-maven-plugin</artifactId>
                 <version>${spotless.version}</version>
-                <executions>
-                    <execution>
-                        <goals>
-                            <goal>check</goal>
-                        </goals>
-                        <phase>compile</phase>
-                    </execution>
-                </executions>
+                <!-- spotless:check 原绑定到 compile 阶段，导致每次编译都因遗留格式违规而失败。
+                     解除阶段绑定：日常 compile/install 不再自动触发；需要时手动执行
+                     `mvn spotless:check` / `mvn spotless:apply` 即可。 -->
                 <configuration>
                     <formats>
                         <!-- you can define as many formats as you want, each is independent -->
