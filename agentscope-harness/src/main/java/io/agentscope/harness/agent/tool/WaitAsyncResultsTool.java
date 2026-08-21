@@ -203,18 +203,16 @@ public class WaitAsyncResultsTool {
         int timeout = normalizeTimeout(timeoutSeconds, sessionId);
 
         log.info(
-                "wait_async_results: waiting up to {}s for any inbox message (legacy inbox-any),"
-                        + " session={}",
+                "wait_async_results: waiting up to {}s for any async result"
+                        + " (legacy inbox-any, event-driven), session={}",
                 timeout,
                 sessionId);
 
         long deadlineMs = System.currentTimeMillis() + (timeout * 1000L);
 
+        // 事件驱动：inbox 消息由后台任务完成回调推送，故先阻塞等待非终态任务的完成信号；
+        // 无任务时退化为短间隔探测 inbox（无事件源可用）。
         while (true) {
-            long remainingMs = deadlineMs - System.currentTimeMillis();
-            if (remainingMs <= 0) {
-                break;
-            }
             Boolean hasMessages = messageBus.inboxHasMessages(sessionId).block();
             if (Boolean.TRUE.equals(hasMessages)) {
                 log.info("wait_async_results: inbox has messages, session={}", sessionId);
@@ -224,8 +222,14 @@ public class WaitAsyncResultsTool {
                         + "automatically. Prefer wait_async_results(task_ids=...) or "
                         + "wait_all=true when you need every task in a group.";
             }
-            // Cap sleep to the remaining budget so the tool never overshoots the caller's timeout.
-            Thread.sleep(Math.min(POLL_INTERVAL_MS, remainingMs));
+            long remainingMs = deadlineMs - System.currentTimeMillis();
+            if (remainingMs <= 0) {
+                break;
+            }
+            if (!waitForAnyTaskSignal(runtimeContext, sessionId, remainingMs)) {
+                // 无运行中任务可等：短间隔探测 inbox，直到超时
+                Thread.sleep(Math.min(POLL_INTERVAL_MS, remainingMs));
+            }
         }
 
         int emptyCount = emptyWaits.incrementAndGet();
@@ -304,23 +308,39 @@ public class WaitAsyncResultsTool {
 
         int timeout = normalizeTimeout(timeoutSeconds, sessionId);
         log.info(
-                "wait_async_results: waiting up to {}s for task barrier, session={}, tasks={}",
+                "wait_async_results: waiting up to {}s for task barrier (event-driven),"
+                        + " session={}, tasks={}",
                 timeout,
                 sessionId,
                 waitSet);
 
+        // 事件驱动等待：逐个阻塞在任务底层 CompletableFuture 的完成信号上，
+        // 不再每秒轮询任务状态；任一任务进入终态即被唤醒继续。
         long deadlineMs = System.currentTimeMillis() + (timeout * 1000L);
-        while (true) {
-            completed = completeTaskBarrierIfReady(runtimeContext, sessionId, waitSet);
-            if (completed != null) {
-                emptyWaits.set(0);
-                return completed;
+        for (String taskId : waitSet) {
+            BackgroundTask task = taskRepository.getTask(runtimeContext, sessionId, taskId);
+            if (task == null) {
+                log.info(
+                        "wait_async_results: task barrier missing task {}, session={}",
+                        taskId,
+                        sessionId);
+                return "Cannot wait: task_id "
+                        + taskId
+                        + " is no longer available. Use task_list to refresh task status.";
             }
             long remainingMs = deadlineMs - System.currentTimeMillis();
             if (remainingMs <= 0) {
                 break;
             }
-            sleepForPollInterval(remainingMs);
+            if (!task.waitForCompletion(remainingMs)) {
+                break;
+            }
+        }
+
+        completed = completeTaskBarrierIfReady(runtimeContext, sessionId, waitSet);
+        if (completed != null) {
+            emptyWaits.set(0);
+            return completed;
         }
 
         int emptyCount = emptyWaits.incrementAndGet();
@@ -451,8 +471,45 @@ public class WaitAsyncResultsTool {
         return timeout;
     }
 
-    private void sleepForPollInterval(long remainingMs) throws InterruptedException {
-        Thread.sleep(Math.min(POLL_INTERVAL_MS, remainingMs));
+    /**
+     * 事件驱动等待任一非终态后台任务完成（inbox-any 模式的事件源）。
+     * inbox 消息由任务完成回调推送，故阻塞在任务底层 Future 上即等价于等待推送。
+     *
+     * @return true 表示确实阻塞等待了某个任务；false 表示无运行中任务可等
+     *         （含仅有外部工作的情况——外部工作无事件源，调用方应退化为短间隔探测，
+     *         避免无休眠的忙轮询）
+     */
+    private boolean waitForAnyTaskSignal(RuntimeContext rc, String sessionId, long remainingMs)
+            throws InterruptedException {
+        if (taskRepository == null) {
+            return false;
+        }
+        List<BackgroundTask> running =
+                taskRepository.listTasks(rc, sessionId, null).stream()
+                        .filter(t -> !t.getTaskStatus().isTerminal())
+                        .toList();
+        if (running.isEmpty()) {
+            return false;
+        }
+        // 逐个等待，任一任务完成即返回；剩余预算在任务间传递
+        long budget = remainingMs;
+        for (BackgroundTask task : running) {
+            if (budget <= 0) {
+                break;
+            }
+            long start = System.currentTimeMillis();
+            task.waitForCompletion(budget);
+            budget -= (System.currentTimeMillis() - start);
+            if (task.getTaskStatus().isTerminal()) {
+                log.info(
+                        "wait_async_results: task {} reached terminal state, waking up,"
+                                + " session={}",
+                        task.getTaskId(),
+                        sessionId);
+                break;
+            }
+        }
+        return true;
     }
 
     private List<String> parseTaskIds(String taskIds) {
