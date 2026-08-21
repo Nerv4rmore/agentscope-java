@@ -158,8 +158,8 @@ public class AgentSpawnTool {
      * key on every model call to swap the model instance. When a subagent declaration specifies
      * {@code model_tier}, {@code agentSpawn} creates a copy of the parent context with this key
      * overridden, so the child inherits the override without polluting the parent's context.
-     * The sentinel value {@code "default"} tells the middleware to skip the tier override and
-     * use the agent's built-in fallback model (e.g. qwen3.7-flash).
+     * A tier unknown to the app's tier configuration falls back to the agent's built-in
+     * default model.
      */
     public static final String CTX_MODEL_TIER = "modelTier";
 

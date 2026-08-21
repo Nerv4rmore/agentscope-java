@@ -475,6 +475,20 @@ final class HarnessAgentBuilderSupport {
             String childSessionId = deriveChildSessionId(decl, parentRc);
 
             // ---- Build child agent ----
+            // A `skills:` declaration implies its skill-gated tool groups (via the groups'
+            // activateOnSkill metadata) are activated at spawn time, so the subagent can call
+            // those tools from its very first turn instead of spending one reasoning turn on
+            // load_skill_through_path. Explicit activate_tool_groups are merged in as well.
+            List<String> activateGroups =
+                    new ArrayList<>(decl.getActivateToolGroups());
+            for (String skillName : decl.getSkills()) {
+                for (String group :
+                        capturedParentToolkit.findSkillToolGroupsByActivateOnSkill(skillName)) {
+                    if (!activateGroups.contains(group)) {
+                        activateGroups.add(group);
+                    }
+                }
+            }
             HarnessAgent.Builder sub =
                     HarnessAgent.builder()
                             .name(decl.getName())
@@ -484,7 +498,7 @@ final class HarnessAgentBuilderSupport {
                                     allowlistedInheritedToolkit(
                                             capturedParentToolkit,
                                             decl.getTools(),
-                                            decl.getActivateToolGroups()))
+                                            activateGroups))
                             .workspace(runtimeWorkspace)
                             .defaultSessionId(childSessionId)
                             .maxIters(decl.getSteps());

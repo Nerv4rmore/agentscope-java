@@ -88,7 +88,7 @@ public final class SubagentDeclaration {
     private final String inlineAgentsBody;
     private final String model;
 
-    /** Optional model-tier override (e.g. "default", "fast", "pro"). */
+    /** Optional model-tier override (e.g. "fast", "pro", "ultra"); null = inherit parent tier. */
     private final String modelTier;
 
     private final Double temperature;
@@ -535,10 +535,10 @@ public final class SubagentDeclaration {
         }
 
         /**
-         * Optional model-tier override (e.g. {@code "default"}, {@code "fast"}, {@code "pro"}).
+         * Optional model-tier override (e.g. {@code "fast"}, {@code "pro"}, {@code "ultra"}).
          * When set, the spawned subagent uses this tier instead of the parent's.
-         * {@code "default"} = use the agent's built-in fallback model (qwen3.7-flash).
-         * Blank/null = inherit parent tier.
+         * Blank/null = inherit parent tier. A tier unknown to the app's tier
+         * configuration falls back to the agent's built-in default model.
          */
         public Builder modelTier(String modelTier) {
             this.modelTier = modelTier;

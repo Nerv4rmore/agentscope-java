@@ -15,7 +15,6 @@
  */
 package io.agentscope.harness.agent.middleware;
 
-import io.agentscope.core.ReActAgent;
 import io.agentscope.core.agent.Agent;
 import io.agentscope.core.agent.RuntimeContext;
 import io.agentscope.core.event.AgentEvent;
@@ -29,6 +28,7 @@ import io.agentscope.core.message.MsgRole;
 import io.agentscope.core.message.ToolUseBlock;
 import io.agentscope.core.middleware.ActingInput;
 import io.agentscope.core.middleware.AgentInput;
+import io.agentscope.core.middleware.ModelCallInput;
 import io.agentscope.core.middleware.ReasoningInput;
 import io.agentscope.core.state.AgentState;
 import io.agentscope.core.util.JsonUtils;
@@ -47,6 +47,12 @@ import reactor.core.publisher.Flux;
  * <p>At INFO level, logs concise summaries: agent name, model, tool names/IDs, and
  * message lengths. At DEBUG level, additionally logs tool call arguments, tool result
  * content, reasoning text, and input message details.
+ *
+ * <p>The effective model is logged from {@link #onModelCall} via {@code
+ * ModelCallInput#model()} — the model AFTER outer middlewares (e.g. per-request model
+ * switching / fallback middlewares) have replaced it. Logging {@code agent.getModel()}
+ * instead would always show the construction-time default model and mislead readers
+ * about which model actually served the request.
  */
 public class AgentTraceMiddleware implements HarnessRuntimeMiddleware {
 
@@ -94,9 +100,8 @@ public class AgentTraceMiddleware implements HarnessRuntimeMiddleware {
             return next.apply(input);
         }
         String name = agent.getName();
-        String modelName = resolveModelName(agent);
         int msgCount = input.messages() != null ? input.messages().size() : 0;
-        log.info("[{}] PRE_REASONING  | model={}, messages={}", name, modelName, msgCount);
+        log.info("[{}] PRE_REASONING  | messages={}", name, msgCount);
         if (log.isDebugEnabled() && input.messages() != null) {
             for (Msg msg : input.messages()) {
                 log.debug(
@@ -146,6 +151,22 @@ public class AgentTraceMiddleware implements HarnessRuntimeMiddleware {
                                 }
                             }
                         });
+    }
+
+    @Override
+    public Flux<AgentEvent> onModelCall(
+            Agent agent,
+            RuntimeContext ctx,
+            ModelCallInput input,
+            Function<ModelCallInput, Flux<AgentEvent>> next) {
+        if (log.isInfoEnabled()) {
+            log.info(
+                    "[{}] PRE_MODEL_CALL | model={}, messages={}",
+                    agent.getName(),
+                    input.model() != null ? input.model().getModelName() : "<unknown>",
+                    input.messages() != null ? input.messages().size() : 0);
+        }
+        return next.apply(input);
     }
 
     @Override
@@ -253,13 +274,6 @@ public class AgentTraceMiddleware implements HarnessRuntimeMiddleware {
                     name,
                     truncate(text, 120));
         }
-    }
-
-    private static String resolveModelName(Agent agent) {
-        if (agent instanceof ReActAgent r && r.getModel() != null) {
-            return r.getModel().getModelName();
-        }
-        return "<unknown>";
     }
 
     private static String truncate(String s, int max) {

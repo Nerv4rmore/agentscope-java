@@ -1363,6 +1363,98 @@ class HarnessAgentTest {
                 "child-local memory tools should not be filtered by inherited allowlist");
     }
 
+    @Test
+    void skillsDeclaration_activatesSkillGatedToolGroupsAtSpawn() throws Exception {
+        Files.createDirectories(workspace);
+
+        // Parent toolkit with an inactive skill-gated group, mirroring how jina-tools is
+        // registered in the app: createSkillToolGroup(group, desc, active=false, activateOnSkill)
+        Toolkit parentToolkit = new Toolkit();
+        parentToolkit.createSkillToolGroup("skill-gated", "gated by my-skill", false, "my-skill");
+        parentToolkit.registration()
+                .tool(mockAgentTool("gated_tool"))
+                .group("skill-gated")
+                .apply();
+        parentToolkit.registerAgentTool(mockAgentTool("ungated_tool"));
+
+        SubagentDeclaration decl =
+                SubagentDeclaration.builder()
+                        .name("skill-declared")
+                        .description("declares a skill whose tool group should pre-activate")
+                        .inlineAgentsBody("Research with pre-activated tools.")
+                        .tools(List.of("gated_tool", "ungated_tool"))
+                        .skills(List.of("my-skill"))
+                        .build();
+
+        List<SubagentEntry> entries =
+                HarnessAgent.builder()
+                        .model(stubModel("ok"))
+                        .toolkit(parentToolkit)
+                        .workspace(workspace)
+                        .subagent(decl)
+                        .buildSubagentEntries(workspace);
+
+        HarnessAgent child =
+                (HarnessAgent)
+                        entries.stream()
+                                .filter(e -> "skill-declared".equals(e.name()))
+                                .findFirst()
+                                .orElseThrow()
+                                .factory()
+                                .create(RuntimeContext.empty());
+        List<String> toolNames =
+                child.getToolkit().getToolSchemas().stream().map(ToolSchema::getName).toList();
+        assertTrue(
+                toolNames.contains("gated_tool"),
+                "skill-gated tool must be visible from the first turn when the declaration"
+                        + " lists that skill — no load_skill_through_path turn needed");
+        assertTrue(toolNames.contains("ungated_tool"));
+    }
+
+    @Test
+    void skillsDeclaration_withoutMatchingSkillGroup_leavesToolsHidden() throws Exception {
+        Files.createDirectories(workspace);
+
+        // No group declares activateOnSkill="unknown-skill", so nothing activates.
+        Toolkit parentToolkit = new Toolkit();
+        parentToolkit.createSkillToolGroup("skill-gated", "gated by my-skill", false, "my-skill");
+        parentToolkit.registration()
+                .tool(mockAgentTool("gated_tool"))
+                .group("skill-gated")
+                .apply();
+
+        SubagentDeclaration decl =
+                SubagentDeclaration.builder()
+                        .name("skill-unknown")
+                        .description("declares a skill with no matching group")
+                        .inlineAgentsBody("Nothing to activate.")
+                        .tools(List.of("gated_tool"))
+                        .skills(List.of("unknown-skill"))
+                        .build();
+
+        List<SubagentEntry> entries =
+                HarnessAgent.builder()
+                        .model(stubModel("ok"))
+                        .toolkit(parentToolkit)
+                        .workspace(workspace)
+                        .subagent(decl)
+                        .buildSubagentEntries(workspace);
+
+        HarnessAgent child =
+                (HarnessAgent)
+                        entries.stream()
+                                .filter(e -> "skill-unknown".equals(e.name()))
+                                .findFirst()
+                                .orElseThrow()
+                                .factory()
+                                .create(RuntimeContext.empty());
+        List<String> toolNames =
+                child.getToolkit().getToolSchemas().stream().map(ToolSchema::getName).toList();
+        assertFalse(
+                toolNames.contains("gated_tool"),
+                "a skill with no matching activateOnSkill group must not leak gated tools");
+    }
+
     // =========================================================================
     // Skills allowlist
     // =========================================================================
