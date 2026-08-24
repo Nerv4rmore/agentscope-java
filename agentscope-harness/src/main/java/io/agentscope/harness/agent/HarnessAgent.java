@@ -1019,7 +1019,15 @@ public class HarnessAgent implements Agent, AutoCloseable {
                         ? effective.getSessionId()
                         : "default";
 
-        CompactionConfig forceConfig = CompactionConfig.builder().triggerMessages(1).build();
+        // Respect MemoryConfig.flushTrigger: a NEVER trigger means no memory flush on any
+        // path, including emergency compaction — offload (session JSONL) still runs.
+        boolean emergencyFlush =
+                memoryConfig.flushTrigger().mode() != MemoryConfig.FlushMode.NEVER;
+        CompactionConfig forceConfig =
+                CompactionConfig.builder()
+                        .triggerMessages(1)
+                        .flushBeforeCompact(emergencyFlush)
+                        .build();
         String effectiveFlushPrompt =
                 memoryConfig.flushPrompt() != null
                         ? memoryConfig.flushPrompt()
