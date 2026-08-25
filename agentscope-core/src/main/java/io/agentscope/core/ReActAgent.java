@@ -502,6 +502,51 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
     }
 
     /**
+     * 在 call 因错误终止时将最新 {@link AgentState} 落盘，随后继续向外传播原始错误。
+     *
+     * <p>{@link #saveStateToSession} 只挂在成功路径（{@code flatMap}）上，硬失败（如 LLM 调用
+     * 在重试与备用模型均耗尽后仍报错）会直接绕过保存逻辑，导致本次 call 累积的上下文全部
+     * 丢失。错误路径补一次落盘后，下次调用即可从最近累积的历史继续，而不必回退到上一个
+     * call 结束时的旧快照。
+     *
+     * <p>中断类错误跳过：USER 中断已在 {@link #handleInterrupt} 中保存；SYSTEM（停机）中断
+     * 已经 {@code GracefulShutdownManager.saveOnInterruptObserved} 保存，重复落盘无意义。
+     */
+    private Mono<Msg> saveStateAfterCallError(CallExecution scope, Throwable error) {
+        // 中断类错误已有专门保存路径，跳过以避免重复落盘
+        if (error instanceof InterruptedException || error instanceof AgentShuttingDownException) {
+            return Mono.error(error);
+        }
+        if (stateStore == null) {
+            return Mono.error(error);
+        }
+        // 与 handleInterrupt 保持一致：先补齐悬空的 pending tool calls，保证落盘状态自洽
+        scope.synthesizeErrorResultsForPendingToolCalls();
+        return saveStateToSession(scope)
+                .doOnSuccess(
+                        v ->
+                                log.info(
+                                        "Saved agent state after call error"
+                                                + " (userId={}, sessionId={}, error={})",
+                                        scope.state.getUserId(),
+                                        scope.state.getSessionId(),
+                                        error.toString()))
+                .onErrorResume(
+                        saveError -> {
+                            // 落盘失败不应掩盖原始错误，仅记录日志
+                            log.warn(
+                                    "Failed to save agent state after call error"
+                                            + " (userId={}, sessionId={}, originalError={})",
+                                    scope.state.getUserId(),
+                                    scope.state.getSessionId(),
+                                    error.toString(),
+                                    saveError);
+                            return Mono.empty();
+                        })
+                .then(Mono.error(error));
+    }
+
+    /**
      * CAS-aware persist of {@code agent_state}. Applies {@link #conflictPolicy} on conflict.
      *
      * @return the new store version, or {@link AgentStateStore#UNVERSIONED} when the backend does
@@ -1188,7 +1233,10 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                                 .ifPresent(ae -> scope.externalEventEmitter = ae);
                     }
                     return scope.doCallInner(msgs)
-                            .flatMap(result -> saveStateToSession(scope).thenReturn(result));
+                            .flatMap(result -> saveStateToSession(scope).thenReturn(result))
+                            // 错误路径补落盘：LLM 重试/备用模型均失败等硬失败时保留本次
+                            // call 累积的上下文（成功路径已在上方 flatMap 落盘）
+                            .onErrorResume(error -> saveStateAfterCallError(scope, error));
                 });
     }
 
@@ -1239,9 +1287,22 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                                                 ? e.getMessage()
                                                 : e.getClass().getSimpleName());
                                 return doFallbackStructuredCall(msgs, jsonSchema);
-                            });
+                            })
+                    // 错误路径补落盘：native 路径的错误会先走上方 fallback，只有最终失败
+                    // （fallback 也失败）才传播到这里
+                    .onErrorResume(
+                            error ->
+                                    Mono.deferContextual(
+                                            cv ->
+                                                    saveStateAfterCallError(
+                                                            scopeFrom(cv), error)));
         }
-        return doFallbackStructuredCall(msgs, jsonSchema);
+        return doFallbackStructuredCall(msgs, jsonSchema)
+                // 错误路径补落盘：与主调用路径 doCall 保持一致
+                .onErrorResume(
+                        error ->
+                                Mono.deferContextual(
+                                        cv -> saveStateAfterCallError(scopeFrom(cv), error)));
     }
 
     /**
