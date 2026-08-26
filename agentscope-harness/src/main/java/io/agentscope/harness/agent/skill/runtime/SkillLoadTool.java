@@ -302,13 +302,54 @@ public final class SkillLoadTool implements AgentTool {
             }
         }
 
-        sb.append("Available resources:\n");
+        // 模型猜错路径时常见情形是前缀不对（如多写了不存在的 references/）：
+        // 存在同名资源时直接给出候选精确路径，避免把大型技能的全量资源清单（可达数千字符）
+        // 塞进上下文；无同名候选时才回退全量清单并截断。
+        String missingName = baseName(missingPath);
+        List<String> candidates = new ArrayList<>();
+        for (String p : available) {
+            if (baseName(p).equals(missingName)) {
+                candidates.add(p);
+            }
+        }
+        if (!candidates.isEmpty()) {
+            sb.append("Did you mean one of these (same file name)?\n");
+            int j = 1;
+            for (String c : candidates) {
+                sb.append(j++).append(". ").append(c).append("\n");
+            }
+            sb.append("Retry with one of the exact paths above.\n");
+            return sb.toString();
+        }
+
+        int total = available.size();
+        sb.append("Available resources");
+        if (total > MAX_AVAILABLE_LISTING) {
+            sb.append(" (showing first ")
+                    .append(MAX_AVAILABLE_LISTING)
+                    .append(" of ")
+                    .append(total)
+                    .append(")");
+        }
+        sb.append(":\n");
         int i = 1;
-        List<String> ordered = new ArrayList<>(available);
-        for (String p : ordered) {
+        for (String p : available) {
+            if (i > MAX_AVAILABLE_LISTING) {
+                break;
+            }
             sb.append(i++).append(". ").append(p).append("\n");
         }
         return sb.toString();
+    }
+
+    /** 全量资源清单的最大条数，防止大型技能的清单占用过多上下文。 */
+    private static final int MAX_AVAILABLE_LISTING = 50;
+
+    /** 提取路径的末段文件名，用于 not-found 时的同名候选匹配。 */
+    private static String baseName(String path) {
+        String normalized = path.replace('\\', '/');
+        int idx = normalized.lastIndexOf('/');
+        return idx >= 0 ? normalized.substring(idx + 1) : normalized;
     }
 
     private static String stringOrNull(Object o) {
