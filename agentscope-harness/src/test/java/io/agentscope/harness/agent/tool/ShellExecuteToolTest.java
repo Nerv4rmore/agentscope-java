@@ -68,17 +68,11 @@ class ShellExecuteToolTest {
     }
 
     @Test
-    void commandWithWorkingDirectory_usesCmdCompatibleQuotingOnWindows() {
-        assertEquals(
-                "cd /d \"workspace dir\" && dir",
-                ShellExecuteTool.commandWithWorkingDirectory("workspace dir", "dir", true));
-    }
-
-    @Test
-    void commandWithWorkingDirectory_preservesShellSafeQuotingOnUnix() {
+    void commandWithWorkingDirectory_alwaysUsesPosixSyntax() {
+        // 命令永远在 Linux 沙箱内执行，即使宿主机为 Windows 也不能生成 cd /d 语法
         assertEquals(
                 "cd 'workspace dir' && ls",
-                ShellExecuteTool.commandWithWorkingDirectory("workspace dir", "ls", false));
+                ShellExecuteTool.commandWithWorkingDirectory("workspace dir", "ls"));
     }
 
     private static final class RecordingSandbox extends LocalFilesystemWithShell {

@@ -77,11 +77,9 @@ public class ShellExecuteTool {
                 return "Error: working_directory must be a relative path within the workspace"
                         + " (absolute paths, '~', and '..' are not allowed).";
             }
-            effectiveCommand =
-                    commandWithWorkingDirectory(
-                            wd,
-                            command,
-                            System.getProperty("os.name").toLowerCase().contains("win"));
+            // 命令始终在 Linux 沙箱内执行，与宿主机 OS 无关，恒用 POSIX cd 语法；
+            // 宿主机为 Windows 时若生成 `cd /d "..."` 会导致沙箱 bash 报 "cd: too many arguments"
+            effectiveCommand = commandWithWorkingDirectory(wd, command);
         }
 
         int timeoutSeconds = timeout != null && timeout > 0 ? timeout : 30;
@@ -98,11 +96,7 @@ public class ShellExecuteTool {
         return sb.toString();
     }
 
-    static String commandWithWorkingDirectory(
-            String workingDirectory, String command, boolean windows) {
-        if (windows) {
-            return "cd /d \"" + workingDirectory.replace("\"", "\"\"") + "\" && " + command;
-        }
+    static String commandWithWorkingDirectory(String workingDirectory, String command) {
         return "cd '" + workingDirectory.replace("'", "'\\''") + "' && " + command;
     }
 }
