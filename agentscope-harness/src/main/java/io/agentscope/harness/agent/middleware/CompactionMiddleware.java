@@ -27,11 +27,11 @@ import io.agentscope.core.state.AgentState;
 import io.agentscope.harness.agent.memory.MemoryFlushManager;
 import io.agentscope.harness.agent.memory.compaction.CompactionConfig;
 import io.agentscope.harness.agent.memory.compaction.ConversationCompactor;
+import io.agentscope.harness.agent.memory.compaction.ConversationCompactor.CompactOutcome;
 import io.agentscope.harness.agent.workspace.WorkspaceManager;
 import java.util.ArrayList;
 import java.util.IdentityHashMap;
 import java.util.List;
-import java.util.Optional;
 import java.util.function.Function;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -56,6 +56,12 @@ import reactor.core.publisher.Mono;
  * effective trigger threshold is computed as {@code model.getContextWindowSize() - reserved}.
  * If the model does not report its context window, falls back to
  * {@link CompactionConfig#FALLBACK_TRIGGER_TOKENS}.
+ *
+ * <p>Besides full LLM summarization, lightweight non-LLM trimming (argument truncation and
+ * tool-result pruning) is applied independently every turn: even when the summarization
+ * threshold is not reached, a trim that changed the messages is written back to the agent's
+ * context and the rebuilt {@link ReasoningInput}, so cheap reclamation takes effect without
+ * waiting for a costly summary pass.
  */
 public class CompactionMiddleware implements HarnessRuntimeMiddleware {
 
@@ -111,7 +117,8 @@ public class CompactionMiddleware implements HarnessRuntimeMiddleware {
 
                     // Only compaction may degrade; downstream reasoning errors must propagate.
                     return compactor
-                            .compactIfNeeded(rc, conversation, effectiveConfig, agentId, sessionId)
+                            .compactWithOutcome(
+                                    rc, conversation, effectiveConfig, agentId, sessionId)
                             .onErrorResume(
                                     error -> {
                                         if (containsInterruptedException(error)) {
@@ -121,20 +128,28 @@ public class CompactionMiddleware implements HarnessRuntimeMiddleware {
                                                 "Compaction failed, continuing without compaction:"
                                                         + " {}",
                                                 error.getMessage());
-                                        return Mono.just(Optional.empty());
+                                        return Mono.just(CompactOutcome.none());
                                     })
                             .flatMapMany(
-                                    optResult -> {
-                                        if (optResult.isEmpty()) {
+                                    outcome -> {
+                                        if (!outcome.changed()) {
                                             return next.apply(input);
                                         }
-                                        List<Msg> compacted = optResult.get();
+                                        List<Msg> compacted = outcome.messages();
                                         applyToContext(
                                                 RuntimeContext.resolveAgentState(rc, reActAgent),
                                                 compacted);
-                                        log.debug(
-                                                "Compacted to {} messages before reasoning",
-                                                compacted.size());
+                                        if (outcome.summarized()) {
+                                            log.debug(
+                                                    "Compacted to {} messages before reasoning",
+                                                    compacted.size());
+                                        } else {
+                                            // 轻量裁剪（arg 截断 / 工具结果 prune）独立生效
+                                            log.info(
+                                                    "Lightweight trim applied before reasoning:"
+                                                            + " {} messages",
+                                                    compacted.size());
+                                        }
                                         List<Msg> newMessages = new ArrayList<>();
                                         if (sys != null) {
                                             newMessages.add(sys);

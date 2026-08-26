@@ -88,6 +88,55 @@ public class ConversationCompactor {
         this.flushManager = flushManager;
     }
 
+    /**
+     * Result of a {@link #compactWithOutcome} invocation.
+     *
+     * <ul>
+     *   <li>{@link #none()} — no change at all; caller keeps the original context.</li>
+     *   <li>{@link #trimmed(List)} — lightweight non-LLM trimming (arg truncation and/or
+     *       tool-result pruning) modified the messages, but no LLM summarization ran.</li>
+     *   <li>{@link #summarized(List)} — full LLM compaction produced
+     *       {@code [summaryMsg] + preservedTail}.</li>
+     * </ul>
+     */
+    public static final class CompactOutcome {
+
+        private final List<Msg> messages;
+        private final boolean summarized;
+
+        private CompactOutcome(List<Msg> messages, boolean summarized) {
+            this.messages = messages;
+            this.summarized = summarized;
+        }
+
+        public static CompactOutcome none() {
+            return new CompactOutcome(List.of(), false);
+        }
+
+        public static CompactOutcome trimmed(List<Msg> messages) {
+            return new CompactOutcome(messages, false);
+        }
+
+        public static CompactOutcome summarized(List<Msg> messages) {
+            return new CompactOutcome(messages, true);
+        }
+
+        /** Replacement message list. Empty when {@link #changed()} is false. */
+        public List<Msg> messages() {
+            return messages;
+        }
+
+        /** True when the prefix was distilled into a summary message. */
+        public boolean summarized() {
+            return summarized;
+        }
+
+        /** True when the caller should replace its context with {@link #messages()}. */
+        public boolean changed() {
+            return summarized || !messages.isEmpty();
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Public API
     // -------------------------------------------------------------------------
@@ -111,27 +160,56 @@ public class ConversationCompactor {
             CompactionConfig config,
             String agentId,
             String sessionId) {
+        // 保留原语义：仅当发生全量 LLM 摘要时返回替换消息列表
+        return compactWithOutcome(rc, conversationMessages, config, agentId, sessionId)
+                .map(
+                        outcome ->
+                                outcome.summarized()
+                                        ? Optional.of(outcome.messages())
+                                        : Optional.<List<Msg>>empty());
+    }
+
+    /**
+     * Extended variant of {@link #compactIfNeeded} that also surfaces lightweight trimming.
+     *
+     * <p>Lightweight trimming (arg truncation + tool-result pruning) no longer depends on the
+     * full-compaction trigger: when the summarization threshold is not reached but trimming
+     * produced changes, the outcome is {@link CompactOutcome#trimmed} and callers should apply
+     * it to the working context. This lets cheap deterministic reclamation run every turn,
+     * delaying and reducing the need for LLM summarization.
+     */
+    public Mono<CompactOutcome> compactWithOutcome(
+            RuntimeContext rc,
+            List<Msg> conversationMessages,
+            CompactionConfig config,
+            String agentId,
+            String sessionId) {
 
         if (conversationMessages == null || conversationMessages.isEmpty()) {
-            return Mono.just(Optional.empty());
+            return Mono.just(CompactOutcome.none());
         }
 
         // Step 1a: Lightweight arg truncation (non-LLM).
         // Step 1b: Aggregate tool-result pruning (non-LLM).
+        // 两个操作在无变更时均返回原引用，可用引用相等检测是否发生了轻量裁剪。
         List<Msg> messages =
                 pruneToolResults(
                         truncateArgs(conversationMessages, config.getTruncateArgsConfig()),
                         config.getPruneConfig());
+        boolean lightweightChanged = messages != conversationMessages;
 
         int totalTokens = TokenCounterUtil.calculateToken(messages);
         if (!shouldCompact(messages, totalTokens, config)) {
-            return Mono.just(Optional.empty());
+            // 未达全量压缩阈值：轻量裁剪结果独立生效，不再被丢弃
+            return Mono.just(
+                    lightweightChanged ? CompactOutcome.trimmed(messages) : CompactOutcome.none());
         }
 
         int cutoff = determineCutoffIndex(messages, totalTokens, config);
         if (cutoff <= 0) {
             log.debug("Compaction triggered but safe cutoff is 0 — skipping");
-            return Mono.just(Optional.empty());
+            return Mono.just(
+                    lightweightChanged ? CompactOutcome.trimmed(messages) : CompactOutcome.none());
         }
 
         // Keep prior summaries in the summarization input so each compaction builds on the
@@ -222,7 +300,7 @@ public class ConversationCompactor {
                                                             messages.size(),
                                                             tail.size(),
                                                             compacted.size());
-                                                    return Optional.of(compacted);
+                                                    return CompactOutcome.summarized(compacted);
                                                 }));
     }
 
