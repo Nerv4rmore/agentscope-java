@@ -25,6 +25,7 @@ import io.agentscope.core.event.ToolResultStartEvent;
 import io.agentscope.core.event.ToolResultTextDeltaEvent;
 import io.agentscope.core.message.Msg;
 import io.agentscope.core.message.MsgRole;
+import io.agentscope.core.message.ToolResultState;
 import io.agentscope.core.message.ToolUseBlock;
 import io.agentscope.core.middleware.ActingInput;
 import io.agentscope.core.middleware.AgentInput;
@@ -44,8 +45,11 @@ import reactor.core.publisher.Flux;
 /**
  * Observability middleware that logs the reasoning and execution trace of an agent.
  *
- * <p>At INFO level, logs concise summaries: agent name, model, tool names/IDs, and
- * message lengths. At DEBUG level, additionally logs tool call arguments, tool result
+ * <p>Normal-path trace summaries (PRE_CALL / PRE_REASONING / PRE_MODEL_CALL / PRE_ACTING /
+ * successful POST_ACTING) are logged at DEBUG to avoid flooding the main log on every tool
+ * invocation. Only abnormal outcomes (errors, empty completions, tool-call-terminated loops,
+ * failed tool executions) surface at INFO/WARN/ERROR so trouble-shooting stays focused.
+ * At DEBUG level, additionally logs tool call arguments, tool result
  * content, reasoning text, and input message details.
  *
  * <p>The effective model is logged from {@link #onModelCall} via {@code
@@ -64,26 +68,27 @@ public class AgentTraceMiddleware implements HarnessRuntimeMiddleware {
             RuntimeContext ctx,
             AgentInput input,
             Function<AgentInput, Flux<AgentEvent>> next) {
-        if (!log.isInfoEnabled()) {
-            return next.apply(input);
-        }
+        // 正常路径摘要降为 debug，避免每次调用刷 INFO；仅 ERROR 分支保留 info。
+        boolean debug = log.isDebugEnabled();
         String name = agent.getName();
-        List<Msg> msgs = input.msgs();
-        log.info("[{}] PRE_CALL  | {} input message(s)", name, msgs != null ? msgs.size() : 0);
-        if (log.isDebugEnabled() && msgs != null) {
-            for (Msg msg : msgs) {
-                log.debug(
-                        "[{}] PRE_CALL  |   [{}] {}",
-                        name,
-                        msg.getRole(),
-                        truncate(msg.getTextContent(), 200));
+        if (debug) {
+            List<Msg> msgs = input.msgs();
+            log.debug("[{}] PRE_CALL  | {} input message(s)", name, msgs != null ? msgs.size() : 0);
+            if (msgs != null) {
+                for (Msg msg : msgs) {
+                    log.debug(
+                            "[{}] PRE_CALL  |   [{}] {}",
+                            name,
+                            msg.getRole(),
+                            truncate(msg.getTextContent(), 200));
+                }
             }
         }
         return next.apply(input)
                 .doOnComplete(() -> logPostCall(agent, ctx))
                 .doOnError(
                         e ->
-                                log.info(
+                                log.warn(
                                         "[{}] ERROR | {}: {}",
                                         name,
                                         e.getClass().getSimpleName(),
@@ -96,19 +101,19 @@ public class AgentTraceMiddleware implements HarnessRuntimeMiddleware {
             RuntimeContext ctx,
             ReasoningInput input,
             Function<ReasoningInput, Flux<AgentEvent>> next) {
-        if (!log.isInfoEnabled()) {
-            return next.apply(input);
-        }
+        // 正常路径摘要降为 debug；仅异常分支（空完成）保留 info。
         String name = agent.getName();
-        int msgCount = input.messages() != null ? input.messages().size() : 0;
-        log.info("[{}] PRE_REASONING  | messages={}", name, msgCount);
-        if (log.isDebugEnabled() && input.messages() != null) {
-            for (Msg msg : input.messages()) {
-                log.debug(
-                        "[{}] PRE_REASONING  |   [{}] len={}",
-                        name,
-                        msg.getRole(),
-                        msg.getTextContent() != null ? msg.getTextContent().length() : 0);
+        if (log.isDebugEnabled()) {
+            int msgCount = input.messages() != null ? input.messages().size() : 0;
+            log.debug("[{}] PRE_REASONING  | messages={}", name, msgCount);
+            if (input.messages() != null) {
+                for (Msg msg : input.messages()) {
+                    log.debug(
+                            "[{}] PRE_REASONING  |   [{}] len={}",
+                            name,
+                            msg.getRole(),
+                            msg.getTextContent() != null ? msg.getTextContent().length() : 0);
+                }
             }
         }
         StringBuilder textBuf = new StringBuilder();
@@ -143,7 +148,8 @@ public class AgentTraceMiddleware implements HarnessRuntimeMiddleware {
                                 }
                             } else {
                                 for (ToolCallStartEvent tc : toolCalls) {
-                                    log.info(
+                                    // 正常工具调用摘要降为 debug，失败结果在 onActing 里以 warn 输出。
+                                    log.debug(
                                             "[{}] POST_REASONING | tool_call: id={}, name={}",
                                             name,
                                             tc.getToolCallId(),
@@ -159,8 +165,9 @@ public class AgentTraceMiddleware implements HarnessRuntimeMiddleware {
             RuntimeContext ctx,
             ModelCallInput input,
             Function<ModelCallInput, Flux<AgentEvent>> next) {
-        if (log.isInfoEnabled()) {
-            log.info(
+        // 正常路径摘要降为 debug，每次模型调用不再刷 INFO。
+        if (log.isDebugEnabled()) {
+            log.debug(
                     "[{}] PRE_MODEL_CALL | model={}, messages={}",
                     agent.getName(),
                     input.model() != null ? input.model().getModelName() : "<unknown>",
@@ -175,19 +182,15 @@ public class AgentTraceMiddleware implements HarnessRuntimeMiddleware {
             RuntimeContext ctx,
             ActingInput input,
             Function<ActingInput, Flux<AgentEvent>> next) {
-        if (!log.isInfoEnabled()) {
-            return next.apply(input);
-        }
+        // 正常路径摘要降为 debug；仅失败的工具结果保留 warn 输出。
         String name = agent.getName();
-        if (input.toolCalls() != null) {
+        if (log.isDebugEnabled() && input.toolCalls() != null) {
             for (ToolUseBlock tu : input.toolCalls()) {
-                log.info("[{}] PRE_ACTING  | id={}, name={}", name, tu.getId(), tu.getName());
-                if (log.isDebugEnabled()) {
-                    log.debug(
-                            "[{}] PRE_ACTING  |   args={}",
-                            name,
-                            truncate(mapToJson(tu.getInput()), 500));
-                }
+                log.debug("[{}] PRE_ACTING  | id={}, name={}", name, tu.getId(), tu.getName());
+                log.debug(
+                        "[{}] PRE_ACTING  |   args={}",
+                        name,
+                        truncate(mapToJson(tu.getInput()), 500));
             }
         }
         // Derive POST_ACTING from the tool-result events flowing through the middleware stream
@@ -224,15 +227,29 @@ public class AgentTraceMiddleware implements HarnessRuntimeMiddleware {
                                 String toolName = toolNames.getOrDefault(id, "<unknown>");
                                 String text =
                                         toolText.getOrDefault(id, new StringBuilder()).toString();
-                                log.info(
-                                        "[{}] POST_ACTING | id={}, name={}, result_len={},"
-                                                + " state={}",
-                                        name,
-                                        id,
-                                        toolName,
-                                        text.length(),
-                                        end.getState());
-                                if (log.isDebugEnabled()) {
+                                // 失败/非正常结束的工具执行提升为 warn（排障最关心）；成功结果降为 debug。
+                                boolean failed =
+                                        end.getState() != null
+                                                && end.getState() != ToolResultState.SUCCESS;
+                                if (failed) {
+                                    log.warn(
+                                            "[{}] POST_ACTING | id={}, name={}, result_len={},"
+                                                    + " state={}, result={}",
+                                            name,
+                                            id,
+                                            toolName,
+                                            text.length(),
+                                            end.getState(),
+                                            truncate(text, 500));
+                                } else if (log.isDebugEnabled()) {
+                                    log.debug(
+                                            "[{}] POST_ACTING | id={}, name={}, result_len={},"
+                                                    + " state={}",
+                                            name,
+                                            id,
+                                            toolName,
+                                            text.length(),
+                                            end.getState());
                                     log.debug(
                                             "[{}] POST_ACTING |   result={}",
                                             name,
@@ -246,7 +263,7 @@ public class AgentTraceMiddleware implements HarnessRuntimeMiddleware {
         String name = agent.getName();
         AgentState state = RuntimeContext.resolveAgentState(rc, agent);
         if (state == null) {
-            log.info("[{}] POST_CALL | response: <n/a>", name);
+            log.debug("[{}] POST_CALL | response: <n/a>", name);
             return;
         }
         Msg lastAssistant = null;
@@ -258,7 +275,7 @@ public class AgentTraceMiddleware implements HarnessRuntimeMiddleware {
             }
         }
         if (lastAssistant == null) {
-            log.info("[{}] POST_CALL | response: <n/a>", name);
+            log.debug("[{}] POST_CALL | response: <n/a>", name);
             return;
         }
         String text = lastAssistant.getTextContent();

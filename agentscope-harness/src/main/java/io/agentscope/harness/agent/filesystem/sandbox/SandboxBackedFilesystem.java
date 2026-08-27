@@ -238,8 +238,9 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
     public ExecuteResponse execute(
             RuntimeContext runtimeContext, String command, Integer timeoutSeconds) {
         Sandbox active = requireSandbox(runtimeContext);
-        // 诊断：execute 入口，记录命令与目标沙箱，便于追踪每次工具调用的落点
-        log.info(
+        // 诊断：execute 入口，记录命令与目标沙箱，便于追踪每次工具调用的落点；
+        // 正常路径降为 debug，避免每次工具调用刷两条 INFO 淹没主日志，异常路径保留 warn/error。
+        log.debug(
                 "[sandbox-diag] execute ENTER: sandboxId={}, cmd={}",
                 active.getState() != null ? active.getState().getSessionId() : "?",
                 command != null && command.length() > 120
@@ -249,8 +250,8 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
             ExecResult result = active.exec(runtimeContext, command, timeoutSeconds);
             // 命令通道正常应答（无论业务成败），清零不健康计数
             consecutiveUnhealthyExecs.set(0);
-            // 诊断：execute 成功，记录退出码
-            log.info(
+            // 诊断：execute 成功，记录退出码；成功属正常路径，降为 debug。
+            log.debug(
                     "[sandbox-diag] execute OK: exitCode={}, truncated={}",
                     result.exitCode(),
                     result.truncated());
