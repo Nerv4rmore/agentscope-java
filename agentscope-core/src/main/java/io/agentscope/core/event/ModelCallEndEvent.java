@@ -25,22 +25,42 @@ import io.agentscope.core.model.ChatUsage;
 public class ModelCallEndEvent extends AgentEvent {
 
     private final String replyId;
+    private final String messageId;
     private final ChatUsage usage;
+
+    public ModelCallEndEvent(
+            @JsonProperty("id") String id,
+            @JsonProperty("createdAt") String createdAt,
+            @JsonProperty("replyId") String replyId,
+            @JsonProperty("usage") ChatUsage usage) {
+        this(id, createdAt, replyId, null, usage);
+    }
 
     @JsonCreator
     public ModelCallEndEvent(
             @JsonProperty("id") String id,
             @JsonProperty("createdAt") String createdAt,
             @JsonProperty("replyId") String replyId,
+            @JsonProperty("messageId") String messageId,
             @JsonProperty("usage") ChatUsage usage) {
         super(id, createdAt);
         this.replyId = replyId;
+        this.messageId = messageId;
         this.usage = usage;
     }
 
     public ModelCallEndEvent(String replyId, ChatUsage usage) {
-        this.replyId = replyId;
-        this.usage = usage;
+        this(replyId, null, usage);
+    }
+
+    /**
+     * Creates an event carrying the persisted message id.
+     *
+     * <p>{@code messageId} is the id assigned to the assistant {@code Msg} built from this model
+     * call (the provider response id), i.e. the {@code id} field persisted in the agent state.
+     */
+    public ModelCallEndEvent(String replyId, String messageId, ChatUsage usage) {
+        this(null, null, replyId, messageId, usage);
     }
 
     @Override
@@ -50,6 +70,11 @@ public class ModelCallEndEvent extends AgentEvent {
 
     public String getReplyId() {
         return replyId;
+    }
+
+    /** Id of the assistant message persisted for this model call (may be null). */
+    public String getMessageId() {
+        return messageId;
     }
 
     public ChatUsage getUsage() {
