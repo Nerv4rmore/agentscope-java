@@ -28,6 +28,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 
 /**
  * Reasoning context that manages all state and content accumulation for a single reasoning round.
@@ -63,6 +64,17 @@ public class ReasoningContext {
     }
 
     /**
+     * Id assigned to the messages built from the current model call (the provider response id),
+     * i.e. the {@code id} field persisted with the assistant {@code Msg} in the agent state.
+     *
+     * @hidden
+     * @return The current message id, or null if no chunk has been processed yet
+     */
+    public String getMessageId() {
+        return messageId;
+    }
+
+    /**
      * Process a response chunk and return messages that can be sent immediately.
      *
      * <p>Strategy:
@@ -77,7 +89,14 @@ public class ReasoningContext {
      * @return List of messages that can be sent immediately
      */
     public List<Msg> processChunk(ChatResponse chunk) {
-        this.messageId = chunk.getId();
+        // Persisted message id: prefer the provider response id; when the provider does not
+        // return one, generate a stable UUID for this model call so the id carried by
+        // ModelCallEndEvent always matches the id persisted in the agent state.
+        if (chunk.getId() != null && !chunk.getId().isEmpty()) {
+            this.messageId = chunk.getId();
+        } else if (this.messageId == null) {
+            this.messageId = UUID.randomUUID().toString();
+        }
 
         // Accumulate ChatUsage
         ChatUsage usage = chunk.getUsage();
