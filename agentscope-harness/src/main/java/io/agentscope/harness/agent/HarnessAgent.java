@@ -457,6 +457,10 @@ public class HarnessAgent implements Agent, AutoCloseable {
             // race with resource cleanup (e.g., temp workspace deletion in tests).
             io.agentscope.harness.agent.memory.session.SessionTree.awaitMirrorQuiescence(
                     5, java.util.concurrent.TimeUnit.SECONDS);
+            // Drain fire-and-forget memory flush/maintenance so async memory/*.md writes do not
+            // race with resource cleanup (e.g., temp workspace deletion in tests).
+            io.agentscope.harness.agent.memory.MemoryBackgroundTasks.awaitQuiescence(
+                    5, java.util.concurrent.TimeUnit.SECONDS);
             shutdownTaskRepository();
         } finally {
             try {
@@ -1913,8 +1917,18 @@ public class HarnessAgent implements Agent, AutoCloseable {
 
         /** Adds a fully custom subagent factory for a given agent id. */
         public Builder subagentFactory(String name, Function<String, Agent> factory) {
+            return subagentFactory(name, null, factory);
+        }
+
+        /**
+         * Adds a fully custom subagent factory for a given agent id, with a description shown to
+         * the orchestrator. When {@code description} is null or blank, the name is used.
+         */
+        public Builder subagentFactory(
+                String name, String description, Function<String, Agent> factory) {
             this.customSubagentFactories.add(
-                    new HarnessAgentBuilderSupport.SubagentFactoryEntry(name, factory));
+                    new HarnessAgentBuilderSupport.SubagentFactoryEntry(
+                            name, description, factory));
             return this;
         }
 

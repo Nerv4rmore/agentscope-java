@@ -21,7 +21,6 @@ import io.agentscope.harness.agent.sandbox.Sandbox;
 import io.agentscope.harness.agent.sandbox.SandboxAcquireResult;
 import io.agentscope.harness.agent.sandbox.SandboxContext;
 import io.agentscope.harness.agent.sandbox.SandboxManager;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -40,7 +39,8 @@ import org.slf4j.LoggerFactory;
  * <ol>
  *   <li>Read {@link SandboxContext} from the current {@link RuntimeContext}</li>
  *   <li>Bind {@link SandboxManager} + {@link SandboxContext} into the filesystem proxy for lazy
- *       creation (no sandbox is created yet)</li>
+ *       creation (no sandbox is created yet); external sandboxes are acquired eagerly and also
+ *       bound per-call on the {@link RuntimeContext} (issue #2490)</li>
  * </ol>
  *
  * <h2>doFinally</h2>
@@ -51,11 +51,18 @@ import org.slf4j.LoggerFactory;
  *       {@link io.agentscope.harness.agent.sandbox.SessionSandboxStateStore}</li>
  *   <li>Only if non-null: release the session via {@link SandboxManager} (stop + optional
  *       shutdown)</li>
- *   <li>Clear the session reference from the filesystem proxy</li>
+ *   <li>Clear this call's per-call binding from the {@link RuntimeContext} and compare-and-clear
+ *       the filesystem proxy's fallback field
+ *       ({@link SandboxBackedFilesystem#clearSandboxIfCurrent}, issue #2490)</li>
  * </ol>
  *
  * <p>Post-call failures (persist, release) are logged but do not propagate — this ensures
  * the agent call result is always returned to the caller even if sandbox cleanup fails.
+ *
+ * <p>The sandbox is bound <em>per call</em> on the invocation's {@link RuntimeContext} rather than
+ * on a shared agent-level slot: distinct {@code (userId, sessionId)} sessions run in parallel on
+ * the same agent bean, so a shared slot would let concurrent calls corrupt each other's binding
+ * (issue #2490).
  */
 public class SandboxLifecycleMiddleware implements HarnessRuntimeMiddleware {
 
@@ -63,8 +70,6 @@ public class SandboxLifecycleMiddleware implements HarnessRuntimeMiddleware {
 
     private final SandboxManager sandboxManager;
     private final SandboxBackedFilesystem filesystemProxy;
-    private final AtomicReference<SandboxAcquireResult> currentAcquireResult =
-            new AtomicReference<>();
     private volatile Consumer<RuntimeContext> beforeStartCallback;
 
     public SandboxLifecycleMiddleware(
@@ -138,13 +143,18 @@ public class SandboxLifecycleMiddleware implements HarnessRuntimeMiddleware {
                 Sandbox sandbox = result.getSandbox();
                 try {
                     sandbox.start();
+                    // 上游 #2490：除共享字段外，再把本次调用的沙箱按调用绑定到 RuntimeContext；
+                    // 同一 agent bean 上并发的不同 (userId, sessionId) 会话靠按调用绑定隔离，
+                    // filesystem proxy 优先从 ctx 解析，共享字段仅作无 ctx 调用方的兜底。
+                    ctx.put(SandboxAcquireResult.class, result);
                     filesystemProxy.setSandbox(sandbox);
                     currentAcquireResult.set(result);
                     log.debug(
                             "[sandbox-mw] Acquired external sandbox {}",
                             sandbox.getState() != null ? sandbox.getState().getSessionId() : "?");
                 } catch (Exception e) {
-                    filesystemProxy.setSandbox(null);
+                    ctx.put(SandboxAcquireResult.class, null);
+                    filesystemProxy.clearSandboxIfCurrent(sandbox);
                     try {
                         sandboxManager.release(result);
                     } catch (Exception releaseErr) {
@@ -196,8 +206,13 @@ public class SandboxLifecycleMiddleware implements HarnessRuntimeMiddleware {
                 "[sandbox-diag] releaseForCall: sessionId={}, userId={}",
                 ctx != null ? ctx.getSessionId() : "null",
                 ctx != null ? ctx.getUserId() : "null");
-        // 外部沙箱路径：优先消费 currentAcquireResult
-        SandboxAcquireResult result = currentAcquireResult.getAndSet(null);
+        // 上游 #2490：优先回读本调用在 acquireForCall 中建立的按调用绑定，
+        // 确保释放时只拆除本次调用自己获取的沙箱，不误伤并发会话。
+        SandboxAcquireResult result = ctx != null ? ctx.get(SandboxAcquireResult.class) : null;
+        if (result == null) {
+            // 外部沙箱路径：消费 currentAcquireResult
+            result = currentAcquireResult.getAndSet(null);
+        }
         if (result == null) {
             // 常规路径：消费懒创建产生的 AcquireResult（未创建沙箱时为 null）
             result = filesystemProxy.consumeAcquireResult();
@@ -206,13 +221,18 @@ public class SandboxLifecycleMiddleware implements HarnessRuntimeMiddleware {
                     result != null ? "non-null(release)" : "null(skip)");
         }
         if (result == null) {
-            // 本次调用从未创建沙箱，无需释放
-            filesystemProxy.setSandbox(null);
+            // 本次调用从未创建沙箱，无需释放；不再无条件清空共享字段，
+            // 避免误清并发兄弟调用的兜底绑定（issue #2490）
             log.info(
-                    "[sandbox-diag] releaseForCall: no sandbox created this call,"
-                            + " setSandbox(null)");
+                    "[sandbox-diag] releaseForCall: no sandbox created this call (skip release)");
             return;
         }
+        if (ctx != null) {
+            ctx.put(SandboxAcquireResult.class, null);
+        }
+        // Compare-and-clear the fallback field so a releasing call never nulls a concurrent
+        // sibling's binding (issue #2490); it only clears the field when it still points here.
+        filesystemProxy.clearSandboxIfCurrent(result.getSandbox());
         SandboxContext sandboxContext = ctx != null ? ctx.get(SandboxContext.class) : null;
         try {
             sandboxManager.persistState(result, sandboxContext, ctx);
@@ -225,7 +245,8 @@ public class SandboxLifecycleMiddleware implements HarnessRuntimeMiddleware {
             log.warn("[sandbox-mw] Failed to release sandbox session: {}", e.getMessage(), e);
         }
         result.getLease().close();
-        filesystemProxy.setSandbox(null);
-        log.info("[sandbox-diag] releaseForCall DONE: setSandbox(null)");
+        // 兜底字段的清理已由上方 clearSandboxIfCurrent 完成（仅当仍指向本调用的沙箱时），
+        // 此处不再无条件 setSandbox(null)，避免清掉并发兄弟调用的绑定（issue #2490）
+        log.info("[sandbox-diag] releaseForCall DONE: sandbox session released");
     }
 }

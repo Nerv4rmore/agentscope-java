@@ -50,9 +50,21 @@ import org.slf4j.LoggerFactory;
 /**
  * A {@link BaseSandboxFilesystem} that delegates execution to a live {@link Sandbox}.
  *
- * <p>Stable proxy created at agent build time; a fresh {@link Sandbox} is injected on each call
- * via the volatile {@code sandbox} field by {@link
- * io.agentscope.harness.agent.middleware.SandboxLifecycleMiddleware}.
+ * <p>Stable proxy created at agent build time. The live {@link Sandbox} for a call is resolved by
+ * {@link #requireSandbox(RuntimeContext)} with this precedence:
+ *
+ * <ol>
+ *   <li>The per-call binding carried on the invocation's {@link RuntimeContext} (established by
+ *       {@link io.agentscope.harness.agent.middleware.SandboxLifecycleMiddleware} when a sandbox
+ *       is eagerly acquired) — this takes precedence and keeps concurrent distinct-session calls
+ *       on the same agent bean isolated (issue #2490).
+ *   <li>The volatile {@code sandbox} field — a best-effort fallback for context-free internal
+ *       callers that resolve the filesystem with a shared empty {@link RuntimeContext} (e.g.
+ *       {@link io.agentscope.harness.agent.bus.WorkspaceMessageBus}); the middleware maintains it
+ *       via {@link #setSandbox} on acquire and {@link #clearSandboxIfCurrent} on release, so it
+ *       remains last-writer-wins under concurrency and must not be relied on for isolation.
+ *   <li>Lazy creation via the bound {@link SandboxManager} + {@link SandboxContext}.
+ * </ol>
  *
  * <p><b>Lazy sandbox creation:</b> since v2.0.0 the sandbox is no longer created eagerly at the
  * start of every agent call. Instead the {@link
@@ -170,7 +182,7 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
     }
 
     @Override
-    public void setSandbox(Sandbox sandbox) {
+    public synchronized void setSandbox(Sandbox sandbox) {
         this.sandbox = sandbox;
         // 新沙箱注入时（新一轮调用或重新 acquire）清零熔断计数，
         // 让新实例从干净状态开始，避免跨调用误伤
@@ -227,6 +239,19 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
         SandboxAcquireResult r = lazyAcquireResult;
         lazyAcquireResult = null;
         return r;
+    }
+
+    /**
+     * Clears the fallback {@code sandbox} field only if it still points at {@code expected}. Used by
+     * {@link io.agentscope.harness.agent.middleware.SandboxLifecycleMiddleware} on release so a
+     * finishing call never nulls a concurrent sibling call's fallback binding (issue #2490).
+     *
+     * @param expected the sandbox this call bound at acquire time
+     */
+    public synchronized void clearSandboxIfCurrent(Sandbox expected) {
+        if (this.sandbox == expected) {
+            this.sandbox = null;
+        }
     }
 
     @Override
@@ -364,17 +389,35 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
         for (Map.Entry<String, byte[]> file : files) {
             String path = file.getKey();
             byte[] content = file.getValue();
-
-            if (active instanceof SandboxFileTransfer transfer
-                    && transfer.supportsFileTransfer(path)) {
-                try {
-                    transfer.uploadFile(path, content);
-                    results.add(FileUploadResponse.success(path));
-                } catch (Exception e) {
-                    log.warn("[sandbox-fs] native upload failed for path: {}", path, e);
-                    results.add(FileUploadResponse.fail(path, e.getMessage()));
-                }
+            if (content == null) {
+                results.add(FileUploadResponse.fail(path, "File content must not be null"));
                 continue;
+            }
+
+            if (active instanceof SandboxFileTransfer transfer) {
+                String transferPath = null;
+                try {
+                    transferPath = resolveTransferPath(active, path);
+                } catch (IllegalArgumentException e) {
+                    // Same contract as the archive fallback: an invalid path fails this file.
+                    log.warn("[sandbox-fs] uploadFiles failed for path: {}", path, e);
+                    results.add(FileUploadResponse.fail(path, e.getMessage()));
+                    continue;
+                } catch (IOException e) {
+                    log.debug(
+                            "[sandbox-fs] Workspace root unavailable, keeping archive fallback: {}",
+                            path);
+                }
+                if (transferPath != null && transfer.supportsFileTransfer(transferPath)) {
+                    try {
+                        transfer.uploadFile(transferPath, content);
+                        results.add(FileUploadResponse.success(path));
+                    } catch (Exception e) {
+                        log.warn("[sandbox-fs] native upload failed for path: {}", path, e);
+                        results.add(FileUploadResponse.fail(path, e.getMessage()));
+                    }
+                    continue;
+                }
             }
 
             try {
@@ -399,6 +442,8 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
         List<FileDownloadResponse> results = new ArrayList<>(paths.size());
 
         for (String path : paths) {
+            // Reads keep the raw-path probe, unlike uploads: no shared temp state to race on,
+            // and the exec fallback below stays a single round trip.
             if (active instanceof SandboxFileTransfer transfer
                     && transfer.supportsFileTransfer(path)) {
                 try {
@@ -432,6 +477,9 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
     /**
      * 获取当前活跃沙箱；若尚未创建则按需懒创建。
      *
+     * <p>解析优先级：先读按调用绑定到 {@code runtimeContext} 的 {@link SandboxAcquireResult}
+     * （并发会话隔离，issue #2490），再退回共享 {@code sandbox} 字段，最后才走懒创建。
+     *
      * <p>懒创建语义：当 {@code sandbox} 为 null 且已通过 {@link #bindLifecycle} 绑定
      * {@link SandboxManager} + {@link SandboxContext} 时，从 {@code runtimeContext} 取出
      * {@link SandboxContext}，调用 {@link SandboxManager#acquire} 获取沙箱并 {@link Sandbox#start}
@@ -447,7 +495,18 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
      * @throws SandboxException.SandboxConfigurationException 既未注入沙箱也未绑定懒创建依赖
      */
     private Sandbox requireSandbox(RuntimeContext runtimeContext) {
-        Sandbox s = sandbox;
+        // 上游 #2490：优先解析按调用绑定到 RuntimeContext 的沙箱，保证同一 agent bean 上
+        // 并发不同会话的调用互不串绑。
+        Sandbox s = null;
+        if (runtimeContext != null) {
+            SandboxAcquireResult perCallBound = runtimeContext.get(SandboxAcquireResult.class);
+            if (perCallBound != null) {
+                s = perCallBound.getSandbox();
+            }
+        }
+        if (s == null) {
+            s = sandbox;
+        }
         if (s != null) {
             // 诊断：复用当前调用已创建/注入的沙箱（同一次 agent 调用内多个工具共享）
             log.debug(
@@ -566,10 +625,7 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
     /** Constrains an upload path to the workspace and converts it to an archive path. */
     private String resolveArchivePath(Sandbox active, String path) throws IOException {
         AbstractFilesystem.validatePath(path);
-        String normalized = path.replace('\\', '/');
-        while (normalized.startsWith("./")) {
-            normalized = normalized.substring(2);
-        }
+        String normalized = normalizeUploadPath(path);
 
         if (normalized.startsWith("/")) {
             String workspaceRoot = resolveWorkspaceRoot(active);
@@ -582,6 +638,31 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
 
         if (normalized.isBlank()) {
             throw new IOException("Upload path must identify a file: " + path);
+        }
+        return normalized;
+    }
+
+    /**
+     * Normalizes an upload path and resolves it to its sandbox-absolute form so
+     * workspace-relative paths can ride the native single-file transfer
+     * ({@link SandboxFileTransfer#uploadFile}) instead of the archive-hydrate fallback. Throws
+     * {@link IllegalArgumentException} for invalid paths — the caller fails just that file,
+     * matching the archive fallback's validation contract.
+     */
+    private String resolveTransferPath(Sandbox active, String path) throws IOException {
+        AbstractFilesystem.validatePath(path);
+        String normalized = normalizeUploadPath(path);
+        if (normalized.startsWith("/")) {
+            return normalized;
+        }
+        return resolveWorkspaceRoot(active) + "/" + normalized;
+    }
+
+    /** Normalizes separators and strips leading {@code ./} segments. */
+    private static String normalizeUploadPath(String path) {
+        String normalized = path.replace('\\', '/');
+        while (normalized.startsWith("./")) {
+            normalized = normalized.substring(2);
         }
         return normalized;
     }
