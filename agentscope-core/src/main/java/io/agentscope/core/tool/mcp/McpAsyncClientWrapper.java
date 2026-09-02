@@ -64,19 +64,41 @@ public class McpAsyncClientWrapper extends McpClientWrapper {
      */
     @Override
     public Mono<Void> initialize() {
+        return initialize(true);
+    }
+
+    /**
+     * 初始化异步 MCP 客户端，可选是否拉取并缓存工具列表。
+     *
+     * @param discoverTools {@code false} 时仅完成协议握手，不发起 tools/list；
+     *     适用于调用方已从外部（如目录预置）获得工具 schema、只需转发 callTool 的场景。
+     * @return a Mono that completes when initialization is finished
+     */
+    @Override
+    public Mono<Void> initialize(boolean discoverTools) {
         if (initialized) {
             return Mono.empty();
         }
 
-        logger.info("Initializing MCP async client: {}", name);
+        logger.info(
+                "Initializing MCP async client: {} (discoverTools={})", name, discoverTools);
 
-        return client.initialize()
-                .doOnSuccess(
-                        result ->
-                                logger.debug(
-                                        "MCP client '{}' initialized with server: {}",
-                                        name,
-                                        result.serverInfo().name()))
+        Mono<Void> handshake =
+                client.initialize()
+                        .doOnSuccess(
+                                result ->
+                                        logger.debug(
+                                                "MCP client '{}' initialized with server: {}",
+                                                name,
+                                                result.serverInfo().name()))
+                        .then();
+        if (!discoverTools) {
+            // 跳过 tools/list：省一次往返，也规避部分服务端工具 schema 的兼容性问题。
+            return handshake
+                    .doOnSuccess(v -> initialized = true)
+                    .doOnError(e -> logger.error("Failed to initialize MCP client: {}", name, e));
+        }
+        return handshake
                 .then(client.listTools())
                 .doOnNext(
                         result -> {

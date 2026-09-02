@@ -66,6 +66,10 @@ public class SandboxLifecycleMiddleware implements HarnessRuntimeMiddleware {
     private final AtomicReference<SandboxAcquireResult> currentAcquireResult =
             new AtomicReference<>();
     private volatile Consumer<RuntimeContext> beforeStartCallback;
+    // 外部沙箱路径的 acquire 结果：外部沙箱在 acquireForCall 立即 acquire，
+    // 结果暂存于此供 releaseNow 消费（懒创建路径走 filesystemProxy 的 lazyAcquireResult）
+    private final AtomicReference<SandboxAcquireResult> currentAcquireResult =
+            new AtomicReference<>();
 
     public SandboxLifecycleMiddleware(
             SandboxManager sandboxManager, SandboxBackedFilesystem filesystemProxy) {

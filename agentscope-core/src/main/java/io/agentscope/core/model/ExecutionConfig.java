@@ -104,7 +104,12 @@ public class ExecutionConfig {
         }
 
         if (error instanceof ModelHttpException mhe) {
-            return mhe.isRetryableHttpStatus();
+            // 有 HTTP 状态码时按状态码判断（429/5xx 可重试）
+            if (mhe.isRetryableHttpStatus()) {
+                return true;
+            }
+            // 无状态码的 HTTP 异常可能是传输层错误被包装（如 SSE 流中断被包成
+            // OpenAIException），不能直接判定不可重试，需继续沿 cause 链判断
         }
 
         // Timeout errors are retryable
