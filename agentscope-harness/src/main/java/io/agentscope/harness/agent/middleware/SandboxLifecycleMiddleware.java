@@ -21,6 +21,7 @@ import io.agentscope.harness.agent.sandbox.Sandbox;
 import io.agentscope.harness.agent.sandbox.SandboxAcquireResult;
 import io.agentscope.harness.agent.sandbox.SandboxContext;
 import io.agentscope.harness.agent.sandbox.SandboxManager;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -71,6 +72,10 @@ public class SandboxLifecycleMiddleware implements HarnessRuntimeMiddleware {
     private final SandboxManager sandboxManager;
     private final SandboxBackedFilesystem filesystemProxy;
     private volatile Consumer<RuntimeContext> beforeStartCallback;
+    // 外部沙箱路径的 acquire 结果：外部沙箱在 acquireForCall 立即 acquire，
+    // 结果暂存于此供 releaseNow 消费（懒创建路径走 filesystemProxy 的 lazyAcquireResult）
+    private final AtomicReference<SandboxAcquireResult> currentAcquireResult =
+            new AtomicReference<>();
 
     public SandboxLifecycleMiddleware(
             SandboxManager sandboxManager, SandboxBackedFilesystem filesystemProxy) {

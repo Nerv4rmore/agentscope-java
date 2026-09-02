@@ -43,6 +43,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -617,7 +618,42 @@ public class McpClientBuilder {
 
         @Override
         public <T> T unmarshalFrom(Object data, TypeRef<T> typeRef) {
-            return delegate.unmarshalFrom(data, typeRef);
+            return delegate.unmarshalFrom(sanitizeAdditionalProperties(data), typeRef);
+        }
+
+        /**
+         * Sanitizes object-valued {@code additionalProperties} in deserialized response data.
+         *
+         * <p>The MCP Java SDK models {@code McpSchema.JsonSchema.additionalProperties} as
+         * {@link Boolean}, but some servers (e.g. the official Notion MCP) return object-valued
+         * JSON Schema for {@code additionalProperties} in tools/list. Jackson then fails with
+         * {@code MismatchedInputException}, breaking client initialization entirely.
+         *
+         * <p>This method recursively replaces object-valued {@code additionalProperties} with
+         * {@code true}, relaxing the constraint from "extra properties must match the sub-schema"
+         * to "extra properties allowed" — safe for argument validation on tool calls.
+         */
+        private static Object sanitizeAdditionalProperties(Object data) {
+            if (data instanceof Map<?, ?> map) {
+                Map<Object, Object> copy = new LinkedHashMap<>(map.size());
+                for (Map.Entry<?, ?> entry : map.entrySet()) {
+                    Object value = entry.getValue();
+                    if ("additionalProperties".equals(entry.getKey()) && value instanceof Map) {
+                        copy.put(entry.getKey(), Boolean.TRUE);
+                    } else {
+                        copy.put(entry.getKey(), sanitizeAdditionalProperties(value));
+                    }
+                }
+                return copy;
+            }
+            if (data instanceof List<?> list) {
+                List<Object> copy = new ArrayList<>(list.size());
+                for (Object item : list) {
+                    copy.add(sanitizeAdditionalProperties(item));
+                }
+                return copy;
+            }
+            return data;
         }
     }
 

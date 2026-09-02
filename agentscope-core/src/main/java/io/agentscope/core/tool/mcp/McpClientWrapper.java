@@ -85,6 +85,18 @@ public abstract class McpClientWrapper implements AutoCloseable {
     public abstract Mono<Void> initialize();
 
     /**
+     * 初始化 MCP 客户端连接。
+     *
+     * @param discoverTools 握手完成后是否额外发起 tools/list 拉取并缓存工具列表。
+     *     调用方已持有工具 schema（如来自外部目录预置）时可传 {@code false}，
+     *     省去一次网络往返。默认实现忽略该参数，委托给 {@link #initialize()}。
+     * @return a Mono that completes when initialization is finished
+     */
+    public Mono<Void> initialize(boolean discoverTools) {
+        return initialize();
+    }
+
+    /**
      * Lists all tools available from this MCP server.
      *
      * @return a Mono emitting the list of available tools
