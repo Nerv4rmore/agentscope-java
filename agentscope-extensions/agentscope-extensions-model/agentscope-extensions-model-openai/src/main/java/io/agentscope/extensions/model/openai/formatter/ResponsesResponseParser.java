@@ -23,6 +23,7 @@ import io.agentscope.core.model.ChatResponse;
 import io.agentscope.core.model.ChatUsage;
 import io.agentscope.core.util.JsonException;
 import io.agentscope.core.util.JsonUtils;
+import io.agentscope.extensions.model.openai.dto.OpenAIError;
 import io.agentscope.extensions.model.openai.dto.ResponsesOutputItem;
 import io.agentscope.extensions.model.openai.dto.ResponsesResponse;
 import io.agentscope.extensions.model.openai.dto.ResponsesStreamEvent;
@@ -370,7 +371,7 @@ public class ResponsesResponseParser {
     }
 
     private OpenAIException buildStreamErrorException(ResponsesStreamEvent event) {
-        // For response.failed, the error is nested inside response.error
+        // 形态 1：response.failed — 错误嵌在 response.error 里
         if (event.getResponse() != null && event.getResponse().getError() != null) {
             return OpenAIException.create(
                     400,
@@ -378,8 +379,32 @@ public class ResponsesResponseParser {
                     event.getResponse().getError().getCode(),
                     null);
         }
-        // For bare "error" events, code/message are on the event itself
-        String message = event.getMessage() != null ? event.getMessage() : "Unknown stream error";
+        // 形态 2：type=error 且载荷嵌在 event.error 里（OpenAI 实测：额度耗尽、内容审查
+        // 等部分失败模式会走这个形态），而非 event 顶层的 code/message。
+        if (event.getError() != null) {
+            OpenAIError err = event.getError();
+            String msg = err.getMessage() != null ? err.getMessage() : err.getType();
+            return OpenAIException.create(
+                    400, "Responses API stream error: " + msg, err.getCode(), null);
+        }
+        // 形态 3：裸 error 事件，code/message 在顶层
+        String message = event.getMessage();
+        if (message == null) {
+            // 三种已知形态都没命中：把事件完整快照打出来。extraFields 由
+            // @JsonAnySetter 收集所有未建模字段，便于线上定位第四种未知形态。
+            log.error(
+                    "[Responses stream error] unrecognized event shape: type={}, topLevelCode={},"
+                            + " responseStatus={}, responseError={}, itemId={}, outputIndex={},"
+                            + " extraFields={}",
+                    event.getType(),
+                    event.getCode(),
+                    event.getResponse() != null ? event.getResponse().getStatus() : null,
+                    event.getResponse() != null ? event.getResponse().getError() : null,
+                    event.getItemId(),
+                    event.getOutputIndex(),
+                    event.getExtraFields());
+            message = "Unknown stream error";
+        }
         return OpenAIException.create(
                 400, "Responses API stream error: " + message, event.getCode(), null);
     }
