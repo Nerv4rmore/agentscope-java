@@ -15,8 +15,12 @@
  */
 package io.agentscope.extensions.model.openai.dto;
 
+import com.fasterxml.jackson.annotation.JsonAnyGetter;
+import com.fasterxml.jackson.annotation.JsonAnySetter;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonProperty;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 /**
  * Responses API 流式 SSE 事件统一容器。
@@ -65,6 +69,33 @@ public class ResponsesStreamEvent {
 
     /** Error message (for bare "error" events). */
     private String message;
+
+    /**
+     * Nested error object (for {@code "type":"error"} events where OpenAI wraps the payload
+     * inside an {@code error} field instead of surfacing {@code code}/{@code message} at the
+     * top level). Real-world example observed 2026-09-14 on {@code /v1/responses} when the
+     * API key runs out of quota:
+     * <pre>{@code
+     * {"type":"error",
+     *  "error":{"type":"insufficient_quota","code":"credit_balance_exhausted",
+     *           "message":"You have no credits remaining...","param":null},
+     *  "sequence_number":2}
+     * }</pre>
+     * Without this field the parser falls through to "Unknown stream error" and hides the
+     * actionable message from the client.
+     */
+    private OpenAIError error;
+
+    /**
+     * 未在本 DTO 建模的额外字段（如 {@code sequence_number}、{@code metadata} 等）。通过
+     * {@link JsonAnySetter} 收集，供异常路径下
+     * {@link io.agentscope.extensions.model.openai.formatter.ResponsesResponseParser}
+     * 打印事件快照定位使用；正常业务逻辑不消费此字段。
+     *
+     * <p>不加此字段的后果：类级 {@code @JsonIgnoreProperties(ignoreUnknown = true)} 会
+     * 把未建模字段静默丢弃，出现 "Unknown stream error" 时无法反查上游载荷。
+     */
+    private Map<String, Object> extraFields;
 
     public ResponsesStreamEvent() {}
 
@@ -146,5 +177,26 @@ public class ResponsesStreamEvent {
 
     public void setMessage(String message) {
         this.message = message;
+    }
+
+    public OpenAIError getError() {
+        return error;
+    }
+
+    public void setError(OpenAIError error) {
+        this.error = error;
+    }
+
+    @JsonAnyGetter
+    public Map<String, Object> getExtraFields() {
+        return extraFields;
+    }
+
+    @JsonAnySetter
+    public void addExtraField(String key, Object value) {
+        if (this.extraFields == null) {
+            this.extraFields = new LinkedHashMap<>();
+        }
+        this.extraFields.put(key, value);
     }
 }
