@@ -313,6 +313,11 @@ public final class AgentSpecLoader {
         if (exposeToUser == null) {
             exposeToUser = asNullableBoolean(fm.get("exposeToUser"));
         }
+        Boolean enablePendingToolRecovery =
+                asNullableBoolean(fm.get("enable_pending_tool_recovery"));
+        if (enablePendingToolRecovery == null) {
+            enablePendingToolRecovery = asNullableBoolean(fm.get("enablePendingToolRecovery"));
+        }
 
         List<String> tools = parseToolNames(asString(fm.get("tools")));
         List<String> skills = parseToolNames(asString(fm.get("skills")));
@@ -336,6 +341,7 @@ public final class AgentSpecLoader {
                         .hidden(hidden)
                         .canSpawn(canSpawn)
                         .exposeToUser(exposeToUser)
+                        .enablePendingToolRecovery(enablePendingToolRecovery)
                         .tools(tools.isEmpty() ? null : tools)
                         .skills(skills.isEmpty() ? null : skills)
                         .activateToolGroups(

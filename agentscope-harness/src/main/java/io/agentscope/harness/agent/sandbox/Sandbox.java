@@ -110,13 +110,22 @@ public interface Sandbox extends AutoCloseable {
      * MIME-decodes the stdout. Backends that expose a dedicated download endpoint (e.g. AgentRun
      * {@code GET /filesystem/download}) should override this for better efficiency.
      *
+     * <p>A truncated stdout means the sandbox capped the command output, so the decoded bytes
+     * would be a silently corrupted file — reject it instead (upstream #2923).
+     *
      * @param path absolute source path inside the sandbox
      * @return raw file bytes
-     * @throws Exception if the download fails
+     * @throws Exception if the download fails or the output was truncated
      */
     default byte[] downloadFile(String path) throws Exception {
         String safePath = path.replace("'", "'\"'\"'");
         ExecResult r = exec(null, "base64 '" + safePath + "'", null);
+        if (!r.ok()) {
+            throw new java.io.IOException(r.combinedOutput());
+        }
+        if (r.truncated()) {
+            throw new java.io.IOException("File download output was truncated by the sandbox");
+        }
         return Base64.getMimeDecoder().decode(r.stdout() != null ? r.stdout() : "");
     }
 }

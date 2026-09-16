@@ -99,6 +99,19 @@ class SandboxBackedFilesystemTest {
     }
 
     @Test
+    void downloadFiles_rejectsTruncatedExecOutput() {
+        SandboxBackedFilesystem filesystem = new SandboxBackedFilesystem();
+        FakeSandbox sandbox = new FakeSandbox(new ExecResult(0, "partial", "", true));
+        filesystem.setSandbox(sandbox);
+
+        List<FileDownloadResponse> responses =
+                filesystem.downloadFiles(RT, List.of("/tmp/truncated.bin"));
+
+        assertTrue(!responses.get(0).isSuccess());
+        assertEquals("File download output was truncated by the sandbox", responses.get(0).error());
+    }
+
+    @Test
     void uploadFiles_prefersNativeTransferWhenSupported() {
         SandboxBackedFilesystem filesystem = new SandboxBackedFilesystem();
         FakeTransferSandbox sandbox = new FakeTransferSandbox("/workspace");
@@ -497,7 +510,12 @@ class SandboxBackedFilesystemTest {
                 }
                 throw new RuntimeException(downloadError);
             }
-            return downloadResult != null ? downloadResult : new byte[0];
+            if (downloadResult == null) {
+                // No canned native payload: fall through to the interface default so tests that
+                // only stub exec() observe the real shell-base64 path (incl. truncation guard).
+                return Sandbox.super.downloadFile(path);
+            }
+            return downloadResult;
         }
     }
 

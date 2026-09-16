@@ -228,8 +228,7 @@ public class SandboxLifecycleMiddleware implements HarnessRuntimeMiddleware {
         if (result == null) {
             // 本次调用从未创建沙箱，无需释放；不再无条件清空共享字段，
             // 避免误清并发兄弟调用的兜底绑定（issue #2490）
-            log.info(
-                    "[sandbox-diag] releaseForCall: no sandbox created this call (skip release)");
+            log.info("[sandbox-diag] releaseForCall: no sandbox created this call (skip release)");
             return;
         }
         if (ctx != null) {

@@ -207,7 +207,9 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
      *     根），供懒创建时兜底使用；可为 {@code null}
      */
     public void bindLifecycle(
-            SandboxManager sandboxManager, SandboxContext sandboxContext, RuntimeContext callContext) {
+            SandboxManager sandboxManager,
+            SandboxContext sandboxContext,
+            RuntimeContext callContext) {
         synchronized (lifecycleLock) {
             if (releaseCompleted) {
                 releaseRequested = false;
@@ -457,6 +459,10 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
             }
 
             try {
+                // Polymorphic dispatch: backends with a dedicated download endpoint (AgentRun's
+                // data-plane GET /filesystem/download) override Sandbox#downloadFile and bypass the
+                // shell base64 round trip entirely. The default implementation in that interface
+                // carries the sandbox-truncation guard (upstream #2923).
                 byte[] bytes = active.downloadFile(path);
                 results.add(FileDownloadResponse.success(path, bytes));
             } catch (SandboxException.ExecException e) {

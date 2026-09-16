@@ -23,6 +23,7 @@ import io.agentscope.core.agent.RuntimeContext;
 import io.agentscope.core.agent.StreamOptions;
 import io.agentscope.core.agent.SubagentEventBus;
 import io.agentscope.core.agent.accumulator.ReasoningContext;
+import io.agentscope.core.agent.config.FailoverListener;
 import io.agentscope.core.agent.config.ModelConfig;
 import io.agentscope.core.agent.config.ReactConfig;
 import io.agentscope.core.event.AgentEndEvent;
@@ -703,7 +704,7 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
 
     private static ModelConfig assembleModelConfig(Builder b) {
         int retries = b.flatMaxRetries != null ? b.flatMaxRetries : ModelConfig.DEFAULT_MAX_RETRIES;
-        return new ModelConfig(retries, b.flatFallbackModel);
+        return new ModelConfig(retries, b.flatFallbackModel, b.flatFailoverListener);
     }
 
     private static ReactConfig assembleReactConfig(Builder b) {
@@ -1216,7 +1217,12 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                     }
                     return scope.doCallInner(msgs)
                             .onErrorResume(error -> saveStateAfterCallFailure(scope, error))
-                            .flatMap(result -> saveStateToSession(scope).thenReturn(result));
+                            .flatMap(result -> saveStateToSession(scope).thenReturn(result))
+                            .switchIfEmpty(
+                                    Mono.defer(
+                                            () ->
+                                                    saveStateToSession(scope)
+                                                            .then(Mono.<Msg>empty())));
                 });
     }
 
@@ -1273,9 +1279,7 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                     .onErrorResume(
                             error ->
                                     Mono.deferContextual(
-                                            cv ->
-                                                    saveStateAfterCallFailure(
-                                                            scopeFrom(cv), error)));
+                                            cv -> saveStateAfterCallFailure(scopeFrom(cv), error)));
         }
         return doFallbackStructuredCall(msgs, jsonSchema)
                 // 错误路径补落盘：与主调用路径 doCall 保持一致
@@ -1325,6 +1329,11 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                                         Msg out = wrapNativeStructuredResult(result);
                                         return saveStateToSession(scope).thenReturn(out);
                                     })
+                            .switchIfEmpty(
+                                    Mono.defer(
+                                            () ->
+                                                    saveStateToSession(scope)
+                                                            .then(Mono.<Msg>empty())))
                             .doOnError(
                                     e -> {
                                         List<Msg> ctx = scope.state.contextMutable();
@@ -1385,7 +1394,12 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                                             scope.state.contextMutable().add(out);
                                         }
                                         return saveStateToSession(scope).thenReturn(out);
-                                    });
+                                    })
+                            .switchIfEmpty(
+                                    Mono.defer(
+                                            () ->
+                                                    saveStateToSession(scope)
+                                                            .then(Mono.<Msg>empty())));
                 });
     }
 
@@ -1409,6 +1423,7 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                     .content(result.getContent())
                     .metadata(metadata)
                     .timestamp(result.getTimestamp())
+                    .usage(result.getUsage())
                     .build();
         } catch (Exception e) {
             log.warn("Failed to parse native structured output as JSON: {}", e.getMessage());
@@ -1578,12 +1593,38 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                     && Boolean.TRUE.equals(result.getMetadata().get("success"))
                     && result.getMetadata().containsKey("response_msg")) {
                 Object responseMsgObj = result.getMetadata().get("response_msg");
-                if (responseMsgObj instanceof Msg responseMsg) {
+                Msg responseMsg = toMsg(responseMsgObj);
+                if (responseMsg != null) {
                     return extractResponseData(responseMsg);
                 }
             }
         }
         return hookResultMsg;
+    }
+
+    /**
+     * Restores a {@link Msg} from a metadata value.
+     *
+     * <p>After a JSON persistence round-trip (agent session save/load) the typed message
+     * stored in {@code ToolResultBlock.metadata["response_msg"]} is restored as a {@code LinkedHashMap},
+     * so it is converted back to its typed form here.
+     *
+     * @param value the raw metadata value
+     * @return the typed message, or {@code null} if it cannot be restored
+     */
+    private static Msg toMsg(Object value) {
+        if (value instanceof Msg msg) {
+            return msg;
+        }
+        if (value instanceof Map<?, ?>) {
+            try {
+                return JsonUtils.getJsonCodec().convertValue(value, Msg.class);
+            } catch (RuntimeException e) {
+                log.warn("Failed to restore response_msg from tool result metadata", e);
+                return null;
+            }
+        }
+        return null;
     }
 
     private Msg extractResponseData(Msg responseMsg) {
@@ -1627,6 +1668,7 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                 .content(newContent)
                 .metadata(metadata)
                 .timestamp(msg.getTimestamp())
+                .usage(chatUsage)
                 .build();
     }
 
@@ -1744,7 +1786,7 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
             // by shutdown, the client is likely retrying with the same user prompt that already
             // exists in memory. Discard the duplicate input so the agent resumes purely from its
             // saved memory context.
-            if (shutdownManager.checkAndClearShutdownInterrupted(ReActAgent.this)) {
+            if (shutdownManager.checkAndClearShutdownInterruptedForState(state)) {
                 log.info(
                         "Detected shutdown-interrupted session for agent {}, discarding duplicate"
                                 + " input",
@@ -2593,7 +2635,11 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                             () -> {
                                 List<AgentEvent> events = new ArrayList<>();
                                 blockLifecycle.flushAll(events);
-                                events.add(new ModelCallEndEvent(replyId, context.getMessageId(), context.getChatUsage()));
+                                events.add(
+                                        new ModelCallEndEvent(
+                                                replyId,
+                                                context.getMessageId(),
+                                                context.getChatUsage()));
                                 return Flux.fromIterable(events);
                             });
 
@@ -2611,14 +2657,19 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                 blockLifecycle.startText(events);
                 if (tb.getText() != null && !tb.getText().isEmpty()) {
                     events.add(
-                            new TextBlockDeltaEvent(blockLifecycle.replyId, "text", tb.getText()));
+                            new TextBlockDeltaEvent(
+                                    blockLifecycle.replyId,
+                                    blockLifecycle.currentTextBlockId(),
+                                    tb.getText()));
                 }
             } else if (block instanceof ThinkingBlock tb) {
                 blockLifecycle.startThinking(events);
                 if (tb.getThinking() != null && !tb.getThinking().isEmpty()) {
                     events.add(
                             new ThinkingBlockDeltaEvent(
-                                    blockLifecycle.replyId, "thinking", tb.getThinking()));
+                                    blockLifecycle.replyId,
+                                    blockLifecycle.currentThinkingBlockId(),
+                                    tb.getThinking()));
                 }
             } else if (withToolEvents && block instanceof ToolUseBlock tub) {
                 String toolId = resolveToolCallId(tub, context);
@@ -2640,13 +2691,17 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
          *
          * <p>The model stream is consumed through {@code concatMap}, but the state holders keep the
          * previous thread-safe shape because model providers may deliver chunk content
-         * unpredictably. This helper only changes when pending end events are flushed; it does not
-         * change the block identity or event payloads.
+         * unpredictably. Each contiguous text or thinking segment receives its own block ID so its
+         * start, delta, and end events can be correlated independently.
          */
         private final class ModelCallBlockLifecycle {
             private final String replyId;
             private final AtomicBoolean textStarted = new AtomicBoolean(false);
+            private final AtomicLong textSegmentSequence = new AtomicLong(0);
+            private final AtomicReference<String> currentTextBlockId = new AtomicReference<>();
             private final AtomicBoolean thinkingStarted = new AtomicBoolean(false);
+            private final AtomicLong thinkingSegmentSequence = new AtomicLong(0);
+            private final AtomicReference<String> currentThinkingBlockId = new AtomicReference<>();
             private final Map<String, String> startedToolCalls = new ConcurrentHashMap<>();
 
             private ModelCallBlockLifecycle(String replyId) {
@@ -2656,14 +2711,28 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
             private void startText(List<AgentEvent> events) {
                 flushThinking(events);
                 if (textStarted.compareAndSet(false, true)) {
-                    events.add(new TextBlockStartEvent(replyId, "text"));
+                    long segment = textSegmentSequence.incrementAndGet();
+                    String blockId = segment == 1 ? "text" : "text-" + segment;
+                    currentTextBlockId.set(blockId);
+                    events.add(new TextBlockStartEvent(replyId, blockId));
                 }
+            }
+
+            private String currentTextBlockId() {
+                return currentTextBlockId.get();
             }
 
             private void startThinking(List<AgentEvent> events) {
                 if (thinkingStarted.compareAndSet(false, true)) {
-                    events.add(new ThinkingBlockStartEvent(replyId, "thinking"));
+                    long segment = thinkingSegmentSequence.incrementAndGet();
+                    String blockId = segment == 1 ? "thinking" : "thinking-" + segment;
+                    currentThinkingBlockId.set(blockId);
+                    events.add(new ThinkingBlockStartEvent(replyId, blockId));
                 }
+            }
+
+            private String currentThinkingBlockId() {
+                return currentThinkingBlockId.get();
             }
 
             private void startToolCall(String toolId, String toolName, List<AgentEvent> events) {
@@ -2681,13 +2750,15 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
 
             private void flushText(List<AgentEvent> events) {
                 if (textStarted.compareAndSet(true, false)) {
-                    events.add(new TextBlockEndEvent(replyId, "text"));
+                    String blockId = currentTextBlockId.getAndSet(null);
+                    events.add(new TextBlockEndEvent(replyId, blockId));
                 }
             }
 
             private void flushThinking(List<AgentEvent> events) {
                 if (thinkingStarted.compareAndSet(true, false)) {
-                    events.add(new ThinkingBlockEndEvent(replyId, "thinking"));
+                    String blockId = currentThinkingBlockId.getAndSet(null);
+                    events.add(new ThinkingBlockEndEvent(replyId, blockId));
                 }
             }
 
@@ -3066,7 +3137,8 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                                                         executeToolCalls(approved)
                                                                 .contextWrite(
                                                                         ctx -> {
-                                                                            // fork: 延迟事件发射器随工具批次下发；上游：分离的工具批次补发事件发射器兑底（#2483）
+                                                                            // fork:
+                                                                            // 延迟事件发射器随工具批次下发；上游：分离的工具批次补发事件发射器兑底（#2483）
                                                                             Context merged =
                                                                                     ctx.putAll(
                                                                                                     parentCtx)
@@ -3707,7 +3779,8 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                                                                             new TextBlockDeltaEvent(
                                                                                     blockLifecycle
                                                                                             .replyId,
-                                                                                    "text",
+                                                                                    blockLifecycle
+                                                                                            .currentTextBlockId(),
                                                                                     tb.getText()));
                                                                 }
                                                             } else if (block
@@ -3721,7 +3794,8 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                                                                             new ThinkingBlockDeltaEvent(
                                                                                     blockLifecycle
                                                                                             .replyId,
-                                                                                    "thinking",
+                                                                                    blockLifecycle
+                                                                                            .currentThinkingBlockId(),
                                                                                     tb
                                                                                             .getThinking()));
                                                                 }
@@ -3735,7 +3809,11 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                             () -> {
                                 List<AgentEvent> events = new ArrayList<>();
                                 blockLifecycle.flushAll(events);
-                                events.add(new ModelCallEndEvent(replyId, context.getMessageId(), context.getChatUsage()));
+                                events.add(
+                                        new ModelCallEndEvent(
+                                                replyId,
+                                                context.getMessageId(),
+                                                context.getChatUsage()));
                                 return Flux.fromIterable(events);
                             });
 
@@ -3775,6 +3853,8 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                                                                     + " generating summary: %s",
                                                             maxIters, error.getMessage()))
                                             .build())
+                            .metadata(Map.of(MessageMetadataKeys.SUMMARY_FAILED, true))
+                            .generateReason(GenerateReason.MAX_ITERATIONS)
                             .build();
             state.contextMutable().add(errorMsg);
             return Mono.just(errorMsg);
@@ -4050,13 +4130,16 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
         if (fallbackModel == null) {
             return model;
         }
+        FailoverListener failoverListener = modelConfig.failoverListener();
 
         AtomicReference<Model> activeModel = new AtomicReference<>(model);
         return new Model() {
             @Override
             public Flux<ChatResponse> stream(
                     List<Msg> messages, List<ToolSchema> tools, GenerateOptions options) {
-                Flux<ChatResponse> primaryFlux = model.stream(messages, tools, options);
+                // Route synchronous model setup failures through the same first-signal fallback.
+                Flux<ChatResponse> primaryFlux =
+                        Flux.defer(() -> model.stream(messages, tools, options));
                 return primaryFlux.switchOnFirst(
                         (signal, flux) -> {
                             if (signal.isOnError()) {
@@ -4067,6 +4150,7 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                                         model.getModelName(),
                                         fallbackModel.getModelName(),
                                         error);
+                                notifyFailover(failoverListener, model, error);
                                 return fallbackModel.stream(messages, tools, options);
                             }
                             return flux;
@@ -4088,6 +4172,22 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                 return activeModel.get().getContextWindowSize();
             }
         };
+    }
+
+    /**
+     * Notifies the failover listener at the switch site. An exception from the listener is
+     * contained here: it is logged and does not affect the switch or the fallback call that
+     * follows.
+     */
+    private static void notifyFailover(FailoverListener listener, Model primary, Throwable error) {
+        if (listener == null) {
+            return;
+        }
+        try {
+            listener.onFailover(primary, error);
+        } catch (Exception e) {
+            log.warn("Failover listener threw an exception, ignoring", e);
+        }
     }
 
     @Override
@@ -4238,6 +4338,7 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
     public void clearStateCache() {
         stateCache.clear();
         permissionEngineCache.clear();
+        slotVersions.clear();
     }
 
     /**
@@ -4268,6 +4369,7 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
         String slot = slotKey(userId, sid);
         stateCache.remove(slot);
         permissionEngineCache.remove(slot);
+        slotVersions.remove(slot);
     }
 
     /**
@@ -4586,6 +4688,7 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
         // Flat setters backing ModelConfig / ReactConfig values
         private Integer flatMaxRetries;
         private Model flatFallbackModel;
+        private FailoverListener flatFailoverListener;
         private Boolean flatStopOnReject;
         private AgentStateStore stateStore;
         private ConflictPolicy conflictPolicy;
@@ -4985,6 +5088,17 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
         }
 
         /**
+         * Sets the listener notified when the fallback model takes over from a failed primary
+         * model. Pass {@code null} to explicitly clear (no notification).
+         *
+         * @see FailoverListener for the threading and failure contract
+         */
+        public Builder failoverListener(FailoverListener failoverListener) {
+            this.flatFailoverListener = failoverListener;
+            return this;
+        }
+
+        /**
          * Controls whether a permission rejection of any tool call terminates the reasoning loop
          * (instead of feeding the rejection back into the next reasoning round). Defaults to
          * {@link ReactConfig#DEFAULT_STOP_ON_REJECT}.
@@ -5195,6 +5309,7 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
             if (srcModelConfig != null) {
                 b.flatMaxRetries = srcModelConfig.maxRetries();
                 b.flatFallbackModel = srcModelConfig.fallbackModel();
+                b.flatFailoverListener = srcModelConfig.failoverListener();
             }
             b.toolkit = agent.getToolkit().copy();
             return b;
