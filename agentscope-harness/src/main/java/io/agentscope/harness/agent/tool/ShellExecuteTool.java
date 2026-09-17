@@ -60,7 +60,10 @@ public class ShellExecuteTool {
             @ToolParam(
                             name = "working_directory",
                             description =
-                                    "Working directory (relative to workspace root, optional)",
+                                    "Sub-path of the current working directory to run in (optional)."
+                                        + " Commands already start in your session working"
+                                        + " directory, so omit this for the common case. Must be"
+                                        + " relative — absolute paths, '~' and '..' are rejected.",
                             required = false)
                     String workingDirectory,
             @ToolParam(
@@ -75,7 +78,10 @@ public class ShellExecuteTool {
             String wd = workingDirectory.strip();
             if (wd.startsWith("/") || wd.startsWith("~") || wd.contains("..")) {
                 return "Error: working_directory must be a relative path within the workspace"
-                        + " (absolute paths, '~', and '..' are not allowed).";
+                        + " (absolute paths, '~', and '..' are not allowed). Commands already run"
+                        + " in the session working directory, so omit working_directory (or use"
+                        + " '.') — an absolute path you may have copied from `pwd` points at that"
+                        + " same directory.";
             }
             // 命令始终在 Linux 沙箱内执行，与宿主机 OS 无关，恒用 POSIX cd 语法；
             // 宿主机为 Windows 时若生成 `cd /d "..."` 会导致沙箱 bash 报 "cd: too many arguments"

@@ -16,10 +16,13 @@
 package io.agentscope.core.tool;
 
 import io.agentscope.core.agent.Agent;
+import io.agentscope.core.agent.RuntimeContext;
 import io.agentscope.core.message.ToolResultBlock;
 import io.agentscope.core.message.ToolUseBlock;
 import io.agentscope.core.model.ExecutionConfig;
 import io.agentscope.core.model.ToolSchema;
+import io.agentscope.core.state.AgentState;
+import io.agentscope.core.state.ToolContextState;
 import io.agentscope.core.tool.mcp.McpClientWrapper;
 import io.agentscope.core.tool.subagent.SubAgentConfig;
 import io.agentscope.core.tool.subagent.SubAgentProvider;
@@ -564,6 +567,18 @@ public class Toolkit {
         return mcpClientManager.removeMcpClient(mcpClientName);
     }
 
+    /** Releases clients registered by this toolkit. Copies do not own the source's clients. */
+    public void closeMcpClients() {
+        for (String name : mcpClientManager.getMcpClientNames()) {
+            try {
+                removeMcpClient(name).block();
+            } catch (RuntimeException e) {
+                logger.warn(
+                        "MCP client '{}' cleanup failed ({})", name, e.getClass().getSimpleName());
+            }
+        }
+    }
+
     // ==================== Tool Group Management (Delegated) ====================
 
     /**
@@ -647,6 +662,24 @@ public class Toolkit {
     }
 
     /**
+     * Add an already-registered tool to an existing tool group.
+     *
+     * <p>A tool may belong to multiple groups. Adding the same tool to the same group more than
+     * once has no additional effect.
+     *
+     * @param groupName Name of the existing tool group
+     * @param toolName Name of the registered tool
+     * @throws IllegalArgumentException if the group or tool doesn't exist
+     */
+    public void addToolToGroup(String groupName, String toolName) {
+        groupManager.validateGroupExists(groupName);
+        if (toolRegistry.getTool(toolName) == null) {
+            throw new IllegalArgumentException("Tool not found: " + toolName);
+        }
+        groupManager.addToolToGroup(groupName, toolName);
+    }
+
+    /**
      * Update the activation status of tool groups.
      *
      * <p>When {@code allowToolDeletion} is disabled and {@code active} is false, the deactivation
@@ -664,6 +697,41 @@ public class Toolkit {
             return;
         }
         groupManager.updateToolGroups(groupNames, active);
+    }
+
+    /**
+     * 更新工具组的激活状态，同时直接写入 per-call state，避免依赖
+     * {@code syncToolkitToState} 从共享 Toolkit 拷贝（后者在并发下会被其他会话污染）。
+     *
+     * <p>中间件在 {@code onActing / onReasoning / onSystemPrompt} 中应优先使用本方法，
+     * 确保 state.activatedGroups 始终反映本次调用的真实意图。
+     *
+     * @param groupNames 要更新的工具组名列表
+     * @param active true=激活，false=停用
+     * @param rc 当前调用的 RuntimeContext，可为 null（退化为旧行为）
+     */
+    public void updateToolGroups(List<String> groupNames, boolean active, RuntimeContext rc) {
+        // 先走旧逻辑更新共享标志（保持 isActiveTool fallback 路径的一致性）
+        updateToolGroups(groupNames, active);
+        // 再直接更新 per-call state，不经过共享 Toolkit 拷贝
+        if (rc == null || groupNames == null) {
+            return;
+        }
+        AgentState state = rc.getAgentState();
+        if (state == null) {
+            return;
+        }
+        ToolContextState toolContext = state.getToolContext();
+        if (toolContext == null) {
+            return;
+        }
+        for (String groupName : groupNames) {
+            if (active) {
+                toolContext.addActivatedGroup(groupName);
+            } else {
+                toolContext.removeActivatedGroup(groupName);
+            }
+        }
     }
 
     /**
@@ -832,6 +900,7 @@ public class Toolkit {
         private Map<String, Map<String, Object>> presetParameters;
         private ExtendedModel extendedModel;
         private List<String> enableTools;
+        private String mcpToolNamePrefix = "";
         private List<String> disableTools;
 
         private ToolRegistration(Toolkit toolkit) {
@@ -941,14 +1010,13 @@ public class Toolkit {
             return this;
         }
 
-        /**
-         * Set the list of tools to enable from the MCP client.
-         *
-         * <p>Only applicable when using mcpClient(). If not specified, all tools are enabled.
-         *
-         * @param enableTools List of tool names to enable
-         * @return This builder for chaining
-         */
+        /** Optional namespace for model-facing MCP tool names; wire names remain unchanged. */
+        public ToolRegistration mcpToolNamePrefix(String prefix) {
+            this.mcpToolNamePrefix = java.util.Objects.requireNonNull(prefix);
+            return this;
+        }
+
+        /** Selects remote tool names; an absent or empty list enables all tools. */
         public ToolRegistration enableTools(List<String> enableTools) {
             this.enableTools = enableTools;
             return this;
@@ -1051,7 +1119,8 @@ public class Toolkit {
                                 enableTools,
                                 disableTools,
                                 groupName,
-                                presetParameters)
+                                presetParameters,
+                                mcpToolNamePrefix)
                         .block();
             } else if (subAgentProvider != null) {
                 SubAgentTool subAgentTool = new SubAgentTool(subAgentProvider, subAgentConfig);

@@ -80,8 +80,7 @@ public class McpAsyncClientWrapper extends McpClientWrapper {
             return Mono.empty();
         }
 
-        logger.info(
-                "Initializing MCP async client: {} (discoverTools={})", name, discoverTools);
+        logger.info("Initializing MCP async client: {} (discoverTools={})", name, discoverTools);
 
         Mono<Void> handshake =
                 client.initialize()

@@ -16,6 +16,7 @@
 package io.agentscope.harness.agent.sandbox;
 
 import io.agentscope.core.agent.RuntimeContext;
+import io.agentscope.harness.agent.sandbox.snapshot.SandboxSnapshotSpec;
 import java.util.Objects;
 import java.util.Optional;
 import org.slf4j.Logger;
@@ -26,7 +27,9 @@ import org.slf4j.LoggerFactory;
  *
  * <p>Acquire priority: {@link SandboxContext#getExternalSandbox()} &gt; {@link
  * SandboxContext#getExternalSandboxState()} &gt; persisted {@link SandboxState} &gt; {@link
- * SandboxClient#create}.
+ * SandboxClient#create}. When a persisted state exists but the resume fails, the fresh-create
+ * fallback keeps the persisted snapshot id so the workspace restores from the previous archive
+ * instead of silently resetting.
  *
  * <p>When a {@link SandboxExecutionGuard} is configured, the manager acquires an execution
  * {@link SandboxLease} before sandbox resume/create for isolation keys that are present. The
@@ -111,6 +114,7 @@ public class SandboxManager {
         }
 
         try {
+            String persistedSnapshotId = null;
             if (scopeKey.isPresent()) {
                 try {
                     Optional<String> stateJson = stateStore.load(scopeKey.get());
@@ -127,6 +131,9 @@ public class SandboxManager {
                         // Overwrite stale WorkspaceSpec with current application config
                         if (sandboxContext.getWorkspaceSpec() != null) {
                             state.setWorkspaceSpec(sandboxContext.getWorkspaceSpec().copy());
+                        }
+                        if (state.getSnapshot() != null) {
+                            persistedSnapshotId = state.getSnapshot().getId();
                         }
                         // Per-call options 同样传入 resume：后端据此把本次调用的工作区根
                         // （如会话级工作目录）应用到复用的沙箱 state 上
@@ -180,6 +187,8 @@ public class SandboxManager {
 
             Sandbox sandbox =
                     typedClient().create(spec, sandboxContext.getSnapshotSpec(), perCallOptions);
+            carryOverPersistedSnapshotId(
+                    sandbox, persistedSnapshotId, sandboxContext.getSnapshotSpec());
             return SandboxAcquireResult.selfManaged(sandbox, lease);
 
         } catch (Exception e) {
@@ -210,6 +219,33 @@ public class SandboxManager {
     @SuppressWarnings("unchecked")
     private SandboxClient<SandboxClientOptions> typedClient() {
         return (SandboxClient<SandboxClientOptions>) client;
+    }
+
+    /**
+     * Keeps workspace continuity when a failed resume falls through to a fresh create: points
+     * the new sandbox at the snapshot id persisted for this scope, so {@link Sandbox#start()}
+     * restores the workspace from the previous archive instead of silently resetting it, and
+     * {@link Sandbox#stop()} overwrites that same archive instead of orphaning it. The snapshot
+     * is rebuilt from the current spec, so it carries a bound client regardless of how the
+     * persisted state deserialized.
+     */
+    private static void carryOverPersistedSnapshotId(
+            Sandbox sandbox, String persistedSnapshotId, SandboxSnapshotSpec snapshotSpec) {
+        SandboxState state = sandbox.getState();
+        if (persistedSnapshotId == null
+                || persistedSnapshotId.isBlank()
+                || snapshotSpec == null
+                || state == null
+                || state.getSnapshot() == null
+                || persistedSnapshotId.equals(state.getSnapshot().getId())) {
+            return;
+        }
+        log.info(
+                "[sandbox] Resume fell back to fresh create; carrying over snapshot id {} (fresh"
+                        + " id was {})",
+                persistedSnapshotId,
+                state.getSnapshot().getId());
+        state.setSnapshot(snapshotSpec.build(persistedSnapshotId));
     }
 
     public void release(SandboxAcquireResult result) {

@@ -24,13 +24,13 @@ import io.agentscope.core.message.MsgRole;
 import io.agentscope.core.middleware.ReasoningInput;
 import io.agentscope.core.model.Model;
 import io.agentscope.core.state.AgentState;
+import io.agentscope.core.util.ExceptionUtils;
 import io.agentscope.harness.agent.memory.MemoryFlushManager;
 import io.agentscope.harness.agent.memory.compaction.CompactionConfig;
 import io.agentscope.harness.agent.memory.compaction.ConversationCompactor;
 import io.agentscope.harness.agent.memory.compaction.ConversationCompactor.CompactOutcome;
 import io.agentscope.harness.agent.workspace.WorkspaceManager;
 import java.util.ArrayList;
-import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.function.Function;
 import org.slf4j.Logger;
@@ -121,7 +121,7 @@ public class CompactionMiddleware implements HarnessRuntimeMiddleware {
                                     rc, conversation, effectiveConfig, agentId, sessionId)
                             .onErrorResume(
                                     error -> {
-                                        if (containsInterruptedException(error)) {
+                                        if (ExceptionUtils.containsInterruptedException(error)) {
                                             return Mono.error(error);
                                         }
                                         log.warn(
@@ -162,18 +162,6 @@ public class CompactionMiddleware implements HarnessRuntimeMiddleware {
                                                         input.options()));
                                     });
                 });
-    }
-
-    private static boolean containsInterruptedException(Throwable error) {
-        IdentityHashMap<Throwable, Boolean> visited = new IdentityHashMap<>();
-        Throwable current = error;
-        while (current != null && visited.put(current, Boolean.TRUE) == null) {
-            if (current instanceof InterruptedException) {
-                return true;
-            }
-            current = current.getCause();
-        }
-        return false;
     }
 
     /**

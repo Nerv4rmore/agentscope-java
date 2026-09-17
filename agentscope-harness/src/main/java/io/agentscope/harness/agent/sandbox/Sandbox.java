@@ -63,6 +63,21 @@ public interface Sandbox extends AutoCloseable {
     SandboxState getState();
 
     /**
+     * Absolute path inside the sandbox that {@link #exec} uses as its working directory, and that
+     * workspace-relative file paths resolve against.
+     *
+     * <p>This is deliberately not {@code getState().getWorkspaceSpec().getRoot()}: the spec root is
+     * where a backend projects shared resources (skills, {@code AGENTS.md}) while a backend may run
+     * each call in a sub-directory of it (session isolation). Callers that anchor relative paths
+     * must use this accessor so file tools and shell commands keep the same view.
+     *
+     * @return the in-sandbox working directory, or {@code null} when the backend has no such path
+     */
+    default String workspaceRoot() {
+        return null;
+    }
+
+    /**
      * Runs a shell command in the sandbox workspace.
      *
      * @param runtimeContext per-call agent context (session, user, attributes); may be {@code null}
@@ -110,13 +125,22 @@ public interface Sandbox extends AutoCloseable {
      * MIME-decodes the stdout. Backends that expose a dedicated download endpoint (e.g. AgentRun
      * {@code GET /filesystem/download}) should override this for better efficiency.
      *
+     * <p>A truncated stdout means the sandbox capped the command output, so the decoded bytes
+     * would be a silently corrupted file — reject it instead (upstream #2923).
+     *
      * @param path absolute source path inside the sandbox
      * @return raw file bytes
-     * @throws Exception if the download fails
+     * @throws Exception if the download fails or the output was truncated
      */
     default byte[] downloadFile(String path) throws Exception {
         String safePath = path.replace("'", "'\"'\"'");
         ExecResult r = exec(null, "base64 '" + safePath + "'", null);
+        if (!r.ok()) {
+            throw new java.io.IOException(r.combinedOutput());
+        }
+        if (r.truncated()) {
+            throw new java.io.IOException("File download output was truncated by the sandbox");
+        }
         return Base64.getMimeDecoder().decode(r.stdout() != null ? r.stdout() : "");
     }
 }
