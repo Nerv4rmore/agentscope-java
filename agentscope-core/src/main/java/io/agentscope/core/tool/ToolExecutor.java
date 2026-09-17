@@ -20,10 +20,13 @@ import io.agentscope.core.message.ToolResultBlock;
 import io.agentscope.core.message.ToolUseBlock;
 import io.agentscope.core.model.ExecutionConfig;
 import io.agentscope.core.shutdown.GracefulShutdownManager;
+import io.agentscope.core.state.AgentState;
+import io.agentscope.core.state.ToolContextState;
 import io.agentscope.core.tracing.TracerRegistry;
 import io.agentscope.core.util.ExceptionUtils;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -189,6 +192,38 @@ class ToolExecutor {
     }
 
     /**
+     * 从 {@link ToolCallParam#getRuntimeContext()} 中解析本次调用记录的 activatedGroups。
+     *
+     * <p>ReActAgent 在 call 入口（{@code activateSlotForContext}）会把当前槽位的
+     * AgentState 写到 RuntimeContext 上，供中间件与工具层以并发安全的方式读取。
+     * 本方法返回的集合与 {@code Toolkit#getToolSchemas(Collection)} 使用的完全一致，
+     * 避免授权判断与 schema 可见性发生偏移。
+     *
+     * <p>当任一环节缺失（非 ReActAgent 发起的调用、RuntimeContext 未携带 state 等）
+     * 时返回 {@code null}，调用方应 fallback 到旧的共享标志路径（{@link
+     * ToolGroupManager#isActiveTool(String)}），保持向后兼容。
+     */
+    private static Collection<String> resolvePerCallActiveGroups(ToolCallParam param) {
+        if (param == null) {
+            return null;
+        }
+        io.agentscope.core.agent.RuntimeContext rc = param.getRuntimeContext();
+        if (rc == null) {
+            return null;
+        }
+        AgentState state = rc.getAgentState();
+        if (state == null) {
+            return null;
+        }
+        ToolContextState toolContext = state.getToolContext();
+        if (toolContext == null) {
+            return null;
+        }
+        // getActivatedGroups() 内部已做 List.copyOf，不会返回 null
+        return toolContext.getActivatedGroups();
+    }
+
+    /**
      * Core tool execution logic.
      *
      * <p>This method handles:
@@ -219,14 +254,30 @@ class ToolExecutor {
             return Mono.just(ToolResultBlock.suspended(toolCall));
         }
 
-        // Check tool activation
+        // 工具授权检查：
+        // 优先从本次调用的 RuntimeContext.AgentState.toolContext.activatedGroups 解析（per-call），
+        // 而不是直接读共享的 ToolGroup.isActive 标志。因为 HarnessAgent 单例下多个
+        // (userId, sessionId) 槽位的调用会在 activateSlotForContext 中并发执行
+        // setActiveGroups，彼此覆盖对方的激活标志；导致本会话已 load_skill_through_path
+        // 激活的 skill-gated 工具组（如 video-generation-tools）在 acting 前被其他会话
+        // 重置，进而报 "Unauthorized tool call"。与 Toolkit.getToolSchemas(activeGroups)
+        // 的 per-call 语义保持一致，也确保“模型看到什么就能执行什么”。
         RegisteredToolFunction registered = toolRegistry.getRegisteredTool(toolCall.getName());
-        if (registered != null && !groupManager.isActiveTool(toolCall.getName())) {
-            String errorMsg =
-                    String.format(
-                            "Unauthorized tool call: '%s' is not available", toolCall.getName());
-            logger.warn(errorMsg);
-            return Mono.just(ToolResultBlock.error(errorMsg));
+        if (registered != null) {
+            Collection<String> perCallGroups = resolvePerCallActiveGroups(param);
+            boolean authorized =
+                    perCallGroups != null
+                            ? groupManager.isActiveToolInGroups(
+                                    toolCall.getName(), perCallGroups)
+                            : groupManager.isActiveTool(toolCall.getName());
+            if (!authorized) {
+                String errorMsg =
+                        String.format(
+                                "Unauthorized tool call: '%s' is not available",
+                                toolCall.getName());
+                logger.warn(errorMsg);
+                return Mono.just(ToolResultBlock.error(errorMsg));
+            }
         }
 
         // Validate input against schema

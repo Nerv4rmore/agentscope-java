@@ -336,6 +336,53 @@ class ToolGroupManager {
     }
 
     /**
+     * 基于调用方显式提供的 activatedGroups 判定工具是否可执行，不读取共享的
+     * {@link ToolGroup#isActive()} 标志。
+     *
+     * <p>这是 {@link #isActiveTool(String)} 的 per-call / stateless 变体：Toolkit 是被
+     * HarnessAgent 单例持有的共享对象，多个 {@code (userId, sessionId)} 槽位的调用会在
+     * {@code activateSlotForContext} 中并发执行 {@code setActiveGroups(...)}，进而互相
+     * 覆盖对方的激活标志。ReActAgent 已把本次调用的 AgentState 挂在 RuntimeContext 上，
+     * ToolExecutor 应优先使用该方法，从当前 call 自己的 state 里解析 activatedGroups，
+     * 与 {@link Toolkit#getToolSchemas(Collection)} 的 per-call 语义保持一致，避免
+     * “模型看得到工具、执行时却被判定为 Unauthorized” 的错配。
+     *
+     * <p>语义与 {@link #isActiveTool(String)} 对齐：
+     * <ul>
+     *   <li>{@code toolName} 为 {@code null} → {@code false}</li>
+     *   <li>工具不属于任何 group → {@code true}（ungrouped 工具永远可见）</li>
+     *   <li>工具属于至少一个 group，且其中任意一个 group 出现在 {@code activeGroups} 里
+     *       → {@code true}</li>
+     *   <li>其余情况 → {@code false}</li>
+     * </ul>
+     *
+     * @param toolName 工具名
+     * @param activeGroups 本次调用视为激活的 group 名集合；{@code null} 或空表示
+     *                     “除 ungrouped 工具外一律不可用”
+     * @return 工具在当前调用的 activatedGroups 下是否可执行
+     */
+    public boolean isActiveToolInGroups(String toolName, Collection<String> activeGroups) {
+        if (toolName == null) {
+            return false;
+        }
+        Set<String> groups = tools.get(toolName);
+        // ungrouped 工具永远可用（与 isActiveTool 保持一致）
+        if (groups == null || groups.isEmpty()) {
+            return true;
+        }
+        if (activeGroups == null || activeGroups.isEmpty()) {
+            return false;
+        }
+        // activeGroups 通常是 List，规模很小；这里直接线性遍历即可，避免额外分配 Set
+        for (String groupName : groups) {
+            if (groupName != null && activeGroups.contains(groupName)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
      * Check whether a tool belongs to any group.
      *
      * @param toolName Tool name
