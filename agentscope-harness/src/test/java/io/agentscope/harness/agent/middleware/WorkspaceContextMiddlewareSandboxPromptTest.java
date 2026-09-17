@@ -62,7 +62,10 @@ class WorkspaceContextMiddlewareSandboxPromptTest {
             String prompt = prompt(wm, false);
 
             assertNotNull(prompt);
-            assertTrue(prompt.contains("Sandbox root: /workspace"));
+            assertTrue(
+                    prompt.contains("Sandbox working directory (sandbox: sandbox-test)"),
+                    () -> prompt);
+            assertFalse(prompt.contains("/workspace"), () -> prompt);
             assertTrue(prompt.contains("no mechanism for moving files across the boundary"));
             assertFalse(prompt.contains("deliver_artifact"), () -> prompt);
             assertFalse(prompt.contains("upload/download tools"), () -> prompt);

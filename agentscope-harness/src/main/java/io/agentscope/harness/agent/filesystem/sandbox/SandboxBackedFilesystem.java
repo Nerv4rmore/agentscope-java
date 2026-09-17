@@ -674,11 +674,14 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
         return normalized;
     }
 
-    /** Resolves the normalized workspace root used to convert absolute upload paths. */
+    /** Resolves the normalized anchor for relative paths: exec cwd first, spec root second. */
     private String resolveWorkspaceRoot(Sandbox active) throws IOException {
-        SandboxState state = active.getState();
-        WorkspaceSpec workspaceSpec = state != null ? state.getWorkspaceSpec() : null;
-        String root = workspaceSpec != null ? workspaceSpec.getRoot() : null;
+        String root = active.workspaceRoot();
+        if (root == null || root.isBlank()) {
+            SandboxState state = active.getState();
+            WorkspaceSpec workspaceSpec = state != null ? state.getWorkspaceSpec() : null;
+            root = workspaceSpec != null ? workspaceSpec.getRoot() : null;
+        }
         if (root == null || root.isBlank()) {
             throw new IOException("Sandbox workspace root is unavailable");
         }

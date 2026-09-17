@@ -299,6 +299,11 @@ public abstract class AbstractBaseSandbox implements Sandbox {
      */
     protected abstract String getWorkspaceRoot();
 
+    @Override
+    public final String workspaceRoot() {
+        return getWorkspaceRoot();
+    }
+
     private void applyWorkspaceProjectionIfChanged(WorkspaceSpec spec) throws Exception {
         WorkspaceProjectionApplier.ProjectionPayload payload =
                 WorkspaceProjectionApplier.build(spec);

@@ -23,6 +23,7 @@ import io.agentscope.harness.agent.filesystem.OverlayFilesystem;
 import io.agentscope.harness.agent.filesystem.ProjectAwareOverlay;
 import io.agentscope.harness.agent.filesystem.local.LocalFilesystemWithShell;
 import io.agentscope.harness.agent.filesystem.sandbox.AbstractSandboxFilesystem;
+import io.agentscope.harness.agent.sandbox.SandboxManager;
 import io.agentscope.harness.agent.workspace.LocalFsMode;
 import io.agentscope.harness.agent.workspace.PathPolicy;
 import io.agentscope.harness.agent.workspace.WorkspaceManager;
@@ -235,7 +236,7 @@ public class WorkspaceContextMiddleware implements HarnessRuntimeMiddleware {
 
         String workspaceParagraph =
                 buildWorkspaceParagraph(
-                        workspace, workspaceManager.getFilesystem(), artifactDeliveryEnabled);
+                        workspace, workspaceManager.getFilesystem(), artifactDeliveryEnabled, rc);
         String loadedContext =
                 buildLoadedContextSection(
                         agentsContent, memoryContent, knowledgeBlock, additionalBlock);
@@ -316,7 +317,10 @@ public class WorkspaceContextMiddleware implements HarnessRuntimeMiddleware {
      * </ul>
      */
     private static String buildWorkspaceParagraph(
-            Path workspace, AbstractFilesystem fs, boolean artifactDeliveryEnabled) {
+            Path workspace,
+            AbstractFilesystem fs,
+            boolean artifactDeliveryEnabled,
+            RuntimeContext rc) {
         StringBuilder sb = new StringBuilder("## Workspace\n");
         LocalFilesystemWithShell localUpper = detectLocalUpper(fs);
         Path project = localUpper != null ? localUpper.getShellCwd() : null;
@@ -357,9 +361,25 @@ public class WorkspaceContextMiddleware implements HarnessRuntimeMiddleware {
             sb.append("Shell commands run with `pwd` set to the project directory.\n");
         } else if (fs instanceof AbstractSandboxFilesystem sandbox
                 && !(fs instanceof OverlayFilesystem)) {
-            sb.append("Sandbox root: /workspace (container id: ")
-                    .append(sandbox.id())
-                    .append(")\n");
+            String sandboxRoot =
+                    rc == null ? null : rc.get(SandboxManager.CALL_WORKSPACE_ROOT_KEY, String.class);
+            if (sandboxRoot != null && !sandboxRoot.isBlank()) {
+                sb.append("Sandbox working directory: ")
+                        .append(sandboxRoot)
+                        .append(" (sandbox: ")
+                        .append(sandbox.id())
+                        .append(")\n");
+                sb.append("Shell commands already start here and relative file paths resolve"
+                        + " here, so leave execute's working_directory unset; it accepts only a"
+                        + " relative sub-path of the directory above.\n");
+            } else {
+                sb.append("Sandbox working directory (sandbox: ")
+                        .append(sandbox.id())
+                        .append("): your current directory — run `pwd` for its absolute path.\n");
+                sb.append("Shell commands already start here and relative file paths resolve"
+                        + " here, so leave execute's working_directory unset; it accepts only a"
+                        + " relative sub-path of the current directory.\n");
+            }
             if (artifactDeliveryEnabled) {
                 sb.append(
                         "Files are isolated inside this container. The host filesystem is not"

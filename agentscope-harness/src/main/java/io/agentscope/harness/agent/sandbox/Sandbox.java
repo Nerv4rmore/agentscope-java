@@ -63,6 +63,21 @@ public interface Sandbox extends AutoCloseable {
     SandboxState getState();
 
     /**
+     * Absolute path inside the sandbox that {@link #exec} uses as its working directory, and that
+     * workspace-relative file paths resolve against.
+     *
+     * <p>This is deliberately not {@code getState().getWorkspaceSpec().getRoot()}: the spec root is
+     * where a backend projects shared resources (skills, {@code AGENTS.md}) while a backend may run
+     * each call in a sub-directory of it (session isolation). Callers that anchor relative paths
+     * must use this accessor so file tools and shell commands keep the same view.
+     *
+     * @return the in-sandbox working directory, or {@code null} when the backend has no such path
+     */
+    default String workspaceRoot() {
+        return null;
+    }
+
+    /**
      * Runs a shell command in the sandbox workspace.
      *
      * @param runtimeContext per-call agent context (session, user, attributes); may be {@code null}

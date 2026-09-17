@@ -334,7 +334,7 @@ class HarnessAgentTest {
         agent.call(userText("hi"), RuntimeContext.builder().sessionId("s1").build()).block();
 
         String combined = capturedPrompt(model);
-        assertTrue(combined.contains("Sandbox root: /workspace"), () -> combined);
+        assertTrue(combined.contains("Sandbox working directory"), () -> combined);
         assertTrue(combined.contains("call deliver_artifact"), () -> combined);
     }
 

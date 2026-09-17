@@ -150,6 +150,23 @@ class SandboxBackedFilesystemTest {
     }
 
     @Test
+    void uploadFiles_anchorsRelativePathOnSandboxWorkspaceRoot() {
+        SandboxBackedFilesystem filesystem = new SandboxBackedFilesystem();
+        String sessionRoot = "/home/user/workspace/sessions/sess-x";
+        FakeTransferSandbox sandbox = new FakeTransferSandbox(sessionRoot);
+        // Spec root keeps its "/workspace" default: exec + relative paths live elsewhere.
+        sandbox.workspaceRoot = sessionRoot;
+        filesystem.setSandbox(sandbox);
+
+        List<FileUploadResponse> responses =
+                filesystem.uploadFiles(RT, List.of(Map.entry("create_doc.js", new byte[] {1})));
+
+        assertTrue(responses.get(0).isSuccess(), () -> responses.get(0).error());
+        assertArrayEquals(new byte[] {1}, sandbox.uploaded.get(sessionRoot + "/create_doc.js"));
+        assertEquals(0, sandbox.hydrateCalls);
+    }
+
+    @Test
     void uploadFiles_rejectsNullContentOnNativeTransferPath() {
         SandboxBackedFilesystem filesystem = new SandboxBackedFilesystem();
         FakeTransferSandbox sandbox = new FakeTransferSandbox("/workspace");
@@ -392,10 +409,16 @@ class SandboxBackedFilesystemTest {
         private final String rootPrefix;
         private final Map<String, byte[]> uploaded = new HashMap<>();
         private boolean failTransfers;
+        private String workspaceRoot;
 
         private FakeTransferSandbox(String root) {
             super(new ExecResult(0, "", "", false));
             this.rootPrefix = root + "/";
+        }
+
+        @Override
+        public String workspaceRoot() {
+            return workspaceRoot;
         }
 
         @Override
