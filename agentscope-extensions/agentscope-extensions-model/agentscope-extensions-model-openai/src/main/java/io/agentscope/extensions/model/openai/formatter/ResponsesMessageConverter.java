@@ -126,30 +126,7 @@ public class ResponsesMessageConverter {
      */
     private List<Map<String, Object>> buildMultimodalContent(
             Msg msg, List<ImageBlock> imageBlocks) {
-        List<Map<String, Object>> parts = new ArrayList<>();
-
-        // 按原始 content 块顺序遍历，保持文本与图片的相对位置
-        List<ContentBlock> allBlocks = msg.getContent();
-        if (allBlocks != null) {
-            for (ContentBlock block : allBlocks) {
-                if (block instanceof TextBlock textBlock) {
-                    String text = textBlock.getText();
-                    if (text != null && !text.isEmpty()) {
-                        Map<String, Object> textPart = new LinkedHashMap<>();
-                        textPart.put("type", "input_text");
-                        textPart.put("text", text);
-                        parts.add(textPart);
-                    }
-                } else if (block instanceof ImageBlock imageBlock) {
-                    Map<String, Object> imagePart = new LinkedHashMap<>();
-                    imagePart.put("type", "input_image");
-                    imagePart.put(
-                            "image_url",
-                            OpenAIConverterUtils.convertImageSourceToUrl(imageBlock.getSource()));
-                    parts.add(imagePart);
-                }
-            }
-        }
+        List<Map<String, Object>> parts = buildMultimodalParts(msg.getContent());
 
         // 兜底：若原始块遍历未产出任何 part（理论上不应发生），用 textExtractor 兜底
         if (parts.isEmpty()) {
@@ -170,6 +147,37 @@ public class ResponsesMessageConverter {
             }
         }
 
+        return parts;
+    }
+
+    /**
+     * 按块顺序把 content 转为 Responses API 的多模态 content 数组。
+     *
+     * <p>文本块 → {@code input_text}，图片块 → {@code input_image}，其余块忽略。
+     */
+    private List<Map<String, Object>> buildMultimodalParts(List<ContentBlock> blocks) {
+        List<Map<String, Object>> parts = new ArrayList<>();
+        if (blocks == null) {
+            return parts;
+        }
+        for (ContentBlock block : blocks) {
+            if (block instanceof TextBlock textBlock) {
+                String text = textBlock.getText();
+                if (text != null && !text.isEmpty()) {
+                    Map<String, Object> textPart = new LinkedHashMap<>();
+                    textPart.put("type", "input_text");
+                    textPart.put("text", text);
+                    parts.add(textPart);
+                }
+            } else if (block instanceof ImageBlock imageBlock) {
+                Map<String, Object> imagePart = new LinkedHashMap<>();
+                imagePart.put("type", "input_image");
+                imagePart.put(
+                        "image_url",
+                        OpenAIConverterUtils.convertImageSourceToUrl(imageBlock.getSource()));
+                parts.add(imagePart);
+            }
+        }
         return parts;
     }
 
@@ -207,6 +215,11 @@ public class ResponsesMessageConverter {
     /**
      * Convert a tool result message. Each {@link ToolResultBlock} becomes a
      * {@code function_call_output} input item.
+     *
+     * <p>{@code function_call_output.output} only carries a string, so a {@link ToolResultBlock}
+     * holding images would otherwise reach the model as a textual URL reference with no pixels.
+     * Those images are promoted into a following {@code message} item with role {@code user} — the
+     * one input-item shape this API accepts {@code input_image} in.
      */
     private List<ResponsesInputItem> convertToolMessage(Msg msg) {
         List<ToolResultBlock> results = msg.getContentBlocks(ToolResultBlock.class);
@@ -217,7 +230,57 @@ public class ResponsesMessageConverter {
             item.setCallId(result.getId());
             item.setOutput(toolResultConverter.apply(result.getOutput()));
             items.add(item);
+            ResponsesInputItem promoted = promoteToolResultImages(result);
+            if (promoted != null) {
+                items.add(promoted);
+            }
         }
         return items;
+    }
+
+    /**
+     * 把工具结果中的图片提升为一条携带 {@code input_image} 的 user message item。
+     *
+     * @param result 工具结果块
+     * @return 图片消息 item；结果中无图片时返回 null
+     */
+    private ResponsesInputItem promoteToolResultImages(ToolResultBlock result) {
+        List<ContentBlock> output = result.getOutput();
+        if (output == null || output.isEmpty()) {
+            return null;
+        }
+        List<ContentBlock> imageBlocks = new ArrayList<>();
+        for (ContentBlock block : output) {
+            if (block instanceof ImageBlock imageBlock) {
+                imageBlocks.add(
+                        new TextBlock.Builder()
+                                .text(
+                                        "\n- The image from '"
+                                                + OpenAIConverterUtils.convertImageSourceToUrl(
+                                                        imageBlock.getSource())
+                                                + "':")
+                                .build());
+                imageBlocks.add(imageBlock);
+            }
+        }
+        if (imageBlocks.isEmpty()) {
+            return null;
+        }
+        List<ContentBlock> blocks = new ArrayList<>();
+        blocks.add(
+                new TextBlock.Builder()
+                        .text(
+                                "<system-info>The following are the image contents from the tool"
+                                    + " result of '"
+                                    + result.getName()
+                                    + "':</system-info>")
+                        .build());
+        blocks.addAll(imageBlocks);
+
+        ResponsesInputItem item = new ResponsesInputItem();
+        item.setType("message");
+        item.setRole("user");
+        item.setContent(buildMultimodalParts(blocks));
+        return item;
     }
 }
