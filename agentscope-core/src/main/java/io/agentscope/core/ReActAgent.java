@@ -4586,9 +4586,11 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
     }
 
     private void syncToolkitToState(AgentState state) {
-        if (toolkit != null && state != null) {
-            state.getToolContext().setActivatedGroups(toolkit.getActiveGroups());
-        }
+        // No-op: 不再从共享 Toolkit 拷贝 activeGroups 到 state。
+        // 原因：HarnessAgent 单例下多个 (userId, sessionId) 槽位的调用并发修改共享 Toolkit，
+        // 盲拷贝会把其他会话的工具组“串味”写入本会话 state。
+        // 现在中间件通过 Toolkit.updateToolGroups(groups, active, rc) 直接更新 per-call state，
+        // state 始终为权威源，无需反向同步。
     }
 
     /** Returns the model-call configuration (retries, timeouts). */

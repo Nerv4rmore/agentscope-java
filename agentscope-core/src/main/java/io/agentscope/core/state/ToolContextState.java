@@ -124,6 +124,31 @@ public final class ToolContextState {
         }
     }
 
+    /**
+     * 幂等地添加一个激活的工具组。如果已存在则不重复添加。
+     *
+     * <p>中间件在 call 期间激活 skill/connector 工具组时应优先使用此方法直接更新 per-call state，
+     * 而非依赖 syncToolkitToState 从共享 Toolkit 拷贝（后者在并发下可能被其他会话污染）。
+     *
+     * @param groupName 要激活的工具组名；{@code null} 或空字符串时忽略
+     */
+    public void addActivatedGroup(String groupName) {
+        if (groupName != null && !groupName.isEmpty() && !this.activatedGroups.contains(groupName)) {
+            this.activatedGroups.add(groupName);
+        }
+    }
+
+    /**
+     * 幂等地移除一个已激活的工具组。如果不存在则忽略。
+     *
+     * @param groupName 要停用的工具组名；{@code null} 时忽略
+     */
+    public void removeActivatedGroup(String groupName) {
+        if (groupName != null) {
+            this.activatedGroups.remove(groupName);
+        }
+    }
+
     @JsonProperty("spawn_registry")
     public Map<String, SpawnEntry> getSpawnRegistry() {
         return Map.copyOf(spawnRegistry);
