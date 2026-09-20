@@ -16,7 +16,9 @@
 package io.agentscope.harness.agent.sandbox;
 
 import io.agentscope.core.agent.RuntimeContext;
+import io.agentscope.harness.agent.IsolationScope;
 import io.agentscope.harness.agent.sandbox.snapshot.SandboxSnapshotSpec;
+import io.agentscope.harness.agent.skill.runtime.MarketplaceStager;
 import java.util.Objects;
 import java.util.Optional;
 import org.slf4j.Logger;
@@ -130,7 +132,10 @@ public class SandboxManager {
                                         stateJson.get(), sandboxContext.getSnapshotSpec());
                         // Overwrite stale WorkspaceSpec with current application config
                         if (sandboxContext.getWorkspaceSpec() != null) {
-                            state.setWorkspaceSpec(sandboxContext.getWorkspaceSpec().copy());
+                            WorkspaceSpec perCall = sandboxContext.getWorkspaceSpec().copy();
+                            narrowProjectionToCallScope(
+                                    perCall, sandboxContext.getIsolationScope(), runtimeContext);
+                            state.setWorkspaceSpec(perCall);
                         }
                         if (state.getSnapshot() != null) {
                             persistedSnapshotId = state.getSnapshot().getId();
@@ -177,6 +182,7 @@ public class SandboxManager {
                     sandboxContext.getWorkspaceSpec() != null
                             ? sandboxContext.getWorkspaceSpec().copy()
                             : new WorkspaceSpec();
+            narrowProjectionToCallScope(spec, sandboxContext.getIsolationScope(), runtimeContext);
 
             // Resolve the per-call user id (the discriminating value of the isolation key, e.g.
             // userId for USER scope) so concrete backends can derive per-user sandbox config such
@@ -196,6 +202,26 @@ public class SandboxManager {
             lease.close();
             throw e;
         }
+    }
+
+    /**
+     * Restricts this call's projection to the {@code .skills-cache} subtree that this call
+     * actually stages into.
+     *
+     * <p>Without this, projection walks the whole shared cache and every user's sandbox start
+     * uploads the staged skills of every other user who ever touched the workspace. The segment
+     * is derived through {@link MarketplaceStager#cacheSegmentFor} rather than the raw isolation
+     * key, because the two must agree exactly — a mismatch would silently hydrate an empty
+     * subtree and leave the model with no skills at all.
+     */
+    private static void narrowProjectionToCallScope(
+            WorkspaceSpec spec, IsolationScope isolationScope, RuntimeContext runtimeContext) {
+        if (spec == null) {
+            return;
+        }
+        String segment = MarketplaceStager.cacheSegmentFor(isolationScope, runtimeContext);
+        WorkspaceProjectionApplier.narrowIncludeRoot(
+                spec, MarketplaceStager.CACHE_DIR, MarketplaceStager.CACHE_DIR + "/" + segment);
     }
 
     /**

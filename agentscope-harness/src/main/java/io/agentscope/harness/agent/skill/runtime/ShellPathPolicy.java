@@ -101,8 +101,13 @@ public final class ShellPathPolicy {
         if (mode == Mode.NO_SHELL || stage == null || stage instanceof StageResult.None) {
             return null;
         }
-        if (stage instanceof StageResult.WorkspaceNative) {
-            return joinSkills(skillName);
+        if (stage instanceof StageResult.WorkspaceNative native_) {
+            // The skill directory's name is not assumed to equal the skill's name: the stager
+            // carries the real workspace-relative location, and only a source with no on-disk
+            // origin falls back to the name-derived path.
+            String rel =
+                    native_.relativePath() != null ? native_.relativePath() : "skills/" + skillName;
+            return joinWorkspaceRelative(rel);
         }
         if (stage instanceof StageResult.Cached cached) {
             return joinCache(cached.scopeSegment(), cached.sourceNamespace(), cached.skillName());
@@ -110,14 +115,13 @@ public final class ShellPathPolicy {
         return null;
     }
 
-    private String joinSkills(String skillName) {
+    private String joinWorkspaceRelative(String workspaceRelativePath) {
         return switch (mode) {
-            case SANDBOX -> escapeSpaces(sandboxPrefix + "/skills/" + skillName);
+            case SANDBOX -> escapeSpaces(sandboxPrefix + "/" + workspaceRelativePath);
             case LOCAL_WITH_SHELL ->
                     escapeSpaces(
                             workspaceRoot
-                                    .resolve("skills")
-                                    .resolve(skillName)
+                                    .resolve(workspaceRelativePath)
                                     .toAbsolutePath()
                                     .toString());
             case NO_SHELL -> null;

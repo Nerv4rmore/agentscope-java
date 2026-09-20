@@ -135,7 +135,7 @@ public abstract class SandboxFilesystemSpec {
         projection.setIncludeRoots(workspaceProjectionRoots);
 
         Map<String, WorkspaceEntry> entries = new LinkedHashMap<>(effective.getEntries());
-        entries.put("__workspace_projection__", projection);
+        entries.put(WorkspaceProjectionEntry.ENTRY_KEY, projection);
         effective.setEntries(entries);
         return effective;
     }

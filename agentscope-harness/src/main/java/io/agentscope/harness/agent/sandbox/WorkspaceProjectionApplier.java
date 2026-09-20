@@ -87,6 +87,45 @@ public final class WorkspaceProjectionApplier {
         return new ProjectionPayload(hash, baos.toByteArray(), ordered.size());
     }
 
+    /**
+     * Swaps one of the projection's include roots for a narrower one (e.g. {@code .skills-cache}
+     * → {@code .skills-cache/<scope>}), so a call does not hydrate content staged for other
+     * isolation scopes. No-op when the entry or the root is absent.
+     *
+     * <p>Installs a fresh entry rather than mutating the one it finds: {@link
+     * WorkspaceSpec#copy()} shares {@link WorkspaceEntry} instances between the build-time spec
+     * and every per-call copy, so an in-place edit would narrow the projection for all callers,
+     * not just this one.
+     *
+     * @param spec    the per-call spec to narrow; ignored when {@code null}
+     * @param from    the include root to replace, relative to the projection source root
+     * @param to      the narrowed include root, relative to the same source root
+     */
+    public static void narrowIncludeRoot(WorkspaceSpec spec, String from, String to) {
+        if (spec == null || from == null || to == null) {
+            return;
+        }
+        Map<String, WorkspaceEntry> entries = spec.getEntries();
+        if (!(entries.get(WorkspaceProjectionEntry.ENTRY_KEY)
+                instanceof WorkspaceProjectionEntry projection)) {
+            return;
+        }
+        List<String> roots = projection.getIncludeRoots();
+        int at = roots.indexOf(from);
+        if (at < 0 || from.equals(to)) {
+            return;
+        }
+        List<String> narrowed = new ArrayList<>(roots);
+        narrowed.set(at, to);
+        WorkspaceProjectionEntry replacement = new WorkspaceProjectionEntry();
+        replacement.setSourceRoot(projection.getSourceRoot());
+        replacement.setIncludeRoots(narrowed);
+        replacement.setEphemeral(projection.isEphemeral());
+        Map<String, WorkspaceEntry> swapped = new LinkedHashMap<>(entries);
+        swapped.put(WorkspaceProjectionEntry.ENTRY_KEY, replacement);
+        spec.setEntries(swapped);
+    }
+
     private static void collectProjectionEntries(
             Map<String, WorkspaceEntry> map, List<WorkspaceProjectionEntry> out) {
         for (WorkspaceEntry entry : map.values()) {
