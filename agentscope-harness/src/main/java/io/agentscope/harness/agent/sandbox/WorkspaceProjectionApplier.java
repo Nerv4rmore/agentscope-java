@@ -100,20 +100,21 @@ public final class WorkspaceProjectionApplier {
      * @param spec    the per-call spec to narrow; ignored when {@code null}
      * @param from    the include root to replace, relative to the projection source root
      * @param to      the narrowed include root, relative to the same source root
+     * @return {@code to} when the root was narrowed, {@code null} when nothing was changed
      */
-    public static void narrowIncludeRoot(WorkspaceSpec spec, String from, String to) {
+    public static String narrowIncludeRoot(WorkspaceSpec spec, String from, String to) {
         if (spec == null || from == null || to == null) {
-            return;
+            return null;
         }
         Map<String, WorkspaceEntry> entries = spec.getEntries();
         if (!(entries.get(WorkspaceProjectionEntry.ENTRY_KEY)
                 instanceof WorkspaceProjectionEntry projection)) {
-            return;
+            return null;
         }
         List<String> roots = projection.getIncludeRoots();
         int at = roots.indexOf(from);
         if (at < 0 || from.equals(to)) {
-            return;
+            return null;
         }
         List<String> narrowed = new ArrayList<>(roots);
         narrowed.set(at, to);
@@ -124,6 +125,7 @@ public final class WorkspaceProjectionApplier {
         Map<String, WorkspaceEntry> swapped = new LinkedHashMap<>(entries);
         swapped.put(WorkspaceProjectionEntry.ENTRY_KEY, replacement);
         spec.setEntries(swapped);
+        return to;
     }
 
     private static void collectProjectionEntries(

@@ -220,8 +220,21 @@ public class SandboxManager {
             return;
         }
         String segment = MarketplaceStager.cacheSegmentFor(isolationScope, runtimeContext);
-        WorkspaceProjectionApplier.narrowIncludeRoot(
-                spec, MarketplaceStager.CACHE_DIR, MarketplaceStager.CACHE_DIR + "/" + segment);
+        String applied =
+                WorkspaceProjectionApplier.narrowIncludeRoot(
+                        spec,
+                        MarketplaceStager.CACHE_DIR,
+                        MarketplaceStager.CACHE_DIR + "/" + segment);
+        if (applied != null) {
+            // Emitted per call at debug because a wrong segment is invisible from the outside:
+            // it projects an empty subtree and the agent silently loses its skills.
+            log.debug(
+                    "[sandbox-projection] Narrowed {} to {} (isolationScope={}, userId={})",
+                    MarketplaceStager.CACHE_DIR,
+                    applied,
+                    isolationScope,
+                    runtimeContext != null ? runtimeContext.getUserId() : null);
+        }
     }
 
     /**

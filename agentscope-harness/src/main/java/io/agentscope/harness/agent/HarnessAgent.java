@@ -2554,6 +2554,30 @@ public class HarnessAgent implements Agent, AutoCloseable {
 
                 defaultSandboxContext = sandboxFilesystemSpec.toSandboxContext(resolvedWorkspace);
 
+                // The .skills-cache subtree is staged under a directory named after
+                // fsIsolationScope (resolved across all filesystem specs) but narrowed for
+                // projection by the scope the sandbox spec itself carries. Those two must be the
+                // same value or projection hydrates a subtree nothing writes into — the agent
+                // loses every skill with no error anywhere. Align them here so the mismatch is
+                // impossible rather than merely logged.
+                if (sandboxFilesystemSpec.getIsolationScope() == null
+                        && fsIsolationScope != IsolationScope.USER) {
+                    // Unset means USER on this side, which is not what the stager keyed on.
+                    sandboxFilesystemSpec.isolationScope(fsIsolationScope);
+                    defaultSandboxContext =
+                            sandboxFilesystemSpec.toSandboxContext(resolvedWorkspace);
+                } else if (sandboxFilesystemSpec.getIsolationScope() != null
+                        && sandboxFilesystemSpec.getIsolationScope() != fsIsolationScope) {
+                    log.warn(
+                            "[harness] Skills-cache scope mismatch: the sandbox spec declares"
+                                + " isolation scope {} but the effective filesystem scope is {}."
+                                + " Skills are staged under the latter while projection and the"
+                                + " sandbox state slot use the former, so the sandbox may start"
+                                + " with no skills. Make the two equal.",
+                            sandboxFilesystemSpec.getIsolationScope(),
+                            fsIsolationScope);
+                }
+
                 if (isLocalSession(effectiveSession)) {
                     log.warn(
                             "[harness] Sandbox mode is using a local AgentStateStore ({})."
