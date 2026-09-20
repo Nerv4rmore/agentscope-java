@@ -91,26 +91,7 @@ public class HarnessSkillMiddleware implements HarnessRuntimeMiddleware {
      * authoritative for everything the sweep can reach.
      */
     private String scopeKeyFor(RuntimeContext ctx) {
-        IsolationScope scope = isolationScope != null ? isolationScope : IsolationScope.USER;
-        return switch (scope) {
-            case USER -> {
-                String uid = ctx != null ? ctx.getUserId() : null;
-                if (uid != null && !uid.isBlank()) {
-                    yield uid;
-                }
-                // Mirrors IsolationScope.USER's documented fall back to the session identity.
-                // null means "no identity to key on" and is distinct from an identity that
-                // happens to be spelled like the stager's shared bucket.
-                String sid = ctx != null ? ctx.getSessionId() : null;
-                yield sid != null && !sid.isBlank() ? sid : null;
-            }
-            case SESSION -> {
-                String sid = ctx != null ? ctx.getSessionId() : null;
-                yield sid != null && !sid.isBlank() ? sid : null;
-            }
-            // The workspace is already per-agent, so these need no further separation.
-            case AGENT, GLOBAL -> null;
-        };
+        return MarketplaceStager.rawScopeKey(isolationScope, ctx);
     }
 
     public HarnessSkillMiddleware(List<AgentSkillRepository> repositories, Toolkit toolkit) {

@@ -15,8 +15,10 @@
  */
 package io.agentscope.harness.agent.skill.runtime;
 
+import io.agentscope.core.agent.RuntimeContext;
 import io.agentscope.core.skill.AgentSkill;
 import io.agentscope.core.skill.repository.AgentSkillRepository;
+import io.agentscope.harness.agent.IsolationScope;
 import io.agentscope.harness.agent.skill.WorkspaceSkillRepository;
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -69,10 +71,10 @@ import org.slf4j.LoggerFactory;
  * directory is deleted only after sitting untouched for that long, and every retained directory
  * is touched on each pass — and every traversal tolerates entries deleted underneath it.
  *
- * <p>Workspace-native skills (those produced by {@link WorkspaceSkillRepository}) are NOT
- * staged: they already live under {@code <wsRoot>/skills/} (or are produced lazily from the
- * sandbox-backed filesystem) and projection covers them through the regular {@code skills}
- * root.
+ * <p>Workspace-native skills are NOT staged: neither those produced by {@link
+ * WorkspaceSkillRepository} nor those whose on-disk origin already sits under {@code
+ * <wsRoot>/skills/}. Projection ships that tree to the sandbox as-is, so staging it again would
+ * duplicate every file once per isolation scope.
  */
 @SuppressWarnings("deprecation")
 public final class MarketplaceStager {
@@ -112,9 +114,10 @@ public final class MarketplaceStager {
 
     /**
      * Stage all eligible inputs and return a map from {@code skill.name} to its resolved
-     * {@link StageResult}. Inputs whose source repository is a
-     * {@link WorkspaceSkillRepository} are returned as {@link StageResult.WorkspaceNative}
-     * — they need no staging because the workspace tree already contains them.
+     * {@link StageResult}. Inputs that already live in the workspace tree — those from a
+     * {@link WorkspaceSkillRepository}, and any whose on-disk origin is under {@code
+     * <wsRoot>/skills/} — are returned as {@link StageResult.WorkspaceNative}. They need no
+     * staging because workspace projection ships that tree as-is.
      *
      * <p>The white-list of staged directories is rebuilt every call; any pre-existing
      * directory under {@code .skills-cache/<source-ns>/} not in the white-list is removed
@@ -180,6 +183,42 @@ public final class MarketplaceStager {
     private static final int MAX_SCOPE_SEGMENT = 64;
 
     /**
+     * The raw per-call isolation identity that keys a {@code .skills-cache} subtree: {@code
+     * userId} under {@link IsolationScope#USER} (falling back to the session id when absent),
+     * the session id under {@link IsolationScope#SESSION}, and no identity for {@code AGENT} /
+     * {@code GLOBAL}, whose workspace is already per-agent.
+     *
+     * <p>Single source of truth on purpose: anything that has to address the same subtree the
+     * stager writes — notably the sandbox projection narrowing its {@code .skills-cache} include
+     * root — must agree with {@link #stage} on this mapping byte for byte, or it silently ships
+     * an empty subtree and the model loses its skills.
+     */
+    public static String rawScopeKey(IsolationScope scope, RuntimeContext ctx) {
+        IsolationScope effective = scope != null ? scope : IsolationScope.USER;
+        return switch (effective) {
+            case USER -> {
+                String uid = ctx != null ? ctx.getUserId() : null;
+                if (uid != null && !uid.isBlank()) {
+                    yield uid;
+                }
+                String sid = ctx != null ? ctx.getSessionId() : null;
+                yield sid != null && !sid.isBlank() ? sid : null;
+            }
+            case SESSION -> {
+                String sid = ctx != null ? ctx.getSessionId() : null;
+                yield sid != null && !sid.isBlank() ? sid : null;
+            }
+            // The workspace is already per-agent, so these need no further separation.
+            case AGENT, GLOBAL -> null;
+        };
+    }
+
+    /** {@link #rawScopeKey} reduced to the actual path segment under {@code .skills-cache/}. */
+    public static String cacheSegmentFor(IsolationScope scope, RuntimeContext ctx) {
+        return scopeSegment(rawScopeKey(scope, ctx));
+    }
+
+    /**
      * Maps a caller-supplied identity to one path segment, injectively. Sanitising alone would
      * not do: {@code alice@corp.com} and {@code alice#corp.com} both flatten to
      * {@code alice_corp.com}, and two identities sharing a subtree is exactly what the scope
@@ -225,6 +264,17 @@ public final class MarketplaceStager {
                 continue;
             }
 
+            // A filesystem repo rooted at (or below) the workspace is already shipped to the
+            // sandbox by workspace projection, which reads the same tree. Re-staging it copies
+            // every file a second time under each isolation scope, and every scope that is not
+            // the caller's own is never garbage collected — so a flat copy of the skill library
+            // accumulates per user and gets uploaded on every sandbox start.
+            String nativeRel = workspaceNativeRelativePath(bound.skill());
+            if (nativeRel != null) {
+                roots.put(name, new StageResult.WorkspaceNative(nativeRel));
+                continue;
+            }
+
             String ns = sourceNs.get(bound.repo());
             if (ns == null || ns.isBlank()) {
                 ns = bound.repo().getSource();
@@ -247,6 +297,32 @@ public final class MarketplaceStager {
                 roots.put(name, StageResult.NONE);
             }
         }
+    }
+
+    /**
+     * Returns the skill's on-disk directory as a {@code /}-separated path relative to the
+     * workspace root, when that directory is already inside the projected workspace tree.
+     * {@code null} means the skill has no workspace-resident origin and must be staged.
+     *
+     * <p>Keyed on the origin directory rather than the repository class because a delegating
+     * repository (e.g. one that filters skills) hides the underlying filesystem source from an
+     * {@code instanceof} test. The directory name is also not assumed to equal the skill's
+     * {@code name}, which is why the relative path is carried rather than reconstructed.
+     */
+    private String workspaceNativeRelativePath(AgentSkill skill) {
+        if (workspaceRoot == null || skill == null) {
+            return null;
+        }
+        Path origin = skill.getOriginDir().map(p -> p.toAbsolutePath().normalize()).orElse(null);
+        if (origin == null) {
+            return null;
+        }
+        Path ws = workspaceRoot.toAbsolutePath().normalize();
+        Path skillsRoot = ws.resolve("skills");
+        if (!origin.startsWith(skillsRoot) || origin.equals(skillsRoot)) {
+            return null;
+        }
+        return ws.relativize(origin).toString().replace('\\', '/');
     }
 
     /** Convenience for callers that don't care about return values. */
@@ -582,8 +658,21 @@ public final class MarketplaceStager {
         /** No staging applied — skill source has no shell-reachable representation. */
         record None() implements StageResult {}
 
-        /** Skill comes from {@link WorkspaceSkillRepository} (already in workspace/skills/). */
-        record WorkspaceNative() implements StageResult {}
+        /**
+         * Skill's content already lives in the workspace tree, so projection ships it as-is and
+         * no staging is needed.
+         *
+         * @param relativePath path of the skill directory relative to the workspace root, in
+         *     {@code /} form (e.g. {@code skills/my-skill}), or {@code null} to derive
+         *     {@code skills/<skillName>} — which is what a {@link WorkspaceSkillRepository} skill
+         *     looks like, and the safe assumption when the source has no on-disk origin.
+         */
+        record WorkspaceNative(String relativePath) implements StageResult {
+
+            public WorkspaceNative() {
+                this(null);
+            }
+        }
 
         /** Skill staged under {@code .skills-cache/<sourceNs>/<skillName>/}. */
         record Cached(String scopeSegment, String sourceNamespace, String skillName)

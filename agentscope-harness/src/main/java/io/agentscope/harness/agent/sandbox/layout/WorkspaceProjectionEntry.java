@@ -29,6 +29,14 @@ import java.util.List;
  */
 public class WorkspaceProjectionEntry extends WorkspaceEntry {
 
+    /**
+     * Key the projection entry is registered under in a {@link
+     * io.agentscope.harness.agent.sandbox.WorkspaceSpec}. Exposed because per-call consumers that
+     * must narrow the projection (see {@link
+     * io.agentscope.harness.agent.sandbox.WorkspaceProjectionApplier}) look the entry up by it.
+     */
+    public static final String ENTRY_KEY = "__workspace_projection__";
+
     private String sourceRoot;
     private List<String> includeRoots = new ArrayList<>();
 
