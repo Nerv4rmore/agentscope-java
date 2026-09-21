@@ -58,6 +58,20 @@ class ShellExecuteToolTest {
     }
 
     @Test
+    void execute_timeoutAboveMax_isClamped() {
+        tool.execute(RT, "ls", null, 60_000);
+
+        assertEquals(ShellExecuteTool.MAX_TIMEOUT_SECONDS, sandbox.timeoutSeconds);
+    }
+
+    @Test
+    void execute_nonPositiveTimeout_fallsBackToDefault() {
+        tool.execute(RT, "ls", null, 0);
+
+        assertEquals(ShellExecuteTool.DEFAULT_TIMEOUT_SECONDS, sandbox.timeoutSeconds);
+    }
+
+    @Test
     void execute_withWorkingDirectory_prefixesCd() {
         String result = tool.execute(RT, "ls", "sub", null);
 

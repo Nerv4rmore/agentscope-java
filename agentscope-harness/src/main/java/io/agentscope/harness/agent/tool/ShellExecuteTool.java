@@ -31,6 +31,19 @@ public class ShellExecuteTool {
      */
     public static final String NAME = "execute";
 
+    /** Foreground wait applied when the model omits {@code timeout}. */
+    static final int DEFAULT_TIMEOUT_SECONDS = 30;
+
+    /**
+     * Upper bound for a single foreground {@code execute}.
+     *
+     * <p>The backend applies {@code timeout} purely as an HTTP read timeout and never sends it to
+     * the sandbox, so an unbounded value would let one tool call stall for as long as the model
+     * asks while the process keeps running unobserved. Anything genuinely longer belongs on the
+     * background path described in the tool description.
+     */
+    static final int MAX_TIMEOUT_SECONDS = 600;
+
     private final AbstractSandboxFilesystem sandbox;
 
     public ShellExecuteTool(AbstractSandboxFilesystem sandbox) {
@@ -46,31 +59,38 @@ public class ShellExecuteTool {
                     "Execute a shell command. Use for git, npm, build, test, and other terminal"
                         + " operations. Returns combined output and exit code. If a dedicated tool"
                         + " exists (e.g., read_file, write_file), you MUST use it instead of shell"
-                        + " commands. IMPORTANT: Commands have a HARD 30-second timeout enforced by"
-                        + " the sandbox gateway — any command exceeding 30s will be killed and"
-                        + " return a timeout error. For long-running commands (e.g., pip install,"
-                        + " npm install, large builds, long-running tests), use background"
-                        + " execution: append ' & echo $!' to start the process in the background,"
-                        + " then use 'wait $PID' or check output files to retrieve results."
-                        + " Alternatively, redirect output to a file (e.g., 'cmd > /tmp/out.log"
-                        + " 2>&1 &') and read it afterwards.")
+                        + " commands. The call blocks until the command exits or 'timeout' seconds"
+                        + " elapse (default 30, max 600). IMPORTANT: reaching the timeout does NOT"
+                        + " kill the command — it only stops this call from waiting. The process"
+                        + " keeps running in the sandbox, its output is lost, and you get no exit"
+                        + " code. So never rely on the timeout to bound work. For anything that may"
+                        + " run longer than ~30s (pip install, npm install, large builds, long test"
+                        + " suites), start it in the background instead: append ' & echo $!' to get"
+                        + " a pid back immediately, redirect its output to a file (e.g. 'cmd >"
+                        + " /tmp/out.log 2>&1 & echo $!'), then run 'wait <pid>' in a later call to"
+                        + " collect the exit code and output. The file redirect is what makes the"
+                        + " result recoverable, so always include it for long work.")
     public String execute(
             RuntimeContext runtimeContext,
             @ToolParam(name = "command", description = "Shell command to execute") String command,
             @ToolParam(
                             name = "working_directory",
                             description =
-                                    "Sub-path of the current working directory to run in (optional)."
-                                        + " Commands already start in your session working"
-                                        + " directory, so omit this for the common case. Must be"
-                                        + " relative — absolute paths, '~' and '..' are rejected.",
+                                    "Sub-path of the current working directory to run in"
+                                        + " (optional). Commands already start in your session"
+                                        + " working directory, so omit this for the common case."
+                                        + " Must be relative — absolute paths, '~' and '..' are"
+                                        + " rejected.",
                             required = false)
                     String workingDirectory,
             @ToolParam(
                             name = "timeout",
                             description =
-                                    "Timeout in seconds (default: 30, max: 30 — the sandbox gateway"
-                                            + " enforces a hard 30s limit)",
+                                    "Seconds this call waits for the command to finish (default:"
+                                        + " 30, max: 600). Raise it when you know the command needs"
+                                        + " longer. It bounds only how long this call waits — it"
+                                        + " never kills the process — so for open-ended work use"
+                                        + " background execution (' & echo $!') instead.",
                             required = false)
                     Integer timeout) {
         String effectiveCommand = command;
@@ -88,7 +108,10 @@ public class ShellExecuteTool {
             effectiveCommand = commandWithWorkingDirectory(wd, command);
         }
 
-        int timeoutSeconds = timeout != null && timeout > 0 ? timeout : 30;
+        int timeoutSeconds =
+                timeout == null || timeout <= 0
+                        ? DEFAULT_TIMEOUT_SECONDS
+                        : Math.min(timeout, MAX_TIMEOUT_SECONDS);
         ExecuteResponse result = sandbox.execute(runtimeContext, effectiveCommand, timeoutSeconds);
 
         StringBuilder sb = new StringBuilder();
