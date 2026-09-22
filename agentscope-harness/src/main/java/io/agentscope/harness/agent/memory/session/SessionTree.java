@@ -20,6 +20,7 @@ import io.agentscope.core.util.JsonUtils;
 import io.agentscope.harness.agent.filesystem.AbstractFilesystem;
 import io.agentscope.harness.agent.filesystem.model.ReadResult;
 import io.agentscope.harness.agent.filesystem.sandbox.PinnedSandboxFilesystem;
+import io.agentscope.harness.agent.filesystem.sandbox.SandboxBackedFilesystem;
 import io.agentscope.harness.agent.sandbox.Sandbox;
 import io.agentscope.harness.agent.sandbox.SandboxAware;
 import io.agentscope.harness.agent.transcript.ObjectStoreTranscriptStore;
@@ -598,9 +599,10 @@ public class SessionTree {
      * When {@code fs} is a call-scoped sandbox proxy with an active binding, return a pinned
      * filesystem that keeps that sandbox for async uploads. Otherwise return {@code fs} as-is.
      */
-    private static AbstractFilesystem pinIfSandbox(AbstractFilesystem fs) {
+    private AbstractFilesystem pinIfSandbox(AbstractFilesystem fs) {
         if (fs instanceof SandboxAware aware) {
-            Sandbox sb = aware.getSandbox();
+            Sandbox sb = fs instanceof SandboxBackedFilesystem sandboxFs
+                    ? sandboxFs.getSandbox(fsRc) : aware.getSandbox();
             if (sb != null) {
                 return new PinnedSandboxFilesystem(sb);
             }

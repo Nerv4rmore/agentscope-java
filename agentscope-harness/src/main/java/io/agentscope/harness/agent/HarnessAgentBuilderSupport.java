@@ -356,6 +356,10 @@ final class HarnessAgentBuilderSupport {
         final boolean capturedAgentTracingLogEnabled = b.agentTracingLogEnabled;
         final List<String> capturedAdditionalContextFiles = List.copyOf(b.additionalContextFiles);
         final int capturedMaxContextTokens = b.maxContextTokens;
+        final var capturedMessageBus = b.messageBus;
+        final var capturedAsyncToolRegistry = b.asyncToolRegistry;
+        final var capturedAsyncToolTimeout = b.asyncToolTimeout;
+        final boolean capturedDisableMessageBus = b.disableMessageBus;
         // Propagate the parent's (distributed) state store so an exposed subagent can be
         // re-materialized on another node / after a restart and still load its conversation
         // history by sessionId. Null in purely local default deployments — children then keep
@@ -411,6 +415,10 @@ final class HarnessAgentBuilderSupport {
             }
             if (capturedBackend != null) sub.abstractFilesystem(capturedBackend);
             if (capturedStateStore != null) sub.stateStore(capturedStateStore);
+            if (capturedMessageBus != null) sub.messageBus(capturedMessageBus);
+            if (capturedAsyncToolRegistry != null) sub.asyncToolRegistry(capturedAsyncToolRegistry);
+            if (capturedAsyncToolTimeout != null) sub.asyncToolTimeout(capturedAsyncToolTimeout);
+            if (capturedDisableMessageBus) sub.disableMessageBus();
             if (capturedModelExec != null) sub.modelExecutionConfig(capturedModelExec);
             if (capturedToolExec != null) sub.toolExecutionConfig(capturedToolExec);
             if (capturedGenOpts != null) sub.generateOptions(capturedGenOpts);

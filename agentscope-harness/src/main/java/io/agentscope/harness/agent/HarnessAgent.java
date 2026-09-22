@@ -719,7 +719,7 @@ public class HarnessAgent implements Agent, AutoCloseable {
     @Deprecated(since = "2.2.0")
     @Override
     public Mono<Msg> call(List<Msg> msgs) {
-        return wrappedCall(msgs, RuntimeContext.empty(), () -> delegate.call(msgs));
+        return call(msgs, RuntimeContext.empty());
     }
 
     /**
@@ -728,8 +728,7 @@ public class HarnessAgent implements Agent, AutoCloseable {
     @Deprecated(since = "2.2.0")
     @Override
     public Mono<Msg> call(List<Msg> msgs, Class<?> structuredModel) {
-        return wrappedCall(
-                msgs, RuntimeContext.empty(), () -> delegate.call(msgs, structuredModel));
+        return call(msgs, structuredModel, RuntimeContext.empty());
     }
 
     /**
@@ -738,7 +737,7 @@ public class HarnessAgent implements Agent, AutoCloseable {
     @Deprecated(since = "2.2.0")
     @Override
     public Mono<Msg> call(List<Msg> msgs, JsonNode schema) {
-        return wrappedCall(msgs, RuntimeContext.empty(), () -> delegate.call(msgs, schema));
+        return call(msgs, schema, RuntimeContext.empty());
     }
 
     public Mono<Msg> call(Msg msg, RuntimeContext ctx) {
@@ -757,21 +756,15 @@ public class HarnessAgent implements Agent, AutoCloseable {
     }
 
     public Mono<Msg> call(List<Msg> msgs, RuntimeContext ctx) {
-        RuntimeContext effective =
-                ensureSessionDefaults(ctx != null ? ctx : RuntimeContext.empty());
-        return wrappedCall(msgs, effective, () -> delegate.call(msgs, effective));
+        return wrappedCall(msgs, ctx, effective -> delegate.call(msgs, effective));
     }
 
     public Mono<Msg> call(List<Msg> msgs, Class<?> structuredModel, RuntimeContext ctx) {
-        RuntimeContext effective =
-                ensureSessionDefaults(ctx != null ? ctx : RuntimeContext.empty());
-        return wrappedCall(msgs, effective, () -> delegate.call(msgs, structuredModel, effective));
+        return wrappedCall(msgs, ctx, effective -> delegate.call(msgs, structuredModel, effective));
     }
 
     public Mono<Msg> call(List<Msg> msgs, JsonNode schema, RuntimeContext ctx) {
-        RuntimeContext effective =
-                ensureSessionDefaults(ctx != null ? ctx : RuntimeContext.empty());
-        return wrappedCall(msgs, effective, () -> delegate.call(msgs, schema, effective));
+        return wrappedCall(msgs, ctx, effective -> delegate.call(msgs, schema, effective));
     }
 
     /**
@@ -781,7 +774,7 @@ public class HarnessAgent implements Agent, AutoCloseable {
     @Deprecated(since = "2.0.0", forRemoval = true)
     @Override
     public Flux<Event> stream(List<Msg> msgs, StreamOptions options) {
-        return wrappedStream(RuntimeContext.empty(), () -> delegate.stream(msgs, options));
+        return stream(msgs, options, RuntimeContext.empty());
     }
 
     /**
@@ -791,8 +784,7 @@ public class HarnessAgent implements Agent, AutoCloseable {
     @Deprecated(since = "2.0.0", forRemoval = true)
     @Override
     public Flux<Event> stream(List<Msg> msgs, StreamOptions options, Class<?> structuredModel) {
-        return wrappedStream(
-                RuntimeContext.empty(), () -> delegate.stream(msgs, options, structuredModel));
+        return stream(msgs, options, structuredModel, RuntimeContext.empty());
     }
 
     /**
@@ -802,7 +794,7 @@ public class HarnessAgent implements Agent, AutoCloseable {
     @Deprecated(since = "2.0.0", forRemoval = true)
     @Override
     public Flux<Event> stream(List<Msg> msgs, StreamOptions options, JsonNode schema) {
-        return wrappedStream(RuntimeContext.empty(), () -> delegate.stream(msgs, options, schema));
+        return stream(msgs, options, schema, RuntimeContext.empty());
     }
 
     /**
@@ -826,9 +818,7 @@ public class HarnessAgent implements Agent, AutoCloseable {
      */
     @Deprecated(since = "2.0.0", forRemoval = true)
     public Flux<Event> stream(List<Msg> msgs, StreamOptions options, RuntimeContext ctx) {
-        RuntimeContext effective =
-                ensureSessionDefaults(ctx != null ? ctx : RuntimeContext.empty());
-        return wrappedStream(effective, () -> delegate.stream(msgs, options, effective));
+        return wrappedStream(ctx, effective -> delegate.stream(msgs, options, effective));
     }
 
     /**
@@ -837,10 +827,8 @@ public class HarnessAgent implements Agent, AutoCloseable {
     @Deprecated(since = "2.0.0", forRemoval = true)
     public Flux<Event> stream(
             List<Msg> msgs, StreamOptions options, Class<?> structuredModel, RuntimeContext ctx) {
-        RuntimeContext effective =
-                ensureSessionDefaults(ctx != null ? ctx : RuntimeContext.empty());
         return wrappedStream(
-                effective, () -> delegate.stream(msgs, options, structuredModel, effective));
+                ctx, effective -> delegate.stream(msgs, options, structuredModel, effective));
     }
 
     /**
@@ -849,9 +837,7 @@ public class HarnessAgent implements Agent, AutoCloseable {
     @Deprecated(since = "2.0.0", forRemoval = true)
     public Flux<Event> stream(
             List<Msg> msgs, StreamOptions options, JsonNode schema, RuntimeContext ctx) {
-        RuntimeContext effective =
-                ensureSessionDefaults(ctx != null ? ctx : RuntimeContext.empty());
-        return wrappedStream(effective, () -> delegate.stream(msgs, options, schema, effective));
+        return wrappedStream(ctx, effective -> delegate.stream(msgs, options, schema, effective));
     }
 
     // ==================== streamEvents (AgentEvent — v2 aligned) ====================
@@ -920,9 +906,7 @@ public class HarnessAgent implements Agent, AutoCloseable {
      * @return event stream covering the full agent invocation lifecycle
      */
     public Flux<AgentEvent> streamEvents(List<Msg> msgs, RuntimeContext ctx) {
-        RuntimeContext effective =
-                ensureSessionDefaults(ctx != null ? ctx : RuntimeContext.empty());
-        return wrappedStreamEvents(effective, () -> delegate.streamEvents(msgs, effective));
+        return wrappedStreamEvents(ctx, effective -> delegate.streamEvents(msgs, effective));
     }
 
     @Override
@@ -942,67 +926,71 @@ public class HarnessAgent implements Agent, AutoCloseable {
     // ==================== Call/stream wrappers ====================
 
     private Mono<Msg> wrappedCall(
-            List<Msg> msgs, RuntimeContext effective, Supplier<Mono<Msg>> inner) {
-        Mono<Msg> base =
-                Mono.using(
-                        () -> {
-                            if (sandboxLifecycleMw != null) {
-                                sandboxLifecycleMw.acquireForCall(effective);
-                            }
-                            return effective;
-                        },
-                        eff -> inner.get(),
-                        eff -> {
-                            if (sandboxLifecycleMw != null) {
-                                sandboxLifecycleMw.releaseForCall(eff);
-                            }
-                        });
-        if (compactionHook != null) {
-            return base.onErrorResume(
-                    e -> {
-                        if (isContextOverflowError(e)) {
-                            return recoverFromOverflow(msgs, effective);
-                        }
-                        return Mono.error(e);
-                    });
-        }
-        return base;
-    }
-
-    /**
-     * @deprecated since 2.0.0, for removal alongside the {@link #stream(List, StreamOptions)}
-     *     family. Replaced by {@link #wrappedStreamEvents(RuntimeContext, Supplier)}.
-     */
-    @Deprecated(since = "2.0.0", forRemoval = true)
-    private Flux<Event> wrappedStream(RuntimeContext effective, Supplier<Flux<Event>> inner) {
-        return Flux.using(
+            List<Msg> msgs, RuntimeContext ctx, Function<RuntimeContext, Mono<Msg>> inner) {
+        return Mono.using(
                 () -> {
+                    RuntimeContext effective =
+                            ensureSessionDefaults(RuntimeContext.builder(ctx).build());
                     if (sandboxLifecycleMw != null) {
                         sandboxLifecycleMw.acquireForCall(effective);
                     }
                     return effective;
                 },
-                eff -> inner.get(),
-                eff -> {
+                effective -> {
+                    Mono<Msg> call = Mono.defer(() -> inner.apply(effective));
+                    if (compactionHook != null) {
+                        // 压缩及重试必须在同一次沙箱租约内完成。
+                        return call.onErrorResume(
+                                e -> isContextOverflowError(e)
+                                        ? recoverFromOverflow(msgs, effective)
+                                        : Mono.error(e));
+                    }
+                    return call;
+                },
+                effective -> {
                     if (sandboxLifecycleMw != null) {
-                        sandboxLifecycleMw.releaseForCall(eff);
+                        sandboxLifecycleMw.releaseForCall(effective);
+                    }
+                });
+    }
+
+    /** @deprecated 使用 {@link #wrappedStreamEvents(RuntimeContext, Function)}。 */
+    @Deprecated(since = "2.0.0", forRemoval = true)
+    private Flux<Event> wrappedStream(
+            RuntimeContext ctx, Function<RuntimeContext, Flux<Event>> inner) {
+        return Flux.using(
+                () -> {
+                    RuntimeContext effective =
+                            ensureSessionDefaults(RuntimeContext.builder(ctx).build());
+                    if (sandboxLifecycleMw != null) {
+                        sandboxLifecycleMw.acquireForCall(effective);
+                    }
+                    return effective;
+                },
+                inner::apply,
+                effective -> {
+                    if (sandboxLifecycleMw != null) {
+                        sandboxLifecycleMw.releaseForCall(effective);
                     }
                 });
     }
 
     private Flux<AgentEvent> wrappedStreamEvents(
-            RuntimeContext effective, Supplier<Flux<AgentEvent>> inner) {
+            RuntimeContext ctx, Function<RuntimeContext, Flux<AgentEvent>> inner) {
         return Flux.using(
                 () -> {
+                    // 每次订阅独立绑定，防止复用上下文或重订阅覆盖仍在运行的调用。
+                    RuntimeContext effective =
+                            ensureSessionDefaults(RuntimeContext.builder(ctx).build());
                     if (sandboxLifecycleMw != null) {
                         sandboxLifecycleMw.acquireForCall(effective);
                     }
                     return effective;
                 },
-                eff -> inner.get(),
-                eff -> {
+                inner::apply,
+                effective -> {
                     if (sandboxLifecycleMw != null) {
-                        sandboxLifecycleMw.releaseForCall(eff);
+                        sandboxLifecycleMw.releaseForCall(effective);
                     }
                 });
     }
@@ -1025,15 +1013,16 @@ public class HarnessAgent implements Agent, AutoCloseable {
                         ? source.get(SandboxContext.class)
                         : defaultSandboxContext;
         AbstractFilesystem fs = workspaceManager != null ? workspaceManager.getFilesystem() : null;
+        boolean bindFilesystem = fs != null && (sourceFs == null || sandboxLifecycleMw != null);
 
         if (ctxSessionId.equals(source.getSessionId())
                 && sandboxCtx == source.get(SandboxContext.class)
-                && (fs == null || sourceFs != null)) {
+                && (!bindFilesystem || sourceFs == fs)) {
             return source;
         }
         RuntimeContext.Builder b = RuntimeContext.builder(source).sessionId(ctxSessionId);
         b.put(SandboxContext.class, sandboxCtx);
-        if (sourceFs == null && fs != null) {
+        if (bindFilesystem) {
             b.put(AbstractFilesystem.class, fs);
         }
         if (workspaceManager != null) {
@@ -2623,20 +2612,22 @@ public class HarnessAgent implements Agent, AutoCloseable {
                         return new WorkspaceManager(capturedWorkspace, ctxFs, capturedIndex, ctxNs);
                     };
 
-            // ---- MessageBus / AsyncToolRegistry: workspace defaults ----
-            // If not set explicitly or via DistributedStore, fall back to workspace-backed
-            // implementations that use the same AbstractFilesystem as the rest of the agent.
-            // disableMessageBus 时跳过默认创建：WorkspaceMessageBus/WorkspaceAsyncToolRegistry 以
-            // 沙箱文件系统为后端，会在推理前被 InboxMiddleware 访问，导致沙箱被提前创建。
-            if (!disableMessageBus && messageBus == null && filesystem != null) {
+            // 消息总线可在调用结束后读写，不能依赖按调用释放的沙箱。
+            AbstractFilesystem busFilesystem =
+                    sandboxFilesystemSpec != null
+                                    || abstractFilesystem instanceof SandboxBackedFilesystem
+                            ? new io.agentscope.harness.agent.filesystem.local.LocalFilesystem(
+                                    resolvedWorkspace)
+                            : filesystem;
+            if (!disableMessageBus && messageBus == null && busFilesystem != null) {
                 messageBus =
                         new io.agentscope.harness.agent.bus.WorkspaceMessageBus(
-                                filesystem, ".agentscope/bus");
+                                busFilesystem, ".agentscope/bus");
             }
-            if (!disableMessageBus && asyncToolRegistry == null && filesystem != null) {
+            if (!disableMessageBus && asyncToolRegistry == null && busFilesystem != null) {
                 asyncToolRegistry =
                         new io.agentscope.harness.agent.bus.WorkspaceAsyncToolRegistry(
-                                filesystem, ".agentscope/bus/async-tools");
+                                busFilesystem, ".agentscope/bus/async-tools");
             }
 
             // ---- Middlewares ----
