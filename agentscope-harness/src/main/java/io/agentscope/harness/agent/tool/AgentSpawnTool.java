@@ -491,6 +491,8 @@ public class AgentSpawnTool {
             final String capturedTask = task;
             SandboxBackedFilesystem.SharedLease sharedLease =
                     remote ? null : retainSharedSandbox(effectiveRc);
+            // 取消未必停止执行，通过认领确保已启动任务仅在退出时释放租约。
+            AtomicBoolean taskClaimed = new AtomicBoolean(false);
             TaskRunSpec spec;
             if (remote) {
                 SubagentDeclaration d = declOpt.get();
@@ -505,6 +507,9 @@ public class AgentSpawnTool {
                 spec =
                         new TaskRunSpec.LocalTaskRunSpec(
                                 () -> {
+                                    if (!taskClaimed.compareAndSet(false, true)) {
+                                        return "";
+                                    }
                                     try {
                                         Msg reply =
                                                 manager.invokeAgent(
@@ -526,10 +531,17 @@ public class AgentSpawnTool {
                 BackgroundTask backgroundTask =
                         taskRepository.putTask(effectiveRc, taskId, agentId, parentSessionId, spec);
                 if (backgroundTask != null) {
-                    backgroundTask.onCompletion(() -> closeSharedSandbox(sharedLease));
+                    backgroundTask.onCompletion(
+                            () -> {
+                                if (taskClaimed.compareAndSet(false, true)) {
+                                    closeSharedSandbox(sharedLease);
+                                }
+                            });
                 }
             } catch (RuntimeException e) {
-                closeSharedSandbox(sharedLease);
+                if (taskClaimed.compareAndSet(false, true)) {
+                    closeSharedSandbox(sharedLease);
+                }
                 throw e;
             }
             return withSubagentExposedEvent(
@@ -681,6 +693,8 @@ public class AgentSpawnTool {
             final String capturedMessage = message;
             SandboxBackedFilesystem.SharedLease sharedLease =
                     remote ? null : retainSharedSandbox(effectiveRc);
+            // 取消未必停止执行，通过认领确保已启动任务仅在退出时释放租约。
+            AtomicBoolean taskClaimed = new AtomicBoolean(false);
             TaskRunSpec spec;
             if (remote) {
                 SubagentDeclaration d = declOpt.get();
@@ -695,6 +709,9 @@ public class AgentSpawnTool {
                 spec =
                         new TaskRunSpec.LocalTaskRunSpec(
                                 () -> {
+                                    if (!taskClaimed.compareAndSet(false, true)) {
+                                        return "";
+                                    }
                                     try {
                                         Msg reply =
                                                 manager.invokeAgent(
@@ -717,10 +734,17 @@ public class AgentSpawnTool {
                         taskRepository.putTask(
                                 effectiveRc, taskId, spawned.agentId(), parentSessionId, spec);
                 if (backgroundTask != null) {
-                    backgroundTask.onCompletion(() -> closeSharedSandbox(sharedLease));
+                    backgroundTask.onCompletion(
+                            () -> {
+                                if (taskClaimed.compareAndSet(false, true)) {
+                                    closeSharedSandbox(sharedLease);
+                                }
+                            });
                 }
             } catch (RuntimeException e) {
-                closeSharedSandbox(sharedLease);
+                if (taskClaimed.compareAndSet(false, true)) {
+                    closeSharedSandbox(sharedLease);
+                }
                 throw e;
             }
             return Mono.just(String.format(BG_RESULT_TEMPLATE, taskId, taskId, taskId));
@@ -809,7 +833,7 @@ public class AgentSpawnTool {
             return null;
         }
         try {
-            return sandboxFs.retainForAsync();
+            return sandboxFs.retainForAsync(ctx);
         } catch (IllegalStateException e) {
             log.warn("Unable to retain shared sandbox for detached child work: {}", e.getMessage());
             return null;
@@ -1739,6 +1763,8 @@ public class AgentSpawnTool {
             final String capturedTask = task;
             SandboxBackedFilesystem.SharedLease sharedLease =
                     remote ? null : retainSharedSandbox(runtimeContext);
+            // 取消未必停止执行，通过认领确保已启动任务仅在退出时释放租约。
+            AtomicBoolean taskClaimed = new AtomicBoolean(false);
             TaskRunSpec spec;
             if (remote) {
                 SubagentDeclaration d = declOpt.get();
@@ -1753,6 +1779,9 @@ public class AgentSpawnTool {
                 spec =
                         new TaskRunSpec.LocalTaskRunSpec(
                                 () -> {
+                                    if (!taskClaimed.compareAndSet(false, true)) {
+                                        return "";
+                                    }
                                     try {
                                         Msg reply =
                                                 manager.invokeAgent(
@@ -1775,10 +1804,17 @@ public class AgentSpawnTool {
                         taskRepository.putTask(
                                 runtimeContext, taskId, spawned.agentId(), parentSessionId, spec);
                 if (backgroundTask != null) {
-                    backgroundTask.onCompletion(() -> closeSharedSandbox(sharedLease));
+                    backgroundTask.onCompletion(
+                            () -> {
+                                if (taskClaimed.compareAndSet(false, true)) {
+                                    closeSharedSandbox(sharedLease);
+                                }
+                            });
                 }
             } catch (RuntimeException e) {
-                closeSharedSandbox(sharedLease);
+                if (taskClaimed.compareAndSet(false, true)) {
+                    closeSharedSandbox(sharedLease);
+                }
                 throw e;
             }
             return Mono.just(

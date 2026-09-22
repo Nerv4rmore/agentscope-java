@@ -364,12 +364,14 @@ class SandboxBackedFilesystemTest {
     @Test
     void sharedLease_defersReleaseUntilLastDetachedTaskCompletes() {
         SandboxBackedFilesystem filesystem = new SandboxBackedFilesystem();
+        RuntimeContext ctx = RuntimeContext.empty();
+        filesystem.bindLifecycle(null, null, ctx);
         java.util.concurrent.atomic.AtomicInteger releases =
                 new java.util.concurrent.atomic.AtomicInteger();
 
-        SandboxBackedFilesystem.SharedLease first = filesystem.retainForAsync();
-        SandboxBackedFilesystem.SharedLease second = filesystem.retainForAsync();
-        filesystem.requestRelease(releases::incrementAndGet);
+        SandboxBackedFilesystem.SharedLease first = filesystem.retainForAsync(ctx);
+        SandboxBackedFilesystem.SharedLease second = filesystem.retainForAsync(ctx);
+        filesystem.requestRelease(ctx, releases::incrementAndGet);
 
         assertEquals(0, releases.get());
         first.close();
@@ -377,17 +379,19 @@ class SandboxBackedFilesystemTest {
         second.close();
         second.close();
         assertEquals(1, releases.get());
-        assertThrows(IllegalStateException.class, filesystem::retainForAsync);
+        assertThrows(IllegalStateException.class, () -> filesystem.retainForAsync(ctx));
     }
 
     @Test
     void sharedLease_withoutDetachedWork_releasesImmediately() {
         SandboxBackedFilesystem filesystem = new SandboxBackedFilesystem();
+        RuntimeContext ctx = RuntimeContext.empty();
+        filesystem.bindLifecycle(null, null, ctx);
         java.util.concurrent.atomic.AtomicInteger releases =
                 new java.util.concurrent.atomic.AtomicInteger();
 
-        filesystem.requestRelease(releases::incrementAndGet);
-        filesystem.requestRelease(releases::incrementAndGet);
+        filesystem.requestRelease(ctx, releases::incrementAndGet);
+        filesystem.requestRelease(ctx, releases::incrementAndGet);
 
         assertEquals(1, releases.get());
     }
