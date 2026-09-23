@@ -47,123 +47,110 @@ import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-/**
- * A {@link BaseSandboxFilesystem} that delegates execution to a live {@link Sandbox}.
- *
- * <p>Stable proxy created at agent build time. The live {@link Sandbox} for a call is resolved by
- * {@link #requireSandbox(RuntimeContext)} with this precedence:
- *
- * <ol>
- *   <li>The per-call binding carried on the invocation's {@link RuntimeContext} (established by
- *       {@link io.agentscope.harness.agent.middleware.SandboxLifecycleMiddleware} when a sandbox
- *       is eagerly acquired) — this takes precedence and keeps concurrent distinct-session calls
- *       on the same agent bean isolated (issue #2490).
- *   <li>The volatile {@code sandbox} field — a best-effort fallback for context-free internal
- *       callers that resolve the filesystem with a shared empty {@link RuntimeContext} (e.g.
- *       {@link io.agentscope.harness.agent.bus.WorkspaceMessageBus}); the middleware maintains it
- *       via {@link #setSandbox} on acquire and {@link #clearSandboxIfCurrent} on release, so it
- *       remains last-writer-wins under concurrency and must not be relied on for isolation.
- *   <li>Lazy creation via the bound {@link SandboxManager} + {@link SandboxContext}.
- * </ol>
- *
- * <p><b>Lazy sandbox creation:</b> since v2.0.0 the sandbox is no longer created eagerly at the
- * start of every agent call. Instead the {@link
- * io.agentscope.harness.agent.middleware.SandboxLifecycleMiddleware} only binds the
- * sandbox-creation dependencies ({@link SandboxManager} + {@link SandboxContext}) via {@link
- * #bindLifecycle}; the actual {@code SandboxManager.acquire} + {@code Sandbox.start} is deferred
- * to the first filesystem operation that actually needs a sandbox (i.e. the first call to {@link
- * #requireSandbox}). Calls that never touch the sandbox filesystem — pure-text replies or tools
- * that do not read/write/exec — therefore pay zero sandbox creation cost. The lazily-created
- * {@link SandboxAcquireResult} is exposed to the middleware via {@link #consumeAcquireResult} so
- * the normal end-of-call release path still runs when (and only when) a sandbox was created.
- */
+/** 沙箱按调用懒加载；上下文副本及共享子 Agent 通过同一状态对象复用实例。 */
 public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements SandboxAware {
 
     private static final Logger log = LoggerFactory.getLogger(SandboxBackedFilesystem.class);
 
     private final String fsId;
+    // 仅显式固定实例使用此字段，调用生命周期不得写入共享代理。
     private volatile Sandbox sandbox;
 
-    // 懒创建依赖：由 SandboxLifecycleMiddleware.acquireForCall 在每次调用开始时注入，
-    // 供 requireSandbox 在首次需要沙箱时按需 acquire + start。
-    private volatile SandboxManager sandboxManager;
-    private volatile SandboxContext sandboxContext;
-    // 本次调用的 RuntimeContext 快照（携带 userId/sessionId 与会话工作区根等 per-call 属性）。
-    // 兜底场景：子 Agent 构建期操作（如 ToolsConfigLoader 读 tools.json）用
-    // RuntimeContext.empty() 触发懒创建时，工具层 ctx 缺失身份信息，若直接透传会导致
-    // SandboxManager 无法解析隔离键、创建出无会话目录的裸沙箱。见 requireSandbox。
-    private volatile RuntimeContext boundCallContext;
-    // 本次调用懒创建产生的 AcquireResult；未创建沙箱时为 null。release 时消费。
-    private volatile SandboxAcquireResult lazyAcquireResult;
+    private static final class CallState {
+        private final SandboxBackedFilesystem filesystem;
+        private final SandboxManager manager;
+        private final SandboxContext sandboxContext;
+        private final RuntimeContext runtimeContext;
+        private final AtomicInteger unhealthyExecs = new AtomicInteger();
+        private SandboxAcquireResult acquireResult;
+        private int retainedAsyncCalls;
+        private boolean releaseRequested;
+        private boolean releaseCompleted;
+        private Runnable pendingRelease;
 
-    /** Coordinates parent cleanup with detached shared child work. */
-    private final Object lifecycleLock = new Object();
+        private CallState(
+                SandboxBackedFilesystem filesystem,
+                SandboxManager manager,
+                SandboxContext sandboxContext,
+                RuntimeContext runtimeContext) {
+            this.filesystem = filesystem;
+            this.manager = manager;
+            this.sandboxContext = sandboxContext;
+            this.runtimeContext = runtimeContext;
+        }
 
-    private int retainedAsyncCalls;
-    private boolean releaseRequested;
-    private boolean releaseCompleted;
-    private Runnable pendingRelease;
+        private Runnable takePendingReleaseIfReady() {
+            if (!releaseRequested || retainedAsyncCalls != 0 || releaseCompleted) {
+                return null;
+            }
+            releaseCompleted = true;
+            Runnable action = pendingRelease;
+            pendingRelease = null;
+            return action;
+        }
+    }
 
-    /** A counted reference that keeps this filesystem alive until detached work finishes. */
-    public final class SharedLease implements AutoCloseable {
+    public static final class SharedLease implements AutoCloseable {
+        private final CallState call;
         private boolean closed;
 
-        private SharedLease() {}
+        private SharedLease(CallState call) {
+            this.call = call;
+        }
 
         @Override
         public void close() {
             Runnable releaseAction;
-            synchronized (lifecycleLock) {
+            synchronized (call) {
                 if (closed) {
                     return;
                 }
                 closed = true;
-                retainedAsyncCalls--;
-                releaseAction = takePendingReleaseIfReady();
+                call.retainedAsyncCalls--;
+                releaseAction = call.takePendingReleaseIfReady();
             }
             runReleaseAction(releaseAction);
         }
     }
 
-    /** Retains this filesystem while a detached local child can outlive its parent call. */
-    public SharedLease retainForAsync() {
-        synchronized (lifecycleLock) {
-            if (releaseCompleted) {
+    public SharedLease retainForAsync(RuntimeContext runtimeContext) {
+        CallState call = callState(runtimeContext);
+        if (call == null) {
+            throw new IllegalStateException("Sandbox filesystem is not bound to this call");
+        }
+        synchronized (call) {
+            if (call.releaseCompleted) {
                 throw new IllegalStateException(
                         "Sandbox filesystem call has already been released");
             }
-            retainedAsyncCalls++;
-            log.debug("[sandbox-diag] shared retain: refs={}", retainedAsyncCalls);
-            return new SharedLease();
+            call.retainedAsyncCalls++;
+            log.debug("[sandbox-diag] shared retain: sessionId={}, refs={}",
+                    call.runtimeContext.getSessionId(), call.retainedAsyncCalls);
+            return new SharedLease(call);
         }
     }
 
-    /** Requests parent cleanup, deferring it while detached child references remain. */
-    public void requestRelease(Runnable releaseAction) {
+    public void requestRelease(RuntimeContext runtimeContext, Runnable releaseAction) {
+        CallState call = callState(runtimeContext);
+        if (call == null) {
+            runReleaseAction(releaseAction);
+            return;
+        }
         Runnable ready;
-        synchronized (lifecycleLock) {
-            if (releaseRequested) {
+        synchronized (call) {
+            if (call.releaseRequested) {
                 return;
             }
-            releaseRequested = true;
-            pendingRelease = releaseAction;
-            ready = takePendingReleaseIfReady();
-            log.info("[sandbox-diag] shared release requested: refs={}", retainedAsyncCalls);
+            call.releaseRequested = true;
+            call.pendingRelease = releaseAction;
+            ready = call.takePendingReleaseIfReady();
+            log.info("[sandbox-diag] shared release requested: sessionId={}, refs={}",
+                    call.runtimeContext.getSessionId(), call.retainedAsyncCalls);
         }
         runReleaseAction(ready);
     }
 
-    private Runnable takePendingReleaseIfReady() {
-        if (!releaseRequested || retainedAsyncCalls != 0 || releaseCompleted) {
-            return null;
-        }
-        releaseCompleted = true;
-        Runnable action = pendingRelease;
-        pendingRelease = null;
-        return action;
-    }
-
-    private void runReleaseAction(Runnable action) {
+    private static void runReleaseAction(Runnable action) {
         if (action != null) {
             action.run();
         }
@@ -184,8 +171,6 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
     @Override
     public synchronized void setSandbox(Sandbox sandbox) {
         this.sandbox = sandbox;
-        // 新沙箱注入时（新一轮调用或重新 acquire）清零熔断计数，
-        // 让新实例从干净状态开始，避免跨调用误伤
         if (sandbox != null) {
             consecutiveUnhealthyExecs.set(0);
         }
@@ -196,51 +181,50 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
         return sandbox;
     }
 
-    /**
-     * 绑定本次调用所需的懒创建依赖。由 {@link
-     * io.agentscope.harness.agent.middleware.SandboxLifecycleMiddleware#acquireForCall} 在每次
-     * agent 调用开始时调用。绑定后不会立即创建沙箱，沙箱将在首次文件系统操作时按需创建。
-     *
-     * @param sandboxManager 沙箱生命周期管理器（acquire/release）
-     * @param sandboxContext 当前调用的沙箱配置（从 RuntimeContext 取出）
-     * @param callContext 当前调用的 RuntimeContext 快照（携带 userId/sessionId 与会话工作区
-     *     根），供懒创建时兜底使用；可为 {@code null}
-     */
     public void bindLifecycle(
             SandboxManager sandboxManager,
             SandboxContext sandboxContext,
             RuntimeContext callContext) {
-        synchronized (lifecycleLock) {
-            if (releaseCompleted) {
-                releaseRequested = false;
-                releaseCompleted = false;
-                pendingRelease = null;
-            } else if (releaseRequested) {
-                throw new IllegalStateException(
-                        "Cannot bind a new sandbox call while detached shared work is still"
-                                + " active");
-            }
-        }
-        this.sandboxManager = sandboxManager;
-        this.sandboxContext = sandboxContext;
-        this.boundCallContext = callContext;
-        this.lazyAcquireResult = null;
+        CallState call = new CallState(
+                this, sandboxManager, sandboxContext, RuntimeContext.builder(callContext).build());
+        // 先绑定可变状态，再复制上下文；后续懒创建对所有副本及共享子 Agent 可见。
+        callContext.put(CallState.class, call);
     }
 
-    /**
-     * 返回并清空本次调用懒创建产生的 {@link SandboxAcquireResult}。
-     *
-     * <p>供 {@link
-     * io.agentscope.harness.agent.middleware.SandboxLifecycleMiddleware#releaseForCall} 在调用结束
-     * 时消费：若本次调用实际创建过沙箱则返回非 null（中间件据此执行 persist + release）；若本次
-     * 调用从未触发沙箱创建则返回 null（中间件跳过释放）。
-     *
-     * @return 本次调用懒创建的 AcquireResult，未创建则返回 null
-     */
-    public SandboxAcquireResult consumeAcquireResult() {
-        SandboxAcquireResult r = lazyAcquireResult;
-        lazyAcquireResult = null;
-        return r;
+    public SandboxAcquireResult consumeAcquireResult(RuntimeContext runtimeContext) {
+        CallState call = callState(runtimeContext);
+        if (call == null) {
+            return null;
+        }
+        synchronized (call) {
+            SandboxAcquireResult result = call.acquireResult;
+            call.acquireResult = null;
+            return result;
+        }
+    }
+
+    public static Sandbox currentSandbox(RuntimeContext runtimeContext) {
+        CallState call = runtimeContext != null ? runtimeContext.get(CallState.class) : null;
+        if (call == null) {
+            return null;
+        }
+        synchronized (call) {
+            return !call.releaseCompleted && call.acquireResult != null
+                    ? call.acquireResult.getSandbox() : null;
+        }
+    }
+
+    public Sandbox getSandbox(RuntimeContext runtimeContext) {
+        Sandbox fixed = sandbox;
+        if (fixed != null) {
+            return fixed;
+        }
+        return callState(runtimeContext) != null ? currentSandbox(runtimeContext) : null;
+    }
+
+    private CallState callState(RuntimeContext runtimeContext) {
+        CallState call = runtimeContext != null ? runtimeContext.get(CallState.class) : null;
+        return call != null && call.filesystem == this ? call : null;
     }
 
     /**
@@ -265,6 +249,9 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
     public ExecuteResponse execute(
             RuntimeContext runtimeContext, String command, Integer timeoutSeconds) {
         Sandbox active = requireSandbox(runtimeContext);
+        CallState call = callState(runtimeContext);
+        AtomicInteger consecutiveUnhealthyExecs =
+                call != null ? call.unhealthyExecs : this.consecutiveUnhealthyExecs;
         // 诊断：execute 入口，记录命令与目标沙箱，便于追踪每次工具调用的落点；
         // 正常路径降为 debug，避免每次工具调用刷两条 INFO 淹没主日志，异常路径保留 warn/error。
         log.debug(
@@ -481,129 +468,56 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
         return results;
     }
 
-    /**
-     * 获取当前活跃沙箱；若尚未创建则按需懒创建。
-     *
-     * <p>解析优先级：先读按调用绑定到 {@code runtimeContext} 的 {@link SandboxAcquireResult}
-     * （并发会话隔离，issue #2490），再退回共享 {@code sandbox} 字段，最后才走懒创建。
-     *
-     * <p>懒创建语义：当 {@code sandbox} 为 null 且已通过 {@link #bindLifecycle} 绑定
-     * {@link SandboxManager} + {@link SandboxContext} 时，从 {@code runtimeContext} 取出
-     * {@link SandboxContext}，调用 {@link SandboxManager#acquire} 获取沙箱并 {@link Sandbox#start}
-     * 启动，随后注入到 {@code sandbox} 字段供本次调用后续操作复用。产生的
-     * {@link SandboxAcquireResult} 暂存到 {@link #lazyAcquireResult}，由
-     * {@link io.agentscope.harness.agent.middleware.SandboxLifecycleMiddleware#releaseForCall}
-     * 在调用结束时消费释放。
-     *
-     * <p>使用 synchronized + double-check 保证同一调用内多个工具并发触发时只创建一次。
-     *
-     * @param runtimeContext 当前调用的 RuntimeContext（携带 SandboxContext）
-     * @return 当前活跃沙箱
-     * @throws SandboxException.SandboxConfigurationException 既未注入沙箱也未绑定懒创建依赖
-     */
-    private Sandbox requireSandbox(RuntimeContext runtimeContext) {
-        // 上游 #2490：优先解析按调用绑定到 RuntimeContext 的沙箱，保证同一 agent bean 上
-        // 并发不同会话的调用互不串绑。
-        Sandbox s = null;
-        if (runtimeContext != null) {
-            SandboxAcquireResult perCallBound = runtimeContext.get(SandboxAcquireResult.class);
-            if (perCallBound != null) {
-                s = perCallBound.getSandbox();
-            }
+    public Sandbox requireSandbox(RuntimeContext runtimeContext) {
+        Sandbox fixed = sandbox;
+        if (fixed != null) {
+            return fixed;
         }
-        if (s == null) {
-            s = sandbox;
-        }
-        if (s != null) {
-            // 诊断：复用当前调用已创建/注入的沙箱（同一次 agent 调用内多个工具共享）
-            log.debug(
-                    "[sandbox-diag] requireSandbox REUSE: sandboxId={}",
-                    s.getState() != null ? s.getState().getSessionId() : "?");
-            return s;
-        }
-        // 已绑定懒创建依赖：首次需要沙箱时按需创建
-        SandboxManager manager = sandboxManager;
-        if (manager == null) {
+        CallState call = callState(runtimeContext);
+        if (call == null) {
             throw new SandboxException.SandboxConfigurationException(
                     "No active sandbox — sandbox filesystem used outside of a call context");
         }
-        SandboxContext ctx = sandboxContext;
-        // 优先使用绑定时的 sandboxContext；若为 null 则尝试从 runtimeContext 取
-        if (ctx == null && runtimeContext != null) {
-            ctx = runtimeContext.get(SandboxContext.class);
-        }
-        if (ctx == null) {
-            throw new SandboxException.SandboxConfigurationException(
-                    "No active sandbox — sandbox context not bound for lazy creation");
-        }
-        // 兜底：工具层传入的 runtimeContext 可能缺失身份信息（典型场景：子 Agent 构建期
-        // ToolsConfigLoader 用 RuntimeContext.empty() 读 tools.json 触发懒创建）。此时若直接
-        // 透传空 ctx，SandboxManager 将解析不出隔离键与会话工作区根，创建出无会话目录的
-        // 裸沙箱。缺失时回退到 acquireForCall 绑定的本次调用 RuntimeContext 快照。
-        RuntimeContext effectiveRc = runtimeContext;
-        RuntimeContext bound = boundCallContext;
-        if (bound != null
-                && (effectiveRc == null
-                        || (effectiveRc.getUserId() == null
-                                && effectiveRc.getSessionId() == null))) {
-            log.info(
-                    "[sandbox-diag] requireSandbox: tool-layer runtimeContext lacks identity,"
-                            + " falling back to bound call context (userId={}, sessionId={})",
-                    bound.getUserId(),
-                    bound.getSessionId());
-            effectiveRc = bound;
-        }
-        // 诊断：懒创建入口，记录当前 sandbox 为 null，将触发 acquire（Priority 3 resume 或 4 create）
-        log.info(
-                "[sandbox-diag] requireSandbox LAZY CREATE: sandbox==null, manager={}, ctx={}",
-                manager != null ? manager.getClass().getSimpleName() : "null",
-                ctx.getExternalSandbox() != null
-                        ? "externalSandbox"
-                        : (ctx.getExternalSandboxState() != null
-                                ? "externalSandboxState"
-                                : "harness-managed"));
-        synchronized (this) {
-            s = sandbox;
-            if (s != null) {
-                return s;
+        synchronized (call) {
+            if (call.releaseCompleted) {
+                throw new SandboxException.SandboxConfigurationException(
+                        "Sandbox filesystem call has already been released");
             }
+            if (call.acquireResult != null) {
+                return call.acquireResult.getSandbox();
+            }
+            log.info("[sandbox-diag] requireSandbox LAZY CREATE: userId={}, sessionId={}, root={}",
+                    call.runtimeContext.getUserId(), call.runtimeContext.getSessionId(),
+                    call.runtimeContext.get(SandboxManager.CALL_WORKSPACE_ROOT_KEY, String.class));
             try {
-                SandboxAcquireResult result = manager.acquire(ctx, effectiveRc);
+                SandboxAcquireResult result =
+                        call.manager.acquire(call.sandboxContext, call.runtimeContext);
                 Sandbox acquired = result.getSandbox();
                 try {
                     acquired.start();
                 } catch (Exception startErr) {
-                    // 诊断：懒创建后 start 失败，记录 sandboxId 与异常，定位复用/重建失败
-                    log.warn(
-                            "[sandbox-diag] requireSandbox LAZY START FAILED: sandboxId={},"
-                                    + " error={}",
-                            acquired.getState() != null ? acquired.getState().getSessionId() : "?",
-                            startErr.getMessage());
-                    // start 失败需回滚 acquire，避免沙箱泄漏
                     try {
-                        manager.release(result);
+                        call.manager.release(result);
                     } catch (Exception releaseErr) {
-                        log.warn(
-                                "[sandbox-fs] Failed to release sandbox after lazy start failure:"
-                                        + " {}",
-                                releaseErr.getMessage(),
+                        log.warn("[sandbox-fs] Failed to release sandbox after start failure",
                                 releaseErr);
+                    } finally {
+                        result.getLease().close();
                     }
-                    result.getLease().close();
                     throw startErr;
                 }
-                this.sandbox = acquired;
-                this.lazyAcquireResult = result;
-                // 诊断：懒创建成功，记录最终 sandboxId
-                log.info(
-                        "[sandbox-diag] requireSandbox LAZY CREATE OK: sandboxId={}",
-                        acquired.getState() != null ? acquired.getState().getSessionId() : "?");
+                call.acquireResult = result;
+                log.info("[sandbox-diag] requireSandbox LAZY CREATE OK: userId={}, sessionId={},"
+                                + " sandboxSessionId={}, workspaceRoot={}",
+                        call.runtimeContext.getUserId(), call.runtimeContext.getSessionId(),
+                        acquired.getState() != null ? acquired.getState().getSessionId() : "?",
+                        acquired.workspaceRoot());
                 return acquired;
             } catch (SandboxException e) {
                 throw e;
             } catch (Exception e) {
                 throw new SandboxException.SandboxConfigurationException(
-                        "Failed to lazily create sandbox: " + e.getMessage(), e);
+                        "Failed to acquire sandbox for this call: " + e.getMessage(), e);
             }
         }
     }
