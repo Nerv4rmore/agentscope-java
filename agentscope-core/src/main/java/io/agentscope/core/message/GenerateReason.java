@@ -70,6 +70,18 @@ public enum GenerateReason {
     MIDDLEWARE_STOP_REQUESTED,
 
     /**
+     * A tool threw {@link io.agentscope.core.tool.ToolRetryLaterException}: it could not run now
+     * and must be re-executed on resume.
+     *
+     * <p>The tool call is left pending (no result committed) and a
+     * {@link io.agentscope.core.event.ToolRetryLaterEvent} is emitted. The caller resumes by
+     * issuing a second {@code agent.call()} with no input — the pending tool call is re-executed
+     * from scratch. Distinct from {@link #TOOL_SUSPENDED}, which waits for an externally supplied
+     * result rather than a retry.
+     */
+    TOOL_RETRY_PENDING,
+
+    /**
      * All tool calls were denied by the user and a hook requested the agent to stop.
      *
      * <p>Fired when every tool call from the most recent reasoning step was denied via HITL

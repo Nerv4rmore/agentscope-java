@@ -65,6 +65,7 @@ import java.util.UUID;
             value = ExternalExecutionResultEvent.class,
             name = "EXTERNAL_EXECUTION_RESULT"),
     @JsonSubTypes.Type(value = RequestStopEvent.class, name = "REQUEST_STOP"),
+    @JsonSubTypes.Type(value = ToolRetryLaterEvent.class, name = "TOOL_RETRY_LATER"),
     @JsonSubTypes.Type(value = SubagentExposedEvent.class, name = "SUBAGENT_EXPOSED"),
     @JsonSubTypes.Type(value = HintBlockEvent.class, name = "HINT_BLOCK"),
     @JsonSubTypes.Type(value = AllToolsDeniedEvent.class, name = "ALL_TOOLS_DENIED"),

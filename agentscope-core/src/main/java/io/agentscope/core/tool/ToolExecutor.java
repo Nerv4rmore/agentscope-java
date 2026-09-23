@@ -356,6 +356,19 @@ class ToolExecutor {
                             return Mono.just(ToolResultBlock.suspended(toolCall, e));
                         })
                 .onErrorResume(
+                        ToolRetryLaterException.class,
+                        e -> {
+                            // Convert ToolRetryLaterException to a transient retry marker. The
+                            // acting phase reads it to leave this tool call pending (re-executed on
+                            // resume) and emit a ToolRetryLaterEvent; it is never committed as a
+                            // tool result nor reported to execution listeners.
+                            logger.debug(
+                                    "Tool '{}' deferred for retry: {}",
+                                    toolCall.getName(),
+                                    e.getReason() != null ? e.getReason() : "no reason");
+                            return Mono.just(ToolResultBlock.retryLater(toolCall, e));
+                        })
+                .onErrorResume(
                         e -> {
                             String errorMsg =
                                     e.getMessage() != null
@@ -379,6 +392,11 @@ class ToolExecutor {
      */
     private void notifyListeners(ToolCallParam param, ToolResultBlock result) {
         if (executionListeners.isEmpty() || result == null) {
+            return;
+        }
+        // A retry-later marker means the tool did not actually run; skip listener notification so
+        // billing/audit observers do not record a non-execution.
+        if (result.isRetryLater()) {
             return;
         }
         ToolUseBlock toolUse = param.getToolUseBlock();

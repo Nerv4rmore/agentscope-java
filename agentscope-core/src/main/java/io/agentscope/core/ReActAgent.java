@@ -54,6 +54,7 @@ import io.agentscope.core.event.ToolResultDataDeltaEvent;
 import io.agentscope.core.event.ToolResultEndEvent;
 import io.agentscope.core.event.ToolResultStartEvent;
 import io.agentscope.core.event.ToolResultTextDeltaEvent;
+import io.agentscope.core.event.ToolRetryLaterEvent;
 import io.agentscope.core.event.UserConfirmResultEvent;
 import io.agentscope.core.formatter.JsonSchema;
 import io.agentscope.core.formatter.ResponseFormat;
@@ -2443,6 +2444,28 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                                                                                 rs
                                                                                         .getGenerateReason()));
                                                             }
+                                                            if (rs != null) {
+                                                                // Stop was requested before any
+                                                                // reasoning content was produced
+                                                                // (e.g. a pre-model-call credits /
+                                                                // budget gate that short-circuits
+                                                                // onReasoning). Return an empty
+                                                                // message tagged with the stop
+                                                                // reason so the call terminates
+                                                                // cleanly instead of completing
+                                                                // empty; nothing is persisted
+                                                                // because the context is already
+                                                                // consistent (no partial
+                                                                // reasoning).
+                                                                return Mono.just(
+                                                                        AssistantMessage.builder()
+                                                                                .name(getName())
+                                                                                .content(List.of())
+                                                                                .generateReason(
+                                                                                        rs
+                                                                                                .getGenerateReason())
+                                                                                .build());
+                                                            }
                                                             return Mono.justOrEmpty(finalMsg);
                                                         }));
                             })
@@ -2857,6 +2880,17 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                                     }
                                     Msg stopMsg = buildStopMsg(results, rs.getGenerateReason());
                                     return Mono.just(stopMsg);
+                                }
+                                // A tool deferred itself for retry (ToolRetryLaterException): leave
+                                // it pending so an empty resume call re-executes it, commit any
+                                // sibling successes so they are not re-run, surface the reason via
+                                // ToolRetryLaterEvent, and stop the loop.
+                                List<Map.Entry<ToolUseBlock, ToolResultBlock>> retryPairs =
+                                        results.stream()
+                                                .filter(e -> e.getValue().isRetryLater())
+                                                .toList();
+                                if (!retryPairs.isEmpty()) {
+                                    return commitRetryAndStop(retryPairs, results);
                                 }
                                 List<Map.Entry<ToolUseBlock, ToolResultBlock>> successPairs =
                                         results.stream()
@@ -3439,6 +3473,65 @@ public class ReActAgent extends AgentBase implements AutoCloseable {
                     .name(getName())
                     .content(content)
                     .generateReason(reason)
+                    .build();
+        }
+
+        /**
+         * Handle a batch in which at least one tool deferred itself for retry
+         * ({@link io.agentscope.core.tool.ToolRetryLaterException}).
+         *
+         * <p>Emits a {@link ToolRetryLaterEvent} per deferred tool, commits the results of siblings
+         * that already succeeded (so they are <b>not</b> re-executed on resume), then stops the loop
+         * with {@link GenerateReason#TOOL_RETRY_PENDING}. The deferred tool calls are deliberately
+         * left without a result in context, so {@link #getPendingToolUseIds()} still reports them as
+         * pending and an empty resume call re-executes them from scratch.
+         */
+        private Mono<Msg> commitRetryAndStop(
+                List<Map.Entry<ToolUseBlock, ToolResultBlock>> retryPairs,
+                List<Map.Entry<ToolUseBlock, ToolResultBlock>> allResults) {
+            for (Map.Entry<ToolUseBlock, ToolResultBlock> pair : retryPairs) {
+                ToolUseBlock use = pair.getKey();
+                Map<String, Object> payload = pair.getValue().getRetryPayload();
+                Object reason = payload.get("reason");
+                Object meta = payload.get("metadata");
+                publishEvent(
+                        new ToolRetryLaterEvent(
+                                use.getId(),
+                                use.getName(),
+                                reason instanceof String s ? s : null,
+                                meta instanceof Map<?, ?> m ? castStringKeyMap(m) : Map.of()));
+            }
+            List<Map.Entry<ToolUseBlock, ToolResultBlock>> successPairs =
+                    allResults.stream()
+                            .filter(
+                                    e ->
+                                            !e.getValue().isSuspended()
+                                                    && !e.getValue().isRetryLater())
+                            .toList();
+            return Flux.fromIterable(successPairs)
+                    .concatMap(this::notifyPostActingHook)
+                    .then(Mono.fromCallable(() -> buildRetryStopMsg(retryPairs)));
+        }
+
+        @SuppressWarnings("unchecked")
+        private static Map<String, Object> castStringKeyMap(Map<?, ?> map) {
+            return (Map<String, Object>) map;
+        }
+
+        /**
+         * Build the call-result Msg for a retry stop. Carries the deferred {@code ToolUseBlock}s for
+         * the caller's inspection; it is <b>not</b> added to context, so the pending tool calls
+         * remain pending for re-execution on resume.
+         */
+        private Msg buildRetryStopMsg(List<Map.Entry<ToolUseBlock, ToolResultBlock>> retryPairs) {
+            List<ContentBlock> content = new ArrayList<>();
+            for (Map.Entry<ToolUseBlock, ToolResultBlock> pair : retryPairs) {
+                content.add(pair.getKey());
+            }
+            return AssistantMessage.builder()
+                    .name(getName())
+                    .content(content)
+                    .generateReason(GenerateReason.TOOL_RETRY_PENDING)
                     .build();
         }
 
