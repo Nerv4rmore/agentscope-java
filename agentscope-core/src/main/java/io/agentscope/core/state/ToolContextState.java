@@ -133,7 +133,9 @@ public final class ToolContextState {
      * @param groupName 要激活的工具组名；{@code null} 或空字符串时忽略
      */
     public void addActivatedGroup(String groupName) {
-        if (groupName != null && !groupName.isEmpty() && !this.activatedGroups.contains(groupName)) {
+        if (groupName != null
+                && !groupName.isEmpty()
+                && !this.activatedGroups.contains(groupName)) {
             this.activatedGroups.add(groupName);
         }
     }

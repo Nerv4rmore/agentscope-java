@@ -271,9 +271,9 @@ public class ResponsesMessageConverter {
                 new TextBlock.Builder()
                         .text(
                                 "<system-info>The following are the image contents from the tool"
-                                    + " result of '"
-                                    + result.getName()
-                                    + "':</system-info>")
+                                        + " result of '"
+                                        + result.getName()
+                                        + "':</system-info>")
                         .build());
         blocks.addAll(imageBlocks);
 

@@ -124,8 +124,10 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
                         "Sandbox filesystem call has already been released");
             }
             call.retainedAsyncCalls++;
-            log.debug("[sandbox-diag] shared retain: sessionId={}, refs={}",
-                    call.runtimeContext.getSessionId(), call.retainedAsyncCalls);
+            log.debug(
+                    "[sandbox-diag] shared retain: sessionId={}, refs={}",
+                    call.runtimeContext.getSessionId(),
+                    call.retainedAsyncCalls);
             return new SharedLease(call);
         }
     }
@@ -144,8 +146,10 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
             call.releaseRequested = true;
             call.pendingRelease = releaseAction;
             ready = call.takePendingReleaseIfReady();
-            log.info("[sandbox-diag] shared release requested: sessionId={}, refs={}",
-                    call.runtimeContext.getSessionId(), call.retainedAsyncCalls);
+            log.info(
+                    "[sandbox-diag] shared release requested: sessionId={}, refs={}",
+                    call.runtimeContext.getSessionId(),
+                    call.retainedAsyncCalls);
         }
         runReleaseAction(ready);
     }
@@ -185,8 +189,12 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
             SandboxManager sandboxManager,
             SandboxContext sandboxContext,
             RuntimeContext callContext) {
-        CallState call = new CallState(
-                this, sandboxManager, sandboxContext, RuntimeContext.builder(callContext).build());
+        CallState call =
+                new CallState(
+                        this,
+                        sandboxManager,
+                        sandboxContext,
+                        RuntimeContext.builder(callContext).build());
         // 先绑定可变状态，再复制上下文；后续懒创建对所有副本及共享子 Agent 可见。
         callContext.put(CallState.class, call);
     }
@@ -210,7 +218,8 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
         }
         synchronized (call) {
             return !call.releaseCompleted && call.acquireResult != null
-                    ? call.acquireResult.getSandbox() : null;
+                    ? call.acquireResult.getSandbox()
+                    : null;
         }
     }
 
@@ -486,8 +495,10 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
             if (call.acquireResult != null) {
                 return call.acquireResult.getSandbox();
             }
-            log.info("[sandbox-diag] requireSandbox LAZY CREATE: userId={}, sessionId={}, root={}",
-                    call.runtimeContext.getUserId(), call.runtimeContext.getSessionId(),
+            log.info(
+                    "[sandbox-diag] requireSandbox LAZY CREATE: userId={}, sessionId={}, root={}",
+                    call.runtimeContext.getUserId(),
+                    call.runtimeContext.getSessionId(),
                     call.runtimeContext.get(SandboxManager.CALL_WORKSPACE_ROOT_KEY, String.class));
             try {
                 SandboxAcquireResult result =
@@ -499,7 +510,8 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
                     try {
                         call.manager.release(result);
                     } catch (Exception releaseErr) {
-                        log.warn("[sandbox-fs] Failed to release sandbox after start failure",
+                        log.warn(
+                                "[sandbox-fs] Failed to release sandbox after start failure",
                                 releaseErr);
                     } finally {
                         result.getLease().close();
@@ -507,9 +519,11 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
                     throw startErr;
                 }
                 call.acquireResult = result;
-                log.info("[sandbox-diag] requireSandbox LAZY CREATE OK: userId={}, sessionId={},"
+                log.info(
+                        "[sandbox-diag] requireSandbox LAZY CREATE OK: userId={}, sessionId={},"
                                 + " sandboxSessionId={}, workspaceRoot={}",
-                        call.runtimeContext.getUserId(), call.runtimeContext.getSessionId(),
+                        call.runtimeContext.getUserId(),
+                        call.runtimeContext.getSessionId(),
                         acquired.getState() != null ? acquired.getState().getSessionId() : "?",
                         acquired.workspaceRoot());
                 return acquired;

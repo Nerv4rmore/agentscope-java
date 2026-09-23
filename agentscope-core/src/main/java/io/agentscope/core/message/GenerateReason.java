@@ -94,5 +94,8 @@ public enum GenerateReason {
     INTERRUPTED,
 
     /** Maximum iterations reached. */
-    MAX_ITERATIONS
+    MAX_ITERATIONS,
+
+    /** Tool result returned directly to the caller without a follow-up model call. */
+    TOOL_RETURN_DIRECT
 }

@@ -267,8 +267,7 @@ class ToolExecutor {
             Collection<String> perCallGroups = resolvePerCallActiveGroups(param);
             boolean authorized =
                     perCallGroups != null
-                            ? groupManager.isActiveToolInGroups(
-                                    toolCall.getName(), perCallGroups)
+                            ? groupManager.isActiveToolInGroups(toolCall.getName(), perCallGroups)
                             : groupManager.isActiveTool(toolCall.getName());
             if (!authorized) {
                 String errorMsg =

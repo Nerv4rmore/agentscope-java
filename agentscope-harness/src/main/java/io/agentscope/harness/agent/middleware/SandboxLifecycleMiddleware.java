@@ -53,7 +53,8 @@ public class SandboxLifecycleMiddleware implements HarnessRuntimeMiddleware {
         log.info(
                 "[sandbox-diag] acquireForCall: sessionId={}, userId={}, externalSandbox={},"
                         + " externalState={}",
-                ctx.getSessionId(), ctx.getUserId(),
+                ctx.getSessionId(),
+                ctx.getUserId(),
                 sandboxContext.getExternalSandbox() != null,
                 sandboxContext.getExternalSandboxState() != null);
         filesystemProxy.bindLifecycle(sandboxManager, sandboxContext, ctx);
@@ -64,7 +65,10 @@ public class SandboxLifecycleMiddleware implements HarnessRuntimeMiddleware {
                 try {
                     callback.accept(ctx);
                 } catch (Exception e) {
-                    log.warn("[sandbox-mw] beforeStartCallback failed; proceeding with sandbox start", e);
+                    log.warn(
+                            "[sandbox-mw] beforeStartCallback failed; proceeding with sandbox"
+                                    + " start",
+                            e);
                 }
             }
             filesystemProxy.requireSandbox(ctx);
@@ -82,8 +86,11 @@ public class SandboxLifecycleMiddleware implements HarnessRuntimeMiddleware {
 
     private void releaseNow(RuntimeContext ctx) {
         SandboxAcquireResult result = filesystemProxy.consumeAcquireResult(ctx);
-        log.info("[sandbox-diag] releaseForCall: sessionId={}, userId={}, acquired={}",
-                ctx.getSessionId(), ctx.getUserId(), result != null);
+        log.info(
+                "[sandbox-diag] releaseForCall: sessionId={}, userId={}, acquired={}",
+                ctx.getSessionId(),
+                ctx.getUserId(),
+                result != null);
         if (result == null) {
             return;
         }

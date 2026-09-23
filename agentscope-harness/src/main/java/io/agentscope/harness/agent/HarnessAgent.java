@@ -941,9 +941,10 @@ public class HarnessAgent implements Agent, AutoCloseable {
                     if (compactionHook != null) {
                         // 压缩及重试必须在同一次沙箱租约内完成。
                         return call.onErrorResume(
-                                e -> isContextOverflowError(e)
-                                        ? recoverFromOverflow(msgs, effective)
-                                        : Mono.error(e));
+                                e ->
+                                        isContextOverflowError(e)
+                                                ? recoverFromOverflow(msgs, effective)
+                                                : Mono.error(e));
                     }
                     return call;
                 },
@@ -2842,7 +2843,8 @@ public class HarnessAgent implements Agent, AutoCloseable {
                 // would produce relative paths whose lower-layer virtual entries (/src/...)
                 // then fail in the upper layer's ROOTED check.
                 pathNormalizer =
-                        WorkspacePathNormalizer.of(resolvedWorkspace.toAbsolutePath().toString());
+                        WorkspacePathNormalizer.of(
+                                resolvedWorkspace.toAbsolutePath().toString(), nsFactory);
             } else if (filesystem instanceof AbstractSandboxFilesystem) {
                 pathNormalizer =
                         WorkspacePathNormalizer.of(ShellPathPolicy.SANDBOX_WORKSPACE_PREFIX);

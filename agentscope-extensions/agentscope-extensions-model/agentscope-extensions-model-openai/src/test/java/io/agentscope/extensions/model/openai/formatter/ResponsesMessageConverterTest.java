@@ -36,8 +36,8 @@ class ResponsesMessageConverterTest {
 
     private final ResponsesMessageConverter converter =
             new ResponsesMessageConverter(
-                    msg -> "extracted text", blocks -> "the returned image can be found at: "
-                            + IMAGE_URL);
+                    msg -> "extracted text",
+                    blocks -> "the returned image can be found at: " + IMAGE_URL);
 
     @Test
     @SuppressWarnings("unchecked")
@@ -58,7 +58,8 @@ class ResponsesMessageConverterTest {
                         .filter(p -> "input_image".equals(p.get("type")))
                         .findFirst()
                         .orElse(null);
-        assertTrue(parts.stream().anyMatch(p -> "input_text".equals(p.get("type"))), () -> "" + parts);
+        assertTrue(
+                parts.stream().anyMatch(p -> "input_text".equals(p.get("type"))), () -> "" + parts);
         assertEquals(IMAGE_URL, imagePart == null ? null : imagePart.get("image_url"));
     }
 
@@ -69,9 +70,7 @@ class ResponsesMessageConverterTest {
                         .role(MsgRole.TOOL)
                         .content(
                                 ToolResultBlock.of(
-                                        "call-2",
-                                        "read_file",
-                                        List.of(text("file contents"))))
+                                        "call-2", "read_file", List.of(text("file contents"))))
                         .build();
 
         assertEquals(1, converter.convertToItems(toolMsg).size());
