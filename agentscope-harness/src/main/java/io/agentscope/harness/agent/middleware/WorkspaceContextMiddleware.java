@@ -216,7 +216,12 @@ public class WorkspaceContextMiddleware implements HarnessRuntimeMiddleware {
                 includeMemoryContext ? workspaceManager.readMemoryMd(rc).strip() : "";
         String knowledgeContent = workspaceManager.readKnowledgeMd(rc).strip();
         Path workspace = workspaceManager.getWorkspace();
-        String sessionContext = buildSessionContextSection(workspace, rc);
+        AbstractFilesystem filesystem = workspaceManager.getFilesystem();
+        Path effectiveWorkspace =
+                detectLocalUpper(filesystem) != null
+                        ? workspaceManager.resolveRuntimeDataPath(rc, "")
+                        : workspace;
+        String sessionContext = buildSessionContextSection(effectiveWorkspace, rc);
 
         String knowledgeBlock = buildKnowledgeBlock(rc, knowledgeContent, workspace);
         String additionalBlock = buildAdditionalContextBlock(rc);
@@ -236,7 +241,7 @@ public class WorkspaceContextMiddleware implements HarnessRuntimeMiddleware {
 
         String workspaceParagraph =
                 buildWorkspaceParagraph(
-                        workspace, workspaceManager.getFilesystem(), artifactDeliveryEnabled, rc);
+                        workspace, effectiveWorkspace, filesystem, artifactDeliveryEnabled, rc);
         String loadedContext =
                 buildLoadedContextSection(
                         agentsContent, memoryContent, knowledgeBlock, additionalBlock);
@@ -318,6 +323,7 @@ public class WorkspaceContextMiddleware implements HarnessRuntimeMiddleware {
      */
     private static String buildWorkspaceParagraph(
             Path workspace,
+            Path effectiveWorkspace,
             AbstractFilesystem fs,
             boolean artifactDeliveryEnabled,
             RuntimeContext rc) {
@@ -329,7 +335,7 @@ public class WorkspaceContextMiddleware implements HarnessRuntimeMiddleware {
                     .append(project.toAbsolutePath())
                     .append("\n");
             sb.append("Workspace (your home base — memory, sessions, skills, runtime data): ")
-                    .append(workspace.toAbsolutePath())
+                    .append(effectiveWorkspace.toAbsolutePath())
                     .append("\n");
             List<Path> extraRoots = extraRootsOf(localUpper, project, workspace);
             if (!extraRoots.isEmpty()) {
@@ -362,23 +368,27 @@ public class WorkspaceContextMiddleware implements HarnessRuntimeMiddleware {
         } else if (fs instanceof AbstractSandboxFilesystem sandbox
                 && !(fs instanceof OverlayFilesystem)) {
             String sandboxRoot =
-                    rc == null ? null : rc.get(SandboxManager.CALL_WORKSPACE_ROOT_KEY, String.class);
+                    rc == null
+                            ? null
+                            : rc.get(SandboxManager.CALL_WORKSPACE_ROOT_KEY, String.class);
             if (sandboxRoot != null && !sandboxRoot.isBlank()) {
                 sb.append("Sandbox working directory: ")
                         .append(sandboxRoot)
                         .append(" (sandbox: ")
                         .append(sandbox.id())
                         .append(")\n");
-                sb.append("Shell commands already start here and relative file paths resolve"
-                        + " here, so leave execute's working_directory unset; it accepts only a"
-                        + " relative sub-path of the directory above.\n");
+                sb.append(
+                        "Shell commands already start here and relative file paths resolve here, so"
+                            + " leave execute's working_directory unset; it accepts only a relative"
+                            + " sub-path of the directory above.\n");
             } else {
                 sb.append("Sandbox working directory (sandbox: ")
                         .append(sandbox.id())
                         .append("): your current directory — run `pwd` for its absolute path.\n");
-                sb.append("Shell commands already start here and relative file paths resolve"
-                        + " here, so leave execute's working_directory unset; it accepts only a"
-                        + " relative sub-path of the current directory.\n");
+                sb.append(
+                        "Shell commands already start here and relative file paths resolve here, so"
+                            + " leave execute's working_directory unset; it accepts only a relative"
+                            + " sub-path of the current directory.\n");
             }
             if (artifactDeliveryEnabled) {
                 sb.append(

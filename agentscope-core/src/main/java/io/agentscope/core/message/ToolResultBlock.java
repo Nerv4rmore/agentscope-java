@@ -18,6 +18,7 @@ package io.agentscope.core.message;
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonProperty;
+import io.agentscope.core.tool.ToolRetryLaterException;
 import io.agentscope.core.tool.ToolSuspendException;
 import java.beans.Transient;
 import java.util.List;
@@ -36,6 +37,12 @@ public final class ToolResultBlock extends ContentBlock {
 
     /** Metadata key indicating this result is suspended for external execution. */
     public static final String METADATA_SUSPENDED = "agentscope_suspended";
+
+    /** Metadata key indicating this tool call must be re-executed on the next resume. */
+    public static final String METADATA_RETRY_LATER = "agentscope_retry_later";
+
+    /** Metadata key carrying the {@link ToolRetryLaterException} payload (reason + UI metadata). */
+    public static final String METADATA_RETRY_PAYLOAD = "agentscope_retry_payload";
 
     private final String id;
     private final String name;
@@ -183,6 +190,58 @@ public final class ToolResultBlock extends ContentBlock {
      */
     public static ToolResultBlock suspended(ToolUseBlock toolUse) {
         return suspended(toolUse, new ToolSuspendException());
+    }
+
+    /**
+     * Checks if this result marks a tool call to be re-executed on the next resume.
+     *
+     * <p>A retry-later result is created when a tool throws {@link ToolRetryLaterException}. Unlike
+     * a {@linkplain #isSuspended() suspended} result it is never committed to the agent state: the
+     * framework uses it only to detect the pending tool call and stop the loop, leaving the
+     * {@code ToolUseBlock} awaiting re-execution.
+     *
+     * @return true if this result requests a retry, false otherwise
+     */
+    @Transient
+    @JsonInclude
+    public boolean isRetryLater() {
+        return Boolean.TRUE.equals(metadata.get(METADATA_RETRY_LATER));
+    }
+
+    /**
+     * Returns the {@link ToolRetryLaterException} payload (reason and UI metadata) carried by a
+     * retry-later result, or an empty map when absent.
+     */
+    @Transient
+    @SuppressWarnings("unchecked")
+    public Map<String, Object> getRetryPayload() {
+        Object payload = metadata.get(METADATA_RETRY_PAYLOAD);
+        return payload instanceof Map<?, ?> m ? (Map<String, Object>) m : Map.of();
+    }
+
+    /**
+     * Creates a retry-later marker from a {@link ToolRetryLaterException}.
+     *
+     * <p>This is a transient in-flight marker: the framework reads {@link #isRetryLater()} and
+     * {@link #getRetryPayload()} during the acting phase, then discards it so the tool call stays
+     * pending. It is never persisted as a tool result.
+     *
+     * @param toolUse   The tool use block that requested the retry
+     * @param exception The exception thrown by the tool
+     * @return A retry-later {@code ToolResultBlock}
+     */
+    public static ToolResultBlock retryLater(
+            ToolUseBlock toolUse, ToolRetryLaterException exception) {
+        String reason =
+                exception.getReason() != null ? exception.getReason() : "[Deferred for retry]";
+        Map<String, Object> payload = new java.util.LinkedHashMap<>();
+        payload.put("reason", exception.getReason());
+        payload.put("metadata", exception.getMetadata());
+        return new ToolResultBlock(
+                toolUse.getId(),
+                toolUse.getName(),
+                List.of(TextBlock.builder().text(reason).build()),
+                Map.of(METADATA_RETRY_LATER, true, METADATA_RETRY_PAYLOAD, payload));
     }
 
     /**

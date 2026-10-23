@@ -601,8 +601,10 @@ public class SessionTree {
      */
     private AbstractFilesystem pinIfSandbox(AbstractFilesystem fs) {
         if (fs instanceof SandboxAware aware) {
-            Sandbox sb = fs instanceof SandboxBackedFilesystem sandboxFs
-                    ? sandboxFs.getSandbox(fsRc) : aware.getSandbox();
+            Sandbox sb =
+                    fs instanceof SandboxBackedFilesystem sandboxFs
+                            ? sandboxFs.getSandbox(fsRc)
+                            : aware.getSandbox();
             if (sb != null) {
                 return new PinnedSandboxFilesystem(sb);
             }

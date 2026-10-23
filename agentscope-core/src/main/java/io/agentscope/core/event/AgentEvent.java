@@ -65,6 +65,7 @@ import java.util.UUID;
             value = ExternalExecutionResultEvent.class,
             name = "EXTERNAL_EXECUTION_RESULT"),
     @JsonSubTypes.Type(value = RequestStopEvent.class, name = "REQUEST_STOP"),
+    @JsonSubTypes.Type(value = ToolRetryLaterEvent.class, name = "TOOL_RETRY_LATER"),
     @JsonSubTypes.Type(value = SubagentExposedEvent.class, name = "SUBAGENT_EXPOSED"),
     @JsonSubTypes.Type(value = HintBlockEvent.class, name = "HINT_BLOCK"),
     @JsonSubTypes.Type(value = AllToolsDeniedEvent.class, name = "ALL_TOOLS_DENIED"),
@@ -85,6 +86,15 @@ public abstract class AgentEvent {
      * prefix) and from {@link #METADATA_TASK_ID} (which identifies the harness task).
      */
     public static final String METADATA_PARENT_SESSION_ID = "parentSessionId";
+
+    /**
+     * Well-known {@link #metadata} key carrying the {@code GenerateReason} name behind a text
+     * projection. Currently attached to the {@code TextBlock} events synthesized for a
+     * {@code returnDirect} closing message, letting observers distinguish "the model said this"
+     * from "a tool result was substituted for the model's final answer". Absent on ordinary
+     * model-generated text events.
+     */
+    public static final String METADATA_GENERATE_REASON = "generate_reason";
 
     private final String id;
     private final String createdAt;
