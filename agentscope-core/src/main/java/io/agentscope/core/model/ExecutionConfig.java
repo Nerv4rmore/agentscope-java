@@ -52,6 +52,8 @@ import java.util.function.Predicate;
  * }</pre>
  */
 public class ExecutionConfig {
+    public static final String CTX_EXECUTION_DEADLINE = "agentscope.execution.deadline";
+
     /** Timeout duration for a single execution (model request or tool call). */
     private final Duration timeout;
 

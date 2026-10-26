@@ -58,6 +58,8 @@ import io.agentscope.harness.agent.subagent.task.TaskRunSpec;
 import io.agentscope.harness.agent.subagent.task.TaskStatus;
 import java.io.Closeable;
 import java.io.IOException;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -74,6 +76,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import reactor.core.Disposable;
+import reactor.core.publisher.BaseSubscriber;
 import reactor.core.publisher.Mono;
 import reactor.core.publisher.SignalType;
 
@@ -229,6 +232,9 @@ public class AgentSpawnTool {
      */
     public static final String CTX_FORCE_SYNC_TIMEOUT_SECONDS =
             "agentscope.subagent.force_sync_timeout_seconds";
+
+    /** 强制同步时优先使用的执行截止时间，RuntimeContext 中的值为 Instant。 */
+    public static final String CTX_EXECUTION_DEADLINE = io.agentscope.core.model.ExecutionConfig.CTX_EXECUTION_DEADLINE;
 
     private static final String BG_RESULT_TEMPLATE =
             """
@@ -891,6 +897,9 @@ public class AgentSpawnTool {
             RuntimeContext parentCtx) {
         return Mono.deferContextual(
                 ctxView -> {
+                    if (isExecutionDeadlineExpired(parentCtx)) {
+                        return Mono.error(new TimeoutException("Execution deadline exceeded."));
+                    }
                     DefaultAgentManager manager = managerFor(parentCtx);
                     // ── Path 1: streamEvents() — AgentEvent forwarding ──
                     Optional<AgentEventEmitter> emitterOpt = AgentEventEmitter.fromContext(ctxView);
@@ -963,9 +972,16 @@ public class AgentSpawnTool {
                                 .switchIfEmpty(
                                         Mono.defer(
                                                 () ->
-                                                        manager.invokeAgent(
-                                                                agent, sessionId, userId, prompt,
-                                                                parentCtx)));
+                                                        isExecutionDeadlineExpired(parentCtx)
+                                                                ? Mono.error(
+                                                                        new TimeoutException(
+                                                                                "Execution deadline exceeded."))
+                                                                : manager.invokeAgent(
+                                                                        agent,
+                                                                        sessionId,
+                                                                        userId,
+                                                                        prompt,
+                                                                        parentCtx)));
                     }
 
                     // ── Path 3: non-streaming ──
@@ -1011,6 +1027,14 @@ public class AgentSpawnTool {
                 parentCtx ->
                         Mono.<String>create(
                                 sink -> {
+                                    Instant deadline = executionDeadline(runtimeContext);
+                                    Instant now = Instant.now();
+                                    if (deadline != null && !now.isBefore(deadline)) {
+                                        sink.success(
+                                                header
+                                                        + "\nstatus: timeout\nExecution deadline exceeded.");
+                                        return;
+                                    }
                                     CompletableFuture<Msg> bridge = new CompletableFuture<>();
                                     SandboxBackedFilesystem.SharedLease sharedLease =
                                             retainSharedSandbox(runtimeContext);
@@ -1029,52 +1053,63 @@ public class AgentSpawnTool {
                                                             c ->
                                                                     reactor.util.context.Context.of(
                                                                             parentCtx))
-                                                    .doFinally(
-                                                            signal -> {
-                                                                // Parent subscription was
-                                                                // cancelled (outer Mono.timeout,
-                                                                // user stop, or upstream Reactor
-                                                                // cancel). The fire-and-forget
-                                                                // subscribe below detaches the
-                                                                // inner execution from the parent
-                                                                // lifecycle, so without this
-                                                                // doFinally the sub-agent would
-                                                                // keep running as an orphan and
-                                                                // the eventual sink.success(...)
-                                                                // would be a no-op on the
-                                                                // already-cancelled sink.
-                                                                if (signal == SignalType.CANCEL) {
+                                                    .doOnCancel(
+                                                            () ->
                                                                     interruptAgent(
-                                                                            agent, runtimeContext);
-                                                                }
-                                                                closeSharedSandbox(sharedLease);
-                                                            });
+                                                                            agent, userId, sessionId))
+                                                    .doFinally(
+                                                            signal -> closeSharedSandbox(sharedLease));
 
-                                    Disposable innerSub =
-                                            inner.subscribe(
-                                                    bridge::complete,
-                                                    bridge::completeExceptionally,
-                                                    () -> {
-                                                        if (!bridge.isDone()) {
-                                                            bridge.complete(null);
-                                                        }
-                                                    });
+                                    BaseSubscriber<Msg> innerSub =
+                                            new BaseSubscriber<>() {
+                                                @Override
+                                                protected void hookOnNext(Msg msg) {
+                                                    bridge.complete(msg);
+                                                }
 
-                                    // Race against timeout without cancelling the bridge.
-                                    // thenApply(m -> m) creates a dependent future so orTimeout
-                                    // completes the race copy, not the original bridge.
+                                                @Override
+                                                protected void hookOnError(Throwable error) {
+                                                    bridge.completeExceptionally(error);
+                                                }
+
+                                                @Override
+                                                protected void hookOnComplete() {
+                                                    bridge.complete(null);
+                                                }
+
+                                                @Override
+                                                protected void hookFinally(SignalType signal) {
+                                                    if (signal == SignalType.CANCEL) {
+                                                        bridge.cancel(false);
+                                                    }
+                                                }
+                                            };
+                                    long waitMs =
+                                            deadline != null
+                                                    ? Math.max(
+                                                            1L,
+                                                            Duration.between(Instant.now(), deadline)
+                                                                    .toMillis())
+                                                    : timeoutMs;
                                     CompletableFuture<Msg> race = bridge.thenApply(m -> m);
-                                    race.orTimeout(timeoutMs, TimeUnit.MILLISECONDS);
-
+                                    // 先绑定取消，再订阅；同步订阅尚未返回时也能停止子调用。
+                                    sink.onCancel(
+                                            () -> {
+                                                race.cancel(false);
+                                                innerSub.dispose();
+                                            });
                                     race.whenComplete(
                                             (msg, err) -> {
+                                                if (race.isCancelled()) {
+                                                    return;
+                                                }
                                                 if (err != null) {
                                                     handleExecError(
                                                             err,
                                                             bridge,
                                                             runtimeContext,
                                                             header,
-                                                            timeoutMs,
+                                                            waitMs,
                                                             agentId,
                                                             sink,
                                                             forceSync,
@@ -1086,32 +1121,21 @@ public class AgentSpawnTool {
                                                                     + textOf(msg));
                                                 }
                                             });
-
-                                    // Propagate parent cancellation to the inner fire-and-forget
-                                    // subscription. Without this, doFinally(CANCEL) above never
-                                    // fires because the inner is subscribed independently of the
-                                    // parent Mono.create sink.
-                                    sink.onCancel(innerSub);
+                                    race.orTimeout(waitMs, TimeUnit.MILLISECONDS);
+                                    if (!innerSub.isDisposed()) {
+                                        inner.subscribe(innerSub);
+                                    } else {
+                                        closeSharedSandbox(sharedLease);
+                                    }
                                 }));
     }
 
-    /**
-     * Interrupts the sub-agent's reasoning loop when its parent tool-call subscription is
-     * cancelled. Mirrors the fix in core {@code SubAgentTool.interruptAgent} (commit
-     * {@code 029cc55e}, issue #1783) — see issue #2062 for the harness-side equivalent.
-     *
-     * <p>Only {@link ReActAgent} exposes {@code interrupt(RuntimeContext)}. Other {@link Agent}
-     * implementations are no-ops here; their inner execution will still be disposed by the caller's
-     * {@code sink.onCancel(innerSub::dispose)}, which is enough for non-looping agents.
-     */
-    private void interruptAgent(Agent agent, RuntimeContext ctx) {
-        if (agent instanceof ReActAgent ra) {
-            ra.interrupt(ctx);
-            log.warn(
-                    "Sub-agent '{}' (id={}) was interrupted because its parent tool call"
-                            + " subscription was cancelled.",
-                    ra.getName(),
-                    ra.getAgentId());
+    /** 中断子调用自己的会话，同时支持 HarnessAgent 包装。 */
+    private void interruptAgent(Agent agent, String userId, String sessionId) {
+        if (agent instanceof HarnessAgent harness) {
+            harness.interrupt(userId, sessionId);
+        } else if (agent instanceof ReActAgent react) {
+            react.interrupt(userId, sessionId);
         }
     }
 
@@ -1134,7 +1158,7 @@ public class AgentSpawnTool {
         Throwable cause = err instanceof CompletionException ? err.getCause() : err;
         if (cause instanceof TimeoutException) {
             if (forceSync) {
-                // Hard timeout: dispose triggers doFinally(CANCEL) → interruptAgent; no promote.
+                // 强制同步超时直接取消子订阅，不转后台。
                 if (innerSub != null && !innerSub.isDisposed()) {
                     innerSub.dispose();
                 }
@@ -1650,6 +1674,7 @@ public class AgentSpawnTool {
      * <p>Precedence under force-sync (highest first):
      *
      * <ol>
+     *   <li>{@link #CTX_EXECUTION_DEADLINE} 存在时使用剩余时间，不受 600 秒上限约束
      *   <li>{@link #CTX_FORCE_SYNC_TIMEOUT_SECONDS} when present — absolute app override
      *   <li>LLM {@code timeout_seconds}, with {@code 0} coerced to the default sync timeout
      * </ol>
@@ -1660,6 +1685,10 @@ public class AgentSpawnTool {
     static long resolveEffectiveTimeoutMs(Integer timeoutSeconds, RuntimeContext ctx) {
         boolean forceSync = isForceSync(ctx);
         if (forceSync) {
+            Instant deadline = executionDeadline(ctx);
+            if (deadline != null) {
+                return Math.max(1L, Duration.between(Instant.now(), deadline).toMillis());
+            }
             Integer override = forceSyncTimeoutSeconds(ctx);
             if (override != null) {
                 int seconds = override <= 0 ? DEFAULT_TIMEOUT_SECONDS : override;
@@ -1671,6 +1700,15 @@ public class AgentSpawnTool {
             return (long) DEFAULT_TIMEOUT_SECONDS * 1_000;
         }
         return timeoutMs;
+    }
+
+    private static Instant executionDeadline(RuntimeContext ctx) {
+        return isForceSync(ctx) ? ctx.get(CTX_EXECUTION_DEADLINE, Instant.class) : null;
+    }
+
+    private static boolean isExecutionDeadlineExpired(RuntimeContext ctx) {
+        Instant deadline = executionDeadline(ctx);
+        return deadline != null && !Instant.now().isBefore(deadline);
     }
 
     /** Reads {@link #CTX_FORCE_SYNC_TIMEOUT_SECONDS}; {@code null} means "no override". */
