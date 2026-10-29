@@ -30,6 +30,12 @@ import io.agentscope.harness.agent.sandbox.SandboxFileTransfer;
 import io.agentscope.harness.agent.sandbox.SandboxManager;
 import io.agentscope.harness.agent.sandbox.SandboxState;
 import io.agentscope.harness.agent.sandbox.WorkspaceSpec;
+
+import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
+import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -42,10 +48,6 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
-import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
-import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 /** 沙箱按调用懒加载；上下文副本及共享子 Agent 通过同一状态对象复用实例。 */
 public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements SandboxAware {
@@ -478,12 +480,21 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
     }
 
     public Sandbox requireSandbox(RuntimeContext runtimeContext) {
-        Sandbox fixed = sandbox;
-        if (fixed != null) {
-            return fixed;
-        }
         CallState call = callState(runtimeContext);
         if (call == null) {
+            SandboxAcquireResult bound =
+                    runtimeContext != null ? runtimeContext.get(SandboxAcquireResult.class) : null;
+            if (bound != null) {
+                if (bound.isReleased()) {
+                    throw new SandboxException.SandboxConfigurationException(
+                            "Sandbox acquisition has been released for this call");
+                }
+                return bound.getSandbox();
+            }
+            Sandbox fixed = sandbox;
+            if (fixed != null) {
+                return fixed;
+            }
             throw new SandboxException.SandboxConfigurationException(
                     "No active sandbox — sandbox filesystem used outside of a call context");
         }
@@ -505,16 +516,22 @@ public class SandboxBackedFilesystem extends BaseSandboxFilesystem implements Sa
                         call.manager.acquire(call.sandboxContext, call.runtimeContext);
                 Sandbox acquired = result.getSandbox();
                 try {
+                    PinnedSandboxFilesystem.markSandboxAcquired(acquired);
                     acquired.start();
                 } catch (Exception startErr) {
-                    try {
-                        call.manager.release(result);
-                    } catch (Exception releaseErr) {
-                        log.warn(
-                                "[sandbox-fs] Failed to release sandbox after start failure",
-                                releaseErr);
-                    } finally {
-                        result.getLease().close();
+                    if (result.beginRelease()) {
+                        try {
+                            if (result.isSelfManaged()) {
+                                PinnedSandboxFilesystem.markSandboxReleased(acquired);
+                            }
+                            call.manager.release(result);
+                        } catch (Exception releaseErr) {
+                            log.warn(
+                                    "[sandbox-fs] Failed to release sandbox after start failure",
+                                    releaseErr);
+                        } finally {
+                            result.getLease().close();
+                        }
                     }
                     throw startErr;
                 }

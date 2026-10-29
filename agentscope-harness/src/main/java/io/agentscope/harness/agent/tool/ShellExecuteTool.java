@@ -16,8 +16,15 @@
 package io.agentscope.harness.agent.tool;
 
 import io.agentscope.core.agent.RuntimeContext;
+import io.agentscope.core.message.ToolExecutionDetails;
+import io.agentscope.core.message.ToolResultBlock;
+import io.agentscope.core.message.ToolResultState;
 import io.agentscope.core.tool.Tool;
 import io.agentscope.core.tool.ToolParam;
+import io.agentscope.harness.agent.filesystem.AbstractFilesystem;
+import io.agentscope.harness.agent.filesystem.OverlayFilesystem;
+import io.agentscope.harness.agent.filesystem.RoutedSandboxFilesystem;
+import io.agentscope.harness.agent.filesystem.local.LocalFilesystemWithShell;
 import io.agentscope.harness.agent.filesystem.model.ExecuteResponse;
 import io.agentscope.harness.agent.filesystem.sandbox.AbstractSandboxFilesystem;
 
@@ -56,30 +63,26 @@ public class ShellExecuteTool {
      */
     @Tool(
             description =
-                    "Execute a shell command. Use for git, npm, build, test, and other terminal"
-                        + " operations. Returns combined output and exit code. If a dedicated tool"
-                        + " exists (e.g., read_file, write_file), you MUST use it instead of shell"
-                        + " commands. The call blocks until the command exits or 'timeout' seconds"
-                        + " elapse (default 30, max 600). IMPORTANT: reaching the timeout does NOT"
-                        + " kill the command — it only stops this call from waiting. The process"
-                        + " keeps running in the sandbox, its output is lost, and you get no exit"
-                        + " code. So never rely on the timeout to bound work. For anything that may"
-                        + " run longer than ~30s (pip install, npm install, large builds, long test"
-                        + " suites), start it in the background instead: append ' & echo $!' to get"
-                        + " a pid back immediately, redirect its output to a file (e.g. 'cmd >"
-                        + " /tmp/out.log 2>&1 & echo $!'), then run 'wait <pid>' in a later call to"
-                        + " collect the exit code and output. The file redirect is what makes the"
-                        + " result recoverable, so always include it for long work.")
-    public String execute(
+                    "Execute a command using the configured execution environment's shell. Use for"
+                        + " git, builds, tests, and other terminal operations. Returns combined"
+                        + " output and exit code. Each call starts a new shell; working directory"
+                        + " and environment changes are scoped to that call. Prefer dedicated file"
+                        + " tools when they support the operation; use shell for other operations."
+                        + " The call waits up to 'timeout' seconds (default 30, max 600). Some"
+                        + " backends only stop waiting at timeout and leave the process running;"
+                        + " never assume a timeout killed it. For long-running work, use the"
+                        + " environment's background execution and save output and completion"
+                        + " status to files so later calls can retrieve them.")
+    public ToolResultBlock execute(
             RuntimeContext runtimeContext,
-            @ToolParam(name = "command", description = "Shell command to execute") String command,
+            @ToolParam(name = "command", description = "Command in the environment's shell syntax")
+                    String command,
             @ToolParam(
                             name = "working_directory",
                             description =
-                                    "Sub-path of the current working directory to run in"
-                                        + " (optional). Commands already start in your session"
-                                        + " working directory, so omit this for the common case."
-                                        + " Must be relative — absolute paths, '~' and '..' are"
+                                    "Working directory for this command only, relative to the"
+                                        + " shell's starting directory (optional). Omit this for"
+                                        + " the common case. Absolute paths, '~' and '..' are"
                                         + " rejected.",
                             required = false)
                     String workingDirectory,
@@ -87,25 +90,29 @@ public class ShellExecuteTool {
                             name = "timeout",
                             description =
                                     "Seconds this call waits for the command to finish (default:"
-                                        + " 30, max: 600). Raise it when you know the command needs"
-                                        + " longer. It bounds only how long this call waits — it"
-                                        + " never kills the process — so for open-ended work use"
-                                        + " background execution (' & echo $!') instead.",
+                                        + " 30, max: 600). Raise it when the command needs longer."
+                                        + " A timeout may leave the process running; use the"
+                                        + " environment's background execution for open-ended"
+                                        + " work.",
                             required = false)
                     Integer timeout) {
         String effectiveCommand = command;
         if (workingDirectory != null && !workingDirectory.isBlank()) {
             String wd = workingDirectory.strip();
             if (wd.startsWith("/") || wd.startsWith("~") || wd.contains("..")) {
-                return "Error: working_directory must be a relative path within the workspace"
-                        + " (absolute paths, '~', and '..' are not allowed). Commands already run"
-                        + " in the session working directory, so omit working_directory (or use"
-                        + " '.') — an absolute path you may have copied from `pwd` points at that"
-                        + " same directory.";
+                return ToolResultBlock.error(
+                        "working_directory must be a relative path within the workspace (absolute"
+                            + " paths, '~', and '..' are not allowed). Commands already run in the"
+                            + " session working directory, so omit working_directory (or use"
+                            + " '.').");
             }
-            // 命令始终在 Linux 沙箱内执行，与宿主机 OS 无关，恒用 POSIX cd 语法；
-            // 宿主机为 Windows 时若生成 `cd /d "..."` 会导致沙箱 bash 报 "cd: too many arguments"
-            effectiveCommand = commandWithWorkingDirectory(wd, command);
+            effectiveCommand =
+                    commandWithWorkingDirectory(
+                            wd,
+                            command,
+                            usesWindowsShell(
+                                    sandbox,
+                                    System.getProperty("os.name").toLowerCase().contains("win")));
         }
 
         int timeoutSeconds =
@@ -122,10 +129,34 @@ public class ShellExecuteTool {
         if (result.truncated()) {
             sb.append("\n(output was truncated)");
         }
-        return sb.toString();
+        ToolExecutionDetails.Outcome outcome =
+                result.exitCode() == null
+                        ? ToolExecutionDetails.Outcome.UNKNOWN
+                        : result.isSuccess()
+                                ? ToolExecutionDetails.Outcome.SUCCEEDED
+                                : ToolExecutionDetails.Outcome.FAILED;
+        return ToolResultBlock.text(sb.toString())
+                .withExecutionDetails(
+                        new ToolExecutionDetails(
+                                "shell", outcome, result.exitCode(), result.truncated()))
+                .withState(result.isSuccess() ? ToolResultState.SUCCESS : ToolResultState.ERROR);
     }
 
-    static String commandWithWorkingDirectory(String workingDirectory, String command) {
+    static boolean usesWindowsShell(AbstractFilesystem filesystem, boolean windowsHost) {
+        if (filesystem instanceof OverlayFilesystem overlay) {
+            return usesWindowsShell(overlay.getUpper(), windowsHost);
+        }
+        if (filesystem instanceof RoutedSandboxFilesystem routed) {
+            return usesWindowsShell(routed.primary(), windowsHost);
+        }
+        return windowsHost && filesystem instanceof LocalFilesystemWithShell;
+    }
+
+    static String commandWithWorkingDirectory(
+            String workingDirectory, String command, boolean windows) {
+        if (windows) {
+            return "cd /d \"" + workingDirectory.replace("\"", "\"\"") + "\" && " + command;
+        }
         return "cd '" + workingDirectory.replace("'", "'\\''") + "' && " + command;
     }
 }

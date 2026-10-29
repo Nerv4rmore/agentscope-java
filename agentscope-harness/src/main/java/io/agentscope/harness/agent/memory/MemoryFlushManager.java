@@ -24,25 +24,21 @@ import io.agentscope.core.message.ToolResultBlock;
 import io.agentscope.core.message.ToolUseBlock;
 import io.agentscope.core.model.Model;
 import io.agentscope.core.util.JsonUtils;
-import io.agentscope.harness.agent.filesystem.AbstractFilesystem;
-import io.agentscope.harness.agent.filesystem.sandbox.AbstractSandboxFilesystem;
+import io.agentscope.harness.agent.context.ContextModelCalls;
 import io.agentscope.harness.agent.memory.compaction.ConversationCompactor;
-import io.agentscope.harness.agent.memory.session.SessionEntry;
-import io.agentscope.harness.agent.memory.session.SessionTranscriptWriter;
-import io.agentscope.harness.agent.memory.session.SessionTree;
 import io.agentscope.harness.agent.workspace.WorkspaceConstants;
 import io.agentscope.harness.agent.workspace.WorkspaceManager;
-import java.nio.file.Path;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import reactor.core.publisher.Mono;
+
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.List;
-import java.util.Set;
 import java.util.stream.Collectors;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import reactor.core.publisher.Mono;
 
 /**
  * Manages memory flush operations: extracting long-term memories from a conversation
@@ -161,7 +157,7 @@ public class MemoryFlushManager {
                         .content(TextBlock.builder().text(userPrompt.toString()).build())
                         .build());
 
-        return model.stream(flushInput, null, null)
+        return ContextModelCalls.auxiliary(model, flushInput)
                 .reduce(
                         new StringBuilder(),
                         (sb, chatResponse) -> {
@@ -188,161 +184,6 @@ public class MemoryFlushManager {
                             writeMemoryFiles(rc, extracted);
                             return Mono.empty();
                         });
-    }
-
-    /**
-     * Returns the string path of the session JSONL file where messages for the given agent and
-     * session are offloaded. Used by the compaction layer to embed the archive location in the
-     * summary message so the agent can retrieve full history if needed.
-     *
-     * @deprecated Prefer {@link SessionTranscriptWriter#resolveContextPath}.
-     */
-    @Deprecated
-    public String resolveOffloadPath(RuntimeContext rc, String agentId, String sessionId) {
-        return new SessionTranscriptWriter(workspaceManager)
-                .resolveContextPath(rc, agentId, sessionId);
-    }
-
-    /**
-     * Offloads raw messages to the JSONL session tree.
-     *
-     * @deprecated Prefer {@link SessionTranscriptWriter#appendMessages}. Kept as a thin
-     *     delegate so compaction / overflow-recovery call sites keep compiling during the
-     *     migration; new code should use {@link SessionTranscriptWriter} directly.
-     */
-    @Deprecated
-    public void offloadMessages(
-            RuntimeContext rc, List<Msg> messages, String agentId, String sessionId) {
-        new SessionTranscriptWriter(workspaceManager)
-                .appendMessages(rc, messages, agentId, sessionId);
-        log.debug(
-                "Offloaded {} messages for agent={}, session={}",
-                messages.size(),
-                agentId,
-                sessionId);
-        workspaceManager.updateSessionIndex(rc, agentId, sessionId, "conversation offloaded");
-        offloadToSessionTree(rc, messages, agentId, sessionId);
-    }
-
-    private void offloadToSessionTree(
-            RuntimeContext rc, List<Msg> messages, String agentId, String sessionId) {
-        try {
-            Path contextFile = workspaceManager.resolveSessionContextFile(rc, agentId, sessionId);
-            String contextRelPath =
-                    WorkspaceConstants.AGENTS_DIR
-                            + "/"
-                            + agentId
-                            + "/"
-                            + WorkspaceConstants.SESSIONS_DIR
-                            + "/"
-                            + sessionId
-                            + WorkspaceConstants.SESSION_CONTEXT_EXT;
-            SessionTree tree =
-                    new SessionTree(
-                                    contextFile,
-                                    workspaceManager.getWorkspace(),
-                                    resolveMirrorFilesystem(workspaceManager.getFilesystem()),
-                                    workspaceManager.getIndex(),
-                                    contextRelPath)
-                            .setRuntimeContext(rc);
-            tree.load();
-            // Sync from remote before appending so that entries written by a previous replica
-            // (cross-machine handoff) are included in the merged file pushed to remote.
-            // Skipped for sandbox filesystems: sandboxes are per-call, ephemeral instances —
-            // there is no durable remote history to merge, and reading them only pulls in stale
-            // or corrupted files from a previous sandbox invocation. Multi-replica deployments
-            // share conversation state via the distributed Session backend (RedisSession /
-            // MysqlSession), not via the sandbox filesystem.
-            tree.syncFromRemote();
-
-            List<SessionEntry> existingEntries = new ArrayList<>(tree.getAllEntries());
-            Set<String> existingIds =
-                    existingEntries.stream()
-                            .map(SessionEntry::getId)
-                            .collect(Collectors.toCollection(HashSet::new));
-            String lastId =
-                    existingEntries.isEmpty()
-                            ? null
-                            : existingEntries.get(existingEntries.size() - 1).getId();
-
-            // The caller passes the full conversation on every turn. Use the stable Msg IDs
-            // to keep the session JSONL append-only and idempotent across repeated offloads.
-            for (Msg msg : messages) {
-                if (msg.getRole() == null || isSessionContextMessage(msg)) {
-                    continue;
-                }
-                String rendered = renderContentBlocks(msg);
-                if (rendered == null || rendered.isBlank()) {
-                    continue;
-                }
-                String entryId = normalizeEntryId(msg.getId());
-                if (entryId == null) {
-                    log.warn(
-                            "Msg without stable ID encountered (role={}); dedup skipped",
-                            msg.getRole());
-                }
-                if (entryId != null && existingIds.contains(entryId)) {
-                    continue;
-                }
-                String toolCallId = extractToolCallId(msg);
-                SessionEntry.MessageEntry entry =
-                        new SessionEntry.MessageEntry(
-                                entryId, lastId, null, msg.getRole().name(), rendered, toolCallId);
-                tree.append(entry);
-                existingIds.add(entry.getId());
-                lastId = entry.getId();
-            }
-
-            tree.flush();
-        } catch (Exception e) {
-            log.warn("Failed to offload to JSONL session tree: {}", e.getMessage());
-        }
-    }
-
-    /**
-     * Returns the filesystem to pass to {@link SessionTree} for mirroring, or {@code null} to
-     * disable mirroring entirely.
-     *
-     * <p>Sandbox filesystems ({@link AbstractSandboxFilesystem}, e.g. {@code
-     * SandboxBackedFilesystem} created from an {@code AgentRunFilesystemSpec}) are <b>ephemeral,
-     * per-call execution environments</b> — not durable shared stores. Mirroring session JSONL to
-     * a sandbox is wasted work: the sandbox is released as soon as the agent call completes
-     * (often before the async mirror runs, causing "MCP session terminated" errors), and nothing
-     * ever reads the session history back from the sandbox (conversation state is restored from
-     * the host-disk {@code AgentState} via {@code JsonFileAgentStateStore}, or from a distributed
-     * Session backend in multi-replica deployments). Passing {@code null} makes {@link
-     * SessionTree} skip both {@code scheduleMirror} (no upload) and {@code syncFromRemote} (no
-     * download), keeping the session JSONL strictly on the host disk.
-     *
-     * <p>Non-sandbox filesystems (local / remote KV-backed stores) are returned as-is, preserving
-     * the cross-replica mirror behaviour for {@code RemoteFilesystemSpec} deployments.
-     */
-    private static AbstractFilesystem resolveMirrorFilesystem(AbstractFilesystem filesystem) {
-        if (filesystem instanceof AbstractSandboxFilesystem) {
-            return null;
-        }
-        return filesystem;
-    }
-
-    /**
-     * Extracts a representative tool call ID from a message, if present.
-     * For TOOL messages, returns the first ToolResultBlock's id.
-     * For ASSISTANT messages with tool calls, returns the first ToolUseBlock's id.
-     */
-    private static String extractToolCallId(Msg msg) {
-        for (ContentBlock block : msg.getContent()) {
-            if (block instanceof ToolResultBlock tr && tr.getId() != null) {
-                return tr.getId();
-            }
-            if (block instanceof ToolUseBlock tu && tu.getId() != null) {
-                return tu.getId();
-            }
-        }
-        return null;
-    }
-
-    private static String normalizeEntryId(String id) {
-        return id != null && !id.isBlank() ? id : null;
     }
 
     /**

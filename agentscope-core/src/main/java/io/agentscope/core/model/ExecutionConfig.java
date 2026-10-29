@@ -17,6 +17,7 @@
 package io.agentscope.core.model;
 
 import io.agentscope.core.model.transport.HttpTransportException;
+
 import java.io.IOException;
 import java.time.Duration;
 import java.util.concurrent.TimeoutException;
@@ -105,13 +106,9 @@ public class ExecutionConfig {
             return hte.isRetryable();
         }
 
-        if (error instanceof ModelHttpException mhe) {
-            // 有 HTTP 状态码时按状态码判断（429/5xx 可重试）
-            if (mhe.isRetryableHttpStatus()) {
-                return true;
-            }
-            // 无状态码的 HTTP 异常可能是传输层错误被包装（如 SSE 流中断被包成
-            // OpenAIException），不能直接判定不可重试，需继续沿 cause 链判断
+        // 无状态码时继续沿 cause 链判断，避免 SSE 传输失败被误判为不可重试。
+        if (error instanceof ModelHttpException mhe && mhe.getStatusCode() != null) {
+            return mhe.isRetryableHttpStatus();
         }
 
         // Timeout errors are retryable

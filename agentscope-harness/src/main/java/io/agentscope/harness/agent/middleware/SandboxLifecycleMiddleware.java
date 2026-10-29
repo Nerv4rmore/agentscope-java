@@ -16,14 +16,20 @@
 package io.agentscope.harness.agent.middleware;
 
 import io.agentscope.core.agent.RuntimeContext;
+import io.agentscope.harness.agent.filesystem.sandbox.PinnedSandboxFilesystem;
 import io.agentscope.harness.agent.filesystem.sandbox.SandboxBackedFilesystem;
 import io.agentscope.harness.agent.sandbox.SandboxAcquireResult;
 import io.agentscope.harness.agent.sandbox.SandboxContext;
 import io.agentscope.harness.agent.sandbox.SandboxManager;
-import java.util.function.Consumer;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.EnumSet;
+import java.util.Set;
+import java.util.function.Consumer;
+
+/** 按调用绑定懒加载沙箱，待共享异步任务结束后释放并持久化状态。 */
 public class SandboxLifecycleMiddleware implements HarnessRuntimeMiddleware {
 
     private static final Logger log = LoggerFactory.getLogger(SandboxLifecycleMiddleware.class);
@@ -38,6 +44,13 @@ public class SandboxLifecycleMiddleware implements HarnessRuntimeMiddleware {
         this.filesystemProxy = filesystemProxy;
     }
 
+    /** 生命周期由 HarnessAgent 显式驱动，不参与扩展点调度。 */
+    @Override
+    public Set<ExtensionPoint> activePoints() {
+        return EnumSet.noneOf(ExtensionPoint.class);
+    }
+
+    /** 在显式外部沙箱启动前准备工作区资源；传入 null 可清除回调。 */
     public void setBeforeStartCallback(Consumer<RuntimeContext> callback) {
         this.beforeStartCallback = callback;
     }
@@ -94,17 +107,30 @@ public class SandboxLifecycleMiddleware implements HarnessRuntimeMiddleware {
         if (result == null) {
             return;
         }
-        try {
-            sandboxManager.persistState(result, ctx.get(SandboxContext.class), ctx);
-        } catch (Exception e) {
-            log.warn("[sandbox-mw] Failed to persist sandbox state", e);
+        if (!result.beginRelease()) {
+            return;
         }
         try {
-            sandboxManager.release(result);
-        } catch (Exception e) {
-            log.warn("[sandbox-mw] Failed to release sandbox session", e);
+            // 先释放，再保存 stop 更新后的工作区及快照状态。
+            try {
+                markMirrorSandboxReleased(result);
+                sandboxManager.release(result);
+            } catch (Exception e) {
+                log.warn("[sandbox-mw] Failed to release sandbox session", e);
+            }
+            try {
+                sandboxManager.persistState(result, ctx.get(SandboxContext.class), ctx);
+            } catch (Exception e) {
+                log.warn("[sandbox-mw] Failed to persist sandbox state", e);
+            }
         } finally {
             result.getLease().close();
+        }
+    }
+
+    private static void markMirrorSandboxReleased(SandboxAcquireResult result) {
+        if (result.isSelfManaged()) {
+            PinnedSandboxFilesystem.markSandboxReleased(result.getSandbox());
         }
     }
 }

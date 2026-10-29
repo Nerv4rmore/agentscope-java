@@ -17,21 +17,27 @@ package io.agentscope.core.state;
 
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.annotation.JsonPropertyOrder;
+
+import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
+
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import reactor.core.publisher.Mono;
-import reactor.core.scheduler.Schedulers;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Read-cache backing for file-touching tools (Read / Write / Edit).
@@ -41,17 +47,24 @@ import reactor.core.scheduler.Schedulers;
  * evicted on access. All filesystem interaction runs on {@link Schedulers#boundedElastic()} so
  * Reactor's non-blocking schedulers are never blocked.
  *
- * <p>Only configuration fields ({@code maxCacheFiles}, {@code maxCacheBytes},
- * {@code activatedGroups}) participate in JSON serialization. The in-memory LRU cache itself is
- * runtime state and is reconstructed empty on deserialization.
+ * <p>Configuration, activated groups, spawn metadata, and discovered tool names participate in
+ * JSON serialization. The in-memory LRU cache itself is runtime state and is reconstructed empty
+ * on deserialization.
  */
-@JsonPropertyOrder({"max_cache_files", "max_cache_bytes", "activated_groups", "spawn_registry"})
+@JsonPropertyOrder({
+    "max_cache_files",
+    "max_cache_bytes",
+    "activated_groups",
+    "spawn_registry",
+    "discovered_tools"
+})
 public final class ToolContextState {
 
     private final int maxCacheFiles;
     private final double maxCacheBytes;
     private final List<ReadCacheEntry> readFileCache = new ArrayList<>();
     private final List<String> activatedGroups;
+    private final LinkedHashSet<String> discoveredTools = new LinkedHashSet<>();
     private final Map<String, SpawnEntry> spawnRegistry;
 
     private ToolContextState(Builder builder) {
@@ -64,7 +77,7 @@ public final class ToolContextState {
         this.maxCacheFiles = builder.maxCacheFiles;
         this.maxCacheBytes = builder.maxCacheBytes;
         this.activatedGroups = new ArrayList<>(builder.activatedGroups);
-        this.spawnRegistry = new LinkedHashMap<>(builder.spawnRegistry);
+        this.spawnRegistry = new ConcurrentHashMap<>(builder.spawnRegistry);
     }
 
     @JsonCreator
@@ -108,7 +121,7 @@ public final class ToolContextState {
     }
 
     @JsonProperty("activated_groups")
-    public List<String> getActivatedGroups() {
+    public synchronized List<String> getActivatedGroups() {
         return List.copyOf(activatedGroups);
     }
 
@@ -117,10 +130,14 @@ public final class ToolContextState {
      *
      * @param groups the new activated groups; {@code null} clears the list
      */
-    public void setActivatedGroups(List<String> groups) {
+    public synchronized void setActivatedGroups(List<String> groups) {
         this.activatedGroups.clear();
         if (groups != null) {
-            this.activatedGroups.addAll(groups);
+            for (String group : groups) {
+                if (group != null && !activatedGroups.contains(group)) {
+                    this.activatedGroups.add(group);
+                }
+            }
         }
     }
 
@@ -132,7 +149,7 @@ public final class ToolContextState {
      *
      * @param groupName 要激活的工具组名；{@code null} 或空字符串时忽略
      */
-    public void addActivatedGroup(String groupName) {
+    public synchronized void addActivatedGroup(String groupName) {
         if (groupName != null
                 && !groupName.isEmpty()
                 && !this.activatedGroups.contains(groupName)) {
@@ -141,14 +158,96 @@ public final class ToolContextState {
     }
 
     /**
+     * Adds the given tool groups to the activated set, preserving order and ignoring nulls and
+     * duplicates. This is an atomic read-modify-write: concurrent callers (e.g. parallel tool
+     * calls within one session) cannot lose one another's additions.
+     *
+     * @param groups the groups to activate; {@code null} is a no-op
+     */
+    public synchronized void addActivatedGroups(List<String> groups) {
+        if (groups == null) {
+            return;
+        }
+        for (String group : groups) {
+            if (group != null && !activatedGroups.contains(group)) {
+                activatedGroups.add(group);
+            }
+        }
+    }
+
+    /**
      * 幂等地移除一个已激活的工具组。如果不存在则忽略。
      *
      * @param groupName 要停用的工具组名；{@code null} 时忽略
      */
-    public void removeActivatedGroup(String groupName) {
+    public synchronized void removeActivatedGroup(String groupName) {
         if (groupName != null) {
             this.activatedGroups.remove(groupName);
         }
+    }
+
+    /**
+     * Removes the given tool groups from the activated set. Atomic read-modify-write; order of the
+     * remaining groups is preserved.
+     *
+     * @param groups the groups to deactivate; {@code null} is a no-op
+     */
+    public synchronized void removeActivatedGroups(List<String> groups) {
+        if (groups == null) {
+            return;
+        }
+        activatedGroups.removeAll(groups);
+    }
+
+    /**
+     * Atomically drops the groups in {@code toRemove} and then adds {@code toAdd}, preserving
+     * order and ignoring nulls/duplicates. This is a single read-modify-write so an additive tool
+     * (e.g. skill activation) running concurrently cannot be lost by a "replace"-style tool (e.g.
+     * {@code reset_equipped_tools}) that interleaves between its read and write.
+     *
+     * @param toRemove the groups to drop (e.g. META-scoped group names); {@code null} is a removal
+     *     no-op
+     * @param toAdd the groups to add; {@code null} is an addition no-op
+     */
+    public synchronized void replaceActivatedGroups(
+            Collection<String> toRemove, Collection<String> toAdd) {
+        if (toRemove != null) {
+            activatedGroups.removeIf(toRemove::contains);
+        }
+        if (toAdd != null) {
+            for (String group : toAdd) {
+                if (group != null && !activatedGroups.contains(group)) {
+                    activatedGroups.add(group);
+                }
+            }
+        }
+    }
+
+    /** Tools discovered in this session; names are revalidated against each request's catalog. */
+    @JsonProperty("discovered_tools")
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    public synchronized List<String> getDiscoveredTools() {
+        return List.copyOf(discoveredTools);
+    }
+
+    @JsonProperty("discovered_tools")
+    public synchronized void setDiscoveredTools(List<String> tools) {
+        discoveredTools.clear();
+        addDiscoveredTools(tools);
+    }
+
+    /** Atomically accumulate discoveries from concurrent searches. */
+    public synchronized void addDiscoveredTools(List<String> tools) {
+        if (tools != null) {
+            for (String tool : tools) {
+                if (tool != null) discoveredTools.add(tool);
+            }
+        }
+    }
+
+    /** Clear tools discovered in this session. */
+    public synchronized void clearDiscoveredTools() {
+        discoveredTools.clear();
     }
 
     @JsonProperty("spawn_registry")
@@ -308,7 +407,9 @@ public final class ToolContextState {
         }
 
         public Builder addActivatedGroup(String groupName) {
-            this.activatedGroups.add(groupName);
+            if (groupName != null) {
+                this.activatedGroups.add(groupName);
+            }
             return this;
         }
 

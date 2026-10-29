@@ -23,13 +23,15 @@ import io.agentscope.core.message.ToolResultBlock;
 import io.agentscope.core.state.AgentState;
 import io.agentscope.core.util.ExceptionUtils;
 import io.agentscope.core.util.JsonUtils;
+
+import reactor.core.publisher.Mono;
+
 import java.lang.reflect.Method;
 import java.lang.reflect.Parameter;
 import java.lang.reflect.ParameterizedType;
 import java.lang.reflect.Type;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
-import reactor.core.publisher.Mono;
 
 /**
  * Invokes tool methods with type conversion and error handling.
@@ -83,11 +85,10 @@ class ToolMethodInvoker {
                             })
                     .flatMap(
                             future ->
-                                    Mono.fromFuture(future)
-                                            .map(
-                                                    r ->
-                                                            converter.convert(
-                                                                    r, extractGenericType(method)))
+                                    convertAsyncResult(
+                                                    Mono.fromFuture(future),
+                                                    extractGenericType(method),
+                                                    converter)
                                             .onErrorResume(this::handleError))
                     .onErrorResume(this::handleError);
 
@@ -105,7 +106,7 @@ class ToolMethodInvoker {
                             })
                     .flatMap(
                             mono ->
-                                    mono.map(r -> converter.convert(r, extractGenericType(method)))
+                                    convertAsyncResult(mono, extractGenericType(method), converter)
                                             .onErrorResume(this::handleError))
                     .onErrorResume(this::handleError);
 
@@ -122,6 +123,14 @@ class ToolMethodInvoker {
                             })
                     .onErrorResume(this::handleError);
         }
+    }
+
+    private Mono<ToolResultBlock> convertAsyncResult(
+            Mono<Object> result, Type returnType, ToolResultConverter converter) {
+        if (returnType == Void.class) {
+            return result.then(Mono.fromSupplier(() -> converter.convert(null, returnType)));
+        }
+        return result.map(value -> converter.convert(value, returnType));
     }
 
     /**
@@ -365,11 +374,17 @@ class ToolMethodInvoker {
         if (e instanceof ToolSuspendException) {
             throw (ToolSuspendException) e;
         }
+        if (e instanceof ToolRetryLaterException retryLater) {
+            throw retryLater;
+        }
 
         Throwable cause = e.getCause();
         // Check for ToolSuspendException in the exception chain
         if (cause instanceof ToolSuspendException) {
             throw (ToolSuspendException) cause;
+        }
+        if (cause instanceof ToolRetryLaterException retryLater) {
+            throw retryLater;
         }
 
         String errorMsg =

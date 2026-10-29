@@ -21,10 +21,12 @@ import io.agentscope.harness.agent.sandbox.ExecResult;
 import io.agentscope.harness.agent.sandbox.SandboxErrorCode;
 import io.agentscope.harness.agent.sandbox.SandboxException;
 import io.agentscope.harness.agent.sandbox.WorkspaceMountSupport;
-import java.io.ByteArrayInputStream;
-import java.io.InputStream;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import java.io.ByteArrayInputStream;
+import java.io.InputStream;
 
 /**
  * {@link io.agentscope.harness.agent.sandbox.Sandbox} backed by an Alibaba Cloud AgentRun sandbox
@@ -256,16 +258,10 @@ public class AgentRunSandbox extends AbstractBaseSandbox {
 
     @Override
     public void shutdown() throws Exception {
-        // The sandbox instance survives across acquire/release cycles: AgentRun reclaims it via
-        // the configured idle timeout (sandboxIdleTimeoutSeconds), not on shutdown. Real teardown
-        // is done via destroyInstance(), called only from AgentRunSandboxClient#delete().
+        // 实例跨调用复用，由 idle timeout 回收；显式删除走 destroyInstance()。
     }
 
-    /**
-     * Destroys the backend sandbox instance via an HTTP delete. Called only from {@link
-     * AgentRunSandboxClient#delete} for explicit teardown — {@link #shutdown()} is intentionally a
-     * no-op so instances live across turns.
-     */
+    /** 仅由 {@link AgentRunSandboxClient#delete} 调用，通过 HTTP 删除自有实例。 */
     void destroyInstance() throws Exception {
         if (!arState.isSandboxOwned()) {
             return;

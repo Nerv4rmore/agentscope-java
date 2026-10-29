@@ -26,9 +26,16 @@ import io.agentscope.harness.agent.filesystem.model.FileDownloadResponse;
 import io.agentscope.harness.agent.filesystem.model.FileUploadResponse;
 import io.agentscope.harness.agent.sandbox.ExecResult;
 import io.agentscope.harness.agent.sandbox.Sandbox;
+import io.agentscope.harness.agent.sandbox.SandboxAcquireResult;
+import io.agentscope.harness.agent.sandbox.SandboxException;
 import io.agentscope.harness.agent.sandbox.SandboxFileTransfer;
 import io.agentscope.harness.agent.sandbox.SandboxState;
 import io.agentscope.harness.agent.sandbox.WorkspaceSpec;
+
+import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
+import org.apache.commons.compress.archivers.tar.TarArchiveInputStream;
+import org.junit.jupiter.api.Test;
+
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -37,13 +44,45 @@ import java.util.AbstractMap;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
-import org.apache.commons.compress.archivers.tar.TarArchiveInputStream;
-import org.junit.jupiter.api.Test;
 
 class SandboxBackedFilesystemTest {
 
     private static final RuntimeContext RT = RuntimeContext.empty();
+
+    @Test
+    void releasedContextCannotFallBackToAnotherCallsSandbox() {
+        SandboxBackedFilesystem filesystem = new SandboxBackedFilesystem();
+        FakeSandbox previous = new FakeSandbox(new ExecResult(0, "", "", false));
+        FakeSandbox current = new FakeSandbox(new ExecResult(0, "", "", false));
+        SandboxAcquireResult acquired = SandboxAcquireResult.userManaged(previous);
+        RuntimeContext stale =
+                RuntimeContext.builder().put(SandboxAcquireResult.class, acquired).build();
+        acquired.beginRelease();
+        filesystem.setSandbox(current);
+
+        assertThrows(
+                SandboxException.SandboxConfigurationException.class,
+                () -> filesystem.execute(stale, "echo stale", 1));
+        assertNull(previous.lastCommand);
+        assertNull(current.lastCommand);
+    }
+
+    @Test
+    void downloadFiles_decodesWrappedBase64Output() {
+        byte[] expected = new byte[] {1, 2, 3, 4, 5, 6};
+        SandboxBackedFilesystem filesystem = new SandboxBackedFilesystem();
+        FakeSandbox sandbox = new FakeSandbox(new ExecResult(0, "AQID\nBAUG", "", false));
+        filesystem.setSandbox(sandbox);
+
+        List<FileDownloadResponse> responses =
+                filesystem.downloadFiles(RT, List.of("/tmp/data.bin"));
+
+        assertEquals("base64 '/tmp/data.bin'", sandbox.lastCommand);
+        assertEquals(1, responses.size());
+        assertTrue(responses.get(0).isSuccess());
+        assertEquals("/tmp/data.bin", responses.get(0).path());
+        assertArrayEquals(expected, responses.get(0).content());
+    }
 
     @Test
     void downloadFiles_returnsBytesFromSandboxDownloadFile() {
@@ -96,6 +135,38 @@ class SandboxBackedFilesystemTest {
         assertEquals(1, responses.size());
         assertTrue(!responses.get(0).isSuccess());
         assertEquals("/tmp/fail.bin", responses.get(0).path());
+    }
+
+    @Test
+    void downloadFiles_decodesEmptyPayloadWhenStdoutIsNull() {
+        SandboxBackedFilesystem filesystem = new SandboxBackedFilesystem();
+        FakeSandbox sandbox = new FakeSandbox(new ExecResult(0, null, "", false));
+        filesystem.setSandbox(sandbox);
+
+        List<FileDownloadResponse> responses =
+                filesystem.downloadFiles(RT, List.of("/tmp/empty.bin"));
+
+        assertEquals("base64 '/tmp/empty.bin'", sandbox.lastCommand);
+        assertEquals(1, responses.size());
+        assertTrue(responses.get(0).isSuccess());
+        assertEquals("/tmp/empty.bin", responses.get(0).path());
+        assertArrayEquals(new byte[0], responses.get(0).content());
+    }
+
+    @Test
+    void downloadFiles_returnsFailureWhenCommandFails() {
+        SandboxBackedFilesystem filesystem = new SandboxBackedFilesystem();
+        FakeSandbox sandbox = new FakeSandbox(new ExecResult(1, "", "boom", false));
+        filesystem.setSandbox(sandbox);
+
+        List<FileDownloadResponse> responses =
+                filesystem.downloadFiles(RT, List.of("/tmp/fail.bin"));
+
+        assertEquals("base64 '/tmp/fail.bin'", sandbox.lastCommand);
+        assertEquals(1, responses.size());
+        assertTrue(!responses.get(0).isSuccess());
+        assertEquals("/tmp/fail.bin", responses.get(0).path());
+        assertEquals("[stderr] boom", responses.get(0).error());
     }
 
     @Test

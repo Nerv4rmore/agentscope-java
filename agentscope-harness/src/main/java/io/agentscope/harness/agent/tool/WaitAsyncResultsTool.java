@@ -16,19 +16,25 @@
 package io.agentscope.harness.agent.tool;
 
 import io.agentscope.core.agent.RuntimeContext;
+import io.agentscope.core.message.ToolResultBlock;
+import io.agentscope.core.message.ToolResultState;
 import io.agentscope.core.tool.Tool;
 import io.agentscope.core.tool.ToolParam;
 import io.agentscope.harness.agent.bus.MessageBus;
 import io.agentscope.harness.agent.subagent.task.BackgroundTask;
 import io.agentscope.harness.agent.subagent.task.TaskRepository;
+import io.agentscope.harness.agent.subagent.task.TaskStatus;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import java.util.function.LongSupplier;
 
 /**
  * Tool that blocks until async results arrive, either for a specific task barrier or (legacy)
@@ -62,6 +68,10 @@ public class WaitAsyncResultsTool {
 
     private final MessageBus messageBus;
     private final TaskRepository taskRepository;
+    private final LongSupplier currentTimeMillis;
+    private final Sleeper sleeper;
+    private final long pollIntervalMs;
+    private final TaskWaiter taskWaiter;
     private final ConcurrentHashMap<String, AtomicInteger> consecutiveEmptyWaitsBySession =
             new ConcurrentHashMap<>();
     private volatile BooleanSupplier externalWorkProbe;
@@ -71,8 +81,87 @@ public class WaitAsyncResultsTool {
     }
 
     public WaitAsyncResultsTool(MessageBus messageBus, TaskRepository taskRepository) {
+        this(
+                messageBus,
+                taskRepository,
+                System::currentTimeMillis,
+                Thread::sleep,
+                POLL_INTERVAL_MS,
+                BackgroundTask::waitForCompletion);
+    }
+
+    /**
+     * Same as {@link #WaitAsyncResultsTool(MessageBus, TaskRepository)}, with a custom polling
+     * granularity for tests: mid-budget task completion is noticed after one test interval instead
+     * of one production interval.
+     */
+    WaitAsyncResultsTool(
+            MessageBus messageBus, TaskRepository taskRepository, long pollIntervalMs) {
+        this(
+                messageBus,
+                taskRepository,
+                System::currentTimeMillis,
+                Thread::sleep,
+                pollIntervalMs,
+                BackgroundTask::waitForCompletion);
+    }
+
+    /** Allows timeout tests to advance elapsed time without waiting for the real deadline. */
+    WaitAsyncResultsTool(
+            MessageBus messageBus,
+            TaskRepository taskRepository,
+            LongSupplier currentTimeMillis,
+            Sleeper sleeper) {
+        this(messageBus, taskRepository, currentTimeMillis, sleeper, POLL_INTERVAL_MS);
+    }
+
+    /**
+     * Allows timeout tests to advance elapsed time without waiting for the real deadline, and to
+     * shrink the polling granularity so waits complete promptly.
+     */
+    WaitAsyncResultsTool(
+            MessageBus messageBus,
+            TaskRepository taskRepository,
+            LongSupplier currentTimeMillis,
+            Sleeper sleeper,
+            long pollIntervalMs) {
+        this(
+                messageBus,
+                taskRepository,
+                currentTimeMillis,
+                sleeper,
+                pollIntervalMs,
+                (task, millis) -> {
+                    // 注入时钟时由同一个 sleeper 推进时间，不能阻塞在真实 Future 超时上。
+                    if (!task.waitForCompletion(0L)) {
+                        sleeper.sleep(millis);
+                    }
+                });
+    }
+
+    private WaitAsyncResultsTool(
+            MessageBus messageBus,
+            TaskRepository taskRepository,
+            LongSupplier currentTimeMillis,
+            Sleeper sleeper,
+            long pollIntervalMs,
+            TaskWaiter taskWaiter) {
         this.messageBus = messageBus;
         this.taskRepository = taskRepository;
+        this.currentTimeMillis = currentTimeMillis;
+        this.sleeper = sleeper;
+        this.pollIntervalMs = pollIntervalMs;
+        this.taskWaiter = taskWaiter;
+    }
+
+    @FunctionalInterface
+    interface Sleeper {
+        void sleep(long millis) throws InterruptedException;
+    }
+
+    @FunctionalInterface
+    private interface TaskWaiter {
+        void await(BackgroundTask task, long millis) throws InterruptedException;
     }
 
     /**
@@ -115,7 +204,7 @@ public class WaitAsyncResultsTool {
                             + "If you have already waited without results, use task_list or "
                             + "task_output(block=false) to check status instead of waiting again.",
             readOnly = true)
-    public String waitForResults(
+    public ToolResultBlock waitForResults(
             @ToolParam(
                             name = "timeout_seconds",
                             description =
@@ -141,12 +230,24 @@ public class WaitAsyncResultsTool {
                                         + " legacy no-arg inbox-any wait.",
                             required = false)
                     Boolean waitAll,
-            RuntimeContext runtimeContext)
+            RuntimeContext runtimeContext) {
+        try {
+            return doWaitForResults(timeoutSeconds, taskIds, waitAll, runtimeContext);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return ToolResultBlock.text("status: interrupted")
+                    .withState(ToolResultState.INTERRUPTED);
+        }
+    }
+
+    private ToolResultBlock doWaitForResults(
+            Integer timeoutSeconds, String taskIds, Boolean waitAll, RuntimeContext runtimeContext)
             throws InterruptedException {
 
         String sessionId = runtimeContext != null ? runtimeContext.getSessionId() : null;
         if (sessionId == null) {
-            return "Cannot wait: no session context available.";
+            return ToolResultBlock.text("Cannot wait: no session context available.")
+                    .withState(ToolResultState.ERROR);
         }
 
         AtomicInteger emptyWaits =
@@ -166,26 +267,31 @@ public class WaitAsyncResultsTool {
                                 + " resetting counter, session={}",
                         sessionId);
                 emptyWaits.set(0);
-                return "Async results have arrived (inbox-any: at least one message). "
-                        + "Continue reasoning — the results will be injected into your context "
-                        + "automatically. Prefer wait_async_results(task_ids=...) or "
-                        + "wait_all=true when you need every task in a group.";
+                return ToolResultBlock.success(
+                        "Async results have arrived (inbox-any: at least one message). "
+                                + "Continue reasoning — the results will be injected into your"
+                                + " context automatically. Prefer wait_async_results(task_ids=...)"
+                                + " or wait_all=true when you need every task in a group.");
             }
             log.info(
                     "wait_async_results: rejected — {} consecutive empty waits reached, session={}",
                     emptyWaits.get(),
                     sessionId);
-            return "Wait budget exhausted: you have already waited "
-                    + emptyWaits.get()
-                    + " times without receiving results. "
-                    + "Do NOT call wait_async_results again. Instead use task_list to check "
-                    + "task status, or task_output(block=false) to poll for results without "
-                    + "blocking.";
+            return ToolResultBlock.success(
+                    "Wait budget exhausted: you have already waited "
+                            + emptyWaits.get()
+                            + " times without receiving results. "
+                            + "Do NOT call wait_async_results again. Instead use task_list to"
+                            + " check task status, or task_output(block=false) to poll for"
+                            + " results without blocking.");
         }
 
         if (taskRepository != null) {
+            Collection<BackgroundTask> tasks =
+                    taskRepository.listTasks(runtimeContext, sessionId, null);
             boolean hasNonTerminal =
-                    hasNonTerminalTasks(runtimeContext, sessionId) || hasExternalWork();
+                    tasks.stream().anyMatch(task -> !task.getTaskStatus().isTerminal())
+                            || hasExternalWork();
             if (!hasNonTerminal) {
                 Boolean hasMessages = messageBus.inboxHasMessages(sessionId).block();
                 if (!Boolean.TRUE.equals(hasMessages)) {
@@ -193,16 +299,19 @@ public class WaitAsyncResultsTool {
                             "wait_async_results: all tasks terminal and inbox empty,"
                                     + " returning immediately, session={}",
                             sessionId);
-                    if (taskRepository.listTasks(runtimeContext, sessionId, null).isEmpty()) {
-                        return "status: no_tasks\n"
-                                + "No background tasks exist in this session. An empty"
-                                + " completion inbox is not evidence of running work. Continue"
-                                + " the assigned work or report the missing capability; do not"
-                                + " keep waiting.";
+                    if (tasks.isEmpty()) {
+                        return ToolResultBlock.success(
+                                "status: no_tasks\n"
+                                        + "No background tasks exist in this session. An empty"
+                                        + " completion inbox is not evidence of running work."
+                                        + " Continue the assigned work or report the missing"
+                                        + " capability; do not keep waiting.");
                     }
-                    return "All background tasks have completed and no pending results in inbox."
-                            + " Use task_list to review results, or task_output(task_id) to read"
-                            + " a specific result.";
+                    return ToolResultBlock.text(
+                                    "All background tasks have completed and no pending results"
+                                            + " in inbox. Use task_list to review results, or"
+                                            + " task_output(task_id) to read a specific result.")
+                            .withState(barrierState(List.copyOf(tasks)));
                 }
             }
         }
@@ -215,27 +324,30 @@ public class WaitAsyncResultsTool {
                 timeout,
                 sessionId);
 
-        long deadlineMs = System.currentTimeMillis() + (timeout * 1000L);
+        long deadlineMs = currentTimeMillis.getAsLong() + (timeout * 1000L);
 
-        // 事件驱动：inbox 消息由后台任务完成回调推送，故先阻塞等待非终态任务的完成信号；
-        // 无任务时退化为短间隔探测 inbox（无事件源可用）。
+        // 先检查 inbox，再等待任务完成信号；无任务事件源时使用注入的轮询间隔。
         while (true) {
             Boolean hasMessages = messageBus.inboxHasMessages(sessionId).block();
             if (Boolean.TRUE.equals(hasMessages)) {
                 log.info("wait_async_results: inbox has messages, session={}", sessionId);
                 emptyWaits.set(0);
-                return "Async results have arrived (inbox-any: at least one message). "
-                        + "Continue reasoning — the results will be injected into your context "
-                        + "automatically. Prefer wait_async_results(task_ids=...) or "
-                        + "wait_all=true when you need every task in a group.";
+                return ToolResultBlock.success(
+                        "Async results have arrived (inbox-any: at least one message). "
+                                + "Continue reasoning — the results will be injected into your"
+                                + " context automatically. Prefer wait_async_results(task_ids=...)"
+                                + " or wait_all=true when you need every task in a group.");
             }
-            long remainingMs = deadlineMs - System.currentTimeMillis();
+            long remainingMs = deadlineMs - currentTimeMillis.getAsLong();
             if (remainingMs <= 0) {
                 break;
             }
             if (!waitForAnyTaskSignal(runtimeContext, sessionId, remainingMs)) {
-                // 无运行中任务可等：短间隔探测 inbox，直到超时
-                Thread.sleep(Math.min(POLL_INTERVAL_MS, remainingMs));
+                // 查询任务也会消耗预算，休眠前使用同一时钟重新计算。
+                remainingMs = deadlineMs - currentTimeMillis.getAsLong();
+                if (remainingMs > 0) {
+                    sleepForPollInterval(remainingMs);
+                }
             }
         }
 
@@ -245,23 +357,23 @@ public class WaitAsyncResultsTool {
                 timeout,
                 emptyCount,
                 sessionId);
-        return "Timeout after "
-                + timeout
-                + "s. No async results yet (empty wait "
-                + emptyCount
-                + "/"
-                + MAX_CONSECUTIVE_EMPTY_WAITS
-                + "). "
-                + "Use task_list to check task status, or task_output(block=false) to poll "
-                + "without blocking.";
+        return ToolResultBlock.success(
+                "Timeout after "
+                        + timeout
+                        + "s. No async results yet (empty wait "
+                        + emptyCount
+                        + "/"
+                        + MAX_CONSECUTIVE_EMPTY_WAITS
+                        + "). "
+                        + "Use task_list to check task status, or task_output(block=false) to"
+                        + " poll without blocking.");
     }
 
-    public String waitForResults(Integer timeoutSeconds, RuntimeContext runtimeContext)
-            throws InterruptedException {
+    public ToolResultBlock waitForResults(Integer timeoutSeconds, RuntimeContext runtimeContext) {
         return waitForResults(timeoutSeconds, null, null, runtimeContext);
     }
 
-    private String waitForTaskBarrier(
+    private ToolResultBlock waitForTaskBarrier(
             Integer timeoutSeconds,
             RuntimeContext runtimeContext,
             String sessionId,
@@ -269,8 +381,11 @@ public class WaitAsyncResultsTool {
             AtomicInteger emptyWaits)
             throws InterruptedException {
         if (taskRepository == null) {
-            return "Cannot wait for task completion: task repository is unavailable. "
-                    + "Use task_list or task_output(block=false) to check status.";
+            return ToolResultBlock.text(
+                            "Cannot wait for task completion: task repository is unavailable. "
+                                    + "Use task_list or task_output(block=false) to check"
+                                    + " status.")
+                    .withState(ToolResultState.ERROR);
         }
 
         if (!explicitTaskIds.isEmpty()) {
@@ -282,11 +397,12 @@ public class WaitAsyncResultsTool {
                                                     == null)
                             .toList();
             if (!missingTaskIds.isEmpty()) {
-                throw new IllegalArgumentException(
-                        "status: not_found\nCannot wait: unknown task_ids "
-                                + missingTaskIds
-                                + ". No running work is implied. Use task_list to find valid task"
-                                + " IDs.");
+                return ToolResultBlock.text(
+                                "status: not_found\nCannot wait: unknown task_ids "
+                                        + missingTaskIds
+                                        + ". No running work is implied. Use task_list to find"
+                                        + " valid task IDs.")
+                        .withState(ToolResultState.ERROR);
             }
         }
 
@@ -300,17 +416,18 @@ public class WaitAsyncResultsTool {
                             + " returning immediately, session={}",
                     sessionId);
             emptyWaits.set(0);
-            return "No running background tasks found at wait start. Continue reasoning, "
-                    + "or use task_list to review existing task status.";
+            return ToolResultBlock.success(
+                    "No running background tasks found at wait start. Continue reasoning, "
+                            + "or use task_list to review existing task status.");
         }
 
-        String completed = completeTaskBarrierIfReady(runtimeContext, sessionId, waitSet);
+        ToolResultBlock completed = completeTaskBarrierIfReady(runtimeContext, sessionId, waitSet);
         if (completed != null) {
             emptyWaits.set(0);
             return completed;
         }
 
-        String rejected = rejectIfWaitBudgetExhausted(sessionId, emptyWaits);
+        ToolResultBlock rejected = rejectIfWaitBudgetExhausted(sessionId, emptyWaits);
         if (rejected != null) {
             return rejected;
         }
@@ -323,26 +440,34 @@ public class WaitAsyncResultsTool {
                 sessionId,
                 waitSet);
 
-        // 事件驱动等待：逐个阻塞在任务底层 CompletableFuture 的完成信号上，
-        // 不再每秒轮询任务状态；任一任务进入终态即被唤醒继续。
-        long deadlineMs = System.currentTimeMillis() + (timeout * 1000L);
-        for (String taskId : waitSet) {
-            BackgroundTask task = taskRepository.getTask(runtimeContext, sessionId, taskId);
-            if (task == null) {
-                log.info(
-                        "wait_async_results: task barrier missing task {}, session={}",
-                        taskId,
-                        sessionId);
-                return "Cannot wait: task_id "
-                        + taskId
-                        + " is no longer available. Use task_list to refresh task status.";
+        long deadlineMs = currentTimeMillis.getAsLong() + (timeout * 1000L);
+        while (true) {
+            completed = completeTaskBarrierIfReady(runtimeContext, sessionId, waitSet);
+            if (completed != null) {
+                emptyWaits.set(0);
+                return completed;
             }
-            long remainingMs = deadlineMs - System.currentTimeMillis();
+            long remainingMs = deadlineMs - currentTimeMillis.getAsLong();
             if (remainingMs <= 0) {
                 break;
             }
-            if (!task.waitForCompletion(remainingMs)) {
-                break;
+            // 仅等待初始 waitSet 中的任务；每次信号或时间片结束后重新读取终态和结果。
+            for (String taskId : waitSet) {
+                BackgroundTask task = taskRepository.getTask(runtimeContext, sessionId, taskId);
+                if (task == null) {
+                    return ToolResultBlock.error(
+                            "Cannot wait: task_id "
+                                    + taskId
+                                    + " is no longer available. Use task_list to refresh task"
+                                    + " status.");
+                }
+                if (!task.getTaskStatus().isTerminal()) {
+                    remainingMs = deadlineMs - currentTimeMillis.getAsLong();
+                    if (remainingMs > 0) {
+                        taskWaiter.await(task, Math.min(pollIntervalMs, remainingMs));
+                    }
+                    break;
+                }
             }
         }
 
@@ -360,18 +485,19 @@ public class WaitAsyncResultsTool {
                 waitSet,
                 emptyCount,
                 sessionId);
-        return "Timeout after "
-                + timeout
-                + "s. Requested background tasks are not all terminal yet (empty wait "
-                + emptyCount
-                + "/"
-                + MAX_CONSECUTIVE_EMPTY_WAITS
-                + "). "
-                + "Use task_list to check task status, or task_output(block=false) to poll "
-                + "without blocking.";
+        return ToolResultBlock.success(
+                "Timeout after "
+                        + timeout
+                        + "s. Requested background tasks are not all terminal yet (empty wait "
+                        + emptyCount
+                        + "/"
+                        + MAX_CONSECUTIVE_EMPTY_WAITS
+                        + "). "
+                        + "Use task_list to check task status, or task_output(block=false) to"
+                        + " poll without blocking.");
     }
 
-    private String completeTaskBarrierIfReady(
+    private ToolResultBlock completeTaskBarrierIfReady(
             RuntimeContext runtimeContext, String sessionId, List<String> waitSet) {
         List<BackgroundTask> terminalTasks = new ArrayList<>(waitSet.size());
         for (String taskId : waitSet) {
@@ -381,9 +507,12 @@ public class WaitAsyncResultsTool {
                         "wait_async_results: task barrier missing task {}, session={}",
                         taskId,
                         sessionId);
-                return "Cannot wait: task_id "
-                        + taskId
-                        + " is no longer available. Use task_list to refresh task status.";
+                return ToolResultBlock.text(
+                                "Cannot wait: task_id "
+                                        + taskId
+                                        + " is no longer available. Use task_list to refresh"
+                                        + " task status.")
+                        .withState(ToolResultState.ERROR);
             }
             if (!task.getTaskStatus().isTerminal()) {
                 return null;
@@ -401,7 +530,7 @@ public class WaitAsyncResultsTool {
      * Embeds each terminal task's status/result in the tool return so the parent can continue
      * without waiting for inbox push-back. Marks tasks delivered to avoid duplicate reminders.
      */
-    private String formatBarrierResults(
+    private ToolResultBlock formatBarrierResults(
             RuntimeContext runtimeContext, String sessionId, List<BackgroundTask> tasks) {
         StringBuilder sb = new StringBuilder();
         sb.append("All requested background tasks are terminal. Results are included below.")
@@ -433,10 +562,24 @@ public class WaitAsyncResultsTool {
                 sb.append("Task completed with no result.").append('\n');
             }
         }
-        return sb.toString().trim();
+        return ToolResultBlock.text(sb.toString().trim()).withState(barrierState(tasks));
     }
 
-    private String rejectIfWaitBudgetExhausted(String sessionId, AtomicInteger emptyWaits) {
+    private static ToolResultState barrierState(List<BackgroundTask> tasks) {
+        boolean interrupted = false;
+        for (BackgroundTask task : tasks) {
+            if (task.getTaskStatus() == TaskStatus.FAILED) {
+                return ToolResultState.ERROR;
+            }
+            if (task.getTaskStatus() == TaskStatus.CANCELLED) {
+                interrupted = true;
+            }
+        }
+        return interrupted ? ToolResultState.INTERRUPTED : ToolResultState.SUCCESS;
+    }
+
+    private ToolResultBlock rejectIfWaitBudgetExhausted(
+            String sessionId, AtomicInteger emptyWaits) {
         if (emptyWaits.get() < MAX_CONSECUTIVE_EMPTY_WAITS) {
             return null;
         }
@@ -447,21 +590,23 @@ public class WaitAsyncResultsTool {
                             + " resetting counter, session={}",
                     sessionId);
             emptyWaits.set(0);
-            return "Async results have arrived (inbox-any: at least one message). "
-                    + "Continue reasoning — the results will be injected into your context "
-                    + "automatically. Prefer wait_async_results(task_ids=...) or "
-                    + "wait_all=true when you need every task in a group.";
+            return ToolResultBlock.success(
+                    "Async results have arrived (inbox-any: at least one message). "
+                            + "Continue reasoning — the results will be injected into your"
+                            + " context automatically. Prefer wait_async_results(task_ids=...)"
+                            + " or wait_all=true when you need every task in a group.");
         }
         log.info(
                 "wait_async_results: rejected — {} consecutive empty waits reached, session={}",
                 emptyWaits.get(),
                 sessionId);
-        return "Wait budget exhausted: you have already waited "
-                + emptyWaits.get()
-                + " times without receiving results. "
-                + "Do NOT call wait_async_results again. Instead use task_list to check "
-                + "task status, or task_output(block=false) to poll for results without "
-                + "blocking.";
+        return ToolResultBlock.success(
+                "Wait budget exhausted: you have already waited "
+                        + emptyWaits.get()
+                        + " times without receiving results. "
+                        + "Do NOT call wait_async_results again. Instead use task_list to"
+                        + " check task status, or task_output(block=false) to poll for"
+                        + " results without blocking.");
     }
 
     private int normalizeTimeout(Integer timeoutSeconds, String sessionId) {
@@ -481,18 +626,16 @@ public class WaitAsyncResultsTool {
     }
 
     /**
-     * 事件驱动等待任一非终态后台任务完成（inbox-any 模式的事件源）。
-     * inbox 消息由任务完成回调推送，故阻塞在任务底层 Future 上即等价于等待推送。
+     * 等待后台任务的完成信号，每轮最多占用一个轮询时间片，避免慢任务挡住其他 inbox 消息。
      *
-     * @return true 表示确实阻塞等待了某个任务；false 表示无运行中任务可等
-     *         （含仅有外部工作的情况——外部工作无事件源，调用方应退化为短间隔探测，
-     *         避免无休眠的忙轮询）
+     * @return false 表示无任务事件源，调用方需使用 sleeper 等待外部消息
      */
     private boolean waitForAnyTaskSignal(RuntimeContext rc, String sessionId, long remainingMs)
             throws InterruptedException {
         if (taskRepository == null) {
             return false;
         }
+        long deadlineMs = currentTimeMillis.getAsLong() + Math.min(pollIntervalMs, remainingMs);
         List<BackgroundTask> running =
                 taskRepository.listTasks(rc, sessionId, null).stream()
                         .filter(t -> !t.getTaskStatus().isTerminal())
@@ -500,15 +643,14 @@ public class WaitAsyncResultsTool {
         if (running.isEmpty()) {
             return false;
         }
-        // 逐个等待，任一任务完成即返回；剩余预算在任务间传递
-        long budget = remainingMs;
-        for (BackgroundTask task : running) {
+        for (int i = 0; i < running.size(); i++) {
+            long budget = deadlineMs - currentTimeMillis.getAsLong();
             if (budget <= 0) {
                 break;
             }
-            long start = System.currentTimeMillis();
-            task.waitForCompletion(budget);
-            budget -= (System.currentTimeMillis() - start);
+            BackgroundTask task = running.get(i);
+            // 在本轮时间片内分配等待预算，任务完成时立即唤醒。
+            taskWaiter.await(task, Math.max(1L, budget / (running.size() - i)));
             if (task.getTaskStatus().isTerminal()) {
                 log.info(
                         "wait_async_results: task {} reached terminal state, waking up,"
@@ -519,6 +661,10 @@ public class WaitAsyncResultsTool {
             }
         }
         return true;
+    }
+
+    private void sleepForPollInterval(long remainingMs) throws InterruptedException {
+        sleeper.sleep(Math.min(pollIntervalMs, remainingMs));
     }
 
     private List<String> parseTaskIds(String taskIds) {
@@ -541,10 +687,5 @@ public class WaitAsyncResultsTool {
                 .filter(t -> !t.getTaskStatus().isTerminal())
                 .map(BackgroundTask::getTaskId)
                 .toList();
-    }
-
-    private boolean hasNonTerminalTasks(RuntimeContext rc, String sessionId) {
-        Collection<BackgroundTask> tasks = taskRepository.listTasks(rc, sessionId, null);
-        return tasks.stream().anyMatch(t -> !t.getTaskStatus().isTerminal());
     }
 }

@@ -20,6 +20,7 @@ import io.agentscope.harness.agent.sandbox.snapshot.SandboxSnapshot;
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -95,10 +96,11 @@ public abstract class AbstractBaseSandbox implements Sandbox {
                     // Branch B: workspace was lost — restore from snapshot + ephemeral entries
                     log.info("[sandbox-diag] base.start Branch B: workspace lost");
                     log.debug("[sandbox] Branch B: workspace lost, restoring from snapshot");
-                    if (snapshot != null && snapshot.isRestorable()) {
+                    Optional<InputStream> archive = openSnapshotArchive(snapshot);
+                    if (archive.isPresent()) {
                         doSetupWorkspace();
-                        try (InputStream archive = snapshot.restore()) {
-                            doHydrateWorkspace(archive);
+                        try (InputStream stream = archive.get()) {
+                            doHydrateWorkspace(stream);
                         }
                         workspaceSpecApplier.applyWorkspaceSpec(spec, true);
                     } else {
@@ -112,13 +114,14 @@ public abstract class AbstractBaseSandbox implements Sandbox {
                 }
             } else {
                 // Workspace was not ready at last stop
-                if (snapshot != null && snapshot.isRestorable()) {
+                Optional<InputStream> archive = openSnapshotArchive(snapshot);
+                if (archive.isPresent()) {
                     // Branch C: restore from snapshot + all spec entries
                     log.info("[sandbox-diag] base.start Branch C: restore from snapshot");
                     log.debug("[sandbox] Branch C: restoring from snapshot");
                     doSetupWorkspace();
-                    try (InputStream archive = snapshot.restore()) {
-                        doHydrateWorkspace(archive);
+                    try (InputStream stream = archive.get()) {
+                        doHydrateWorkspace(stream);
                     }
                     workspaceSpecApplier.applyWorkspaceSpec(spec, false);
                 } else {
@@ -202,6 +205,18 @@ public abstract class AbstractBaseSandbox implements Sandbox {
     @Override
     public InputStream persistWorkspace() throws Exception {
         return doPersistWorkspace();
+    }
+
+    /**
+     * Opens the snapshot archive for the current start, or returns empty when no snapshot is
+     * available. Backends that select a restore source before {@link #start()} can override this
+     * to reuse their decision instead of opening the persisted snapshot a second time.
+     */
+    protected Optional<InputStream> openSnapshotArchive(SandboxSnapshot snapshot) throws Exception {
+        if (snapshot == null || !snapshot.isRestorable()) {
+            return Optional.empty();
+        }
+        return Optional.of(snapshot.restore());
     }
 
     @Override
