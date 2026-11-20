@@ -310,16 +310,17 @@ public class SubagentsMiddleware implements HarnessRuntimeMiddleware {
                                             + "</system-reminder>",
                                     taskId, subAgentId, result != null ? result : "(no output)");
                     String hintId = java.util.UUID.randomUUID().toString().replace("-", "");
-                    java.util.Map<String, Object> hintPayload =
-                            java.util.Map.of(
-                                    "type",
-                                    "hint",
-                                    "id",
-                                    hintId,
-                                    "hint",
-                                    hintContent,
-                                    "source",
-                                    "subagent_task");
+                    // 结构化字段供宿主侧完成观察器直接提取（免解析 hint 文本）；
+                    // inbox 消费端只读 hint，附加键不影响既有注入行为。result 可为 null
+                    //（失败任务），故用 HashMap 而非 Map.of。
+                    java.util.Map<String, Object> hintPayload = new java.util.HashMap<>();
+                    hintPayload.put("type", "hint");
+                    hintPayload.put("id", hintId);
+                    hintPayload.put("hint", hintContent);
+                    hintPayload.put("source", "subagent_task");
+                    hintPayload.put("taskId", taskId);
+                    hintPayload.put("agentId", subAgentId);
+                    hintPayload.put("result", result);
                     long beforeInbox = System.currentTimeMillis();
                     messageBus.inboxPush(sessionId, hintPayload).subscribe();
                     long afterInbox = System.currentTimeMillis();
